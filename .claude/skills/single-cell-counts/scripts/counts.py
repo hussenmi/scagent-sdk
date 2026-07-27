@@ -15,12 +15,16 @@ def _identity(kind: str, value: Any) -> str:
 
 def _count_matrix_identity(matrix: Any, obs_names: Any, var_names: Any) -> str:
     import numpy as np
-    from scipy import sparse
+
+    try:
+        from scipy import sparse
+    except ImportError:  # keeps this recipe callable from the control plane for drift tests
+        sparse = None  # type: ignore[assignment]
 
     digest = hashlib.sha256()
     digest.update(b"scagent-count-matrix-v1\0")
     digest.update(str(tuple(map(int, matrix.shape))).encode() + b"\0")
-    if sparse.issparse(matrix):
+    if sparse is not None and sparse.issparse(matrix):
         value = matrix.tocsr()
         arrays = (value.data, value.indices, value.indptr)
     else:

@@ -18,6 +18,70 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import genes  # noqa: E402  (sibling module; path inserted above)
+import identity as identity_recipes  # noqa: E402  (sibling module; path inserted above)
+
+
+def _remint_after_relabel(
+    adata: Any, path: Path, facts: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Re-mint count identities after a var-axis relabel, and invalidate what it stales.
+
+    ``count_matrix_id`` hashes ``var_names`` and ``dataset_revision.id`` derives from the count
+    representation, so relabelling genes after counts were materialized leaves both identities
+    describing a vocabulary the file no longer uses. Returns ``(facts_patch_fragment, uns_updates)``
+    or ``None`` when no count representation exists yet -- the common ordering, where conversion
+    precedes ``resolve_count_matrix`` and nothing needs re-minting.
+    """
+
+    analysis = facts.get("analysis")
+    if not isinstance(analysis, dict):
+        return None
+    representation = analysis.get("count_representation")
+    revision = analysis.get("dataset_revision")
+    cell_set = analysis.get("cell_set")
+    if not (
+        isinstance(representation, dict)
+        and isinstance(revision, dict)
+        and isinstance(cell_set, dict)
+    ):
+        return None
+    cell_set_id = cell_set.get("id")
+    selected_source = representation.get("count_source")
+    if not isinstance(cell_set_id, str) or not isinstance(selected_source, str):
+        return None
+
+    counts = adata.layers.get("counts") if hasattr(adata, "layers") else None
+    if counts is None:
+        return None
+
+    matrix_id = identity_recipes.count_matrix_identity(counts, adata.obs_names, adata.var_names)
+    count_id = identity_recipes.count_representation_identity(
+        matrix_id, cell_set_id, selected_source
+    )
+    source_path = revision.get("source_path")
+    revision_id = identity_recipes.dataset_revision_identity(
+        str(source_path) if isinstance(source_path, str) else str(path), cell_set_id, count_id
+    )
+
+    fragment = {
+        "analysis": {
+            "count_representation": {"id": count_id, "matrix_id": matrix_id},
+            "dataset_revision": {"id": revision_id},
+        },
+        # Annotation evidence is scored against gene symbols but the annotation floor keys only on
+        # clustering_id, so a relabel would otherwise leave it "current" and permit finalization
+        # against the previous vocabulary. Cluster QC, cell QC, doublets, and batch already stale
+        # on count_representation_id and need no explicit clearing.
+        "annotation": None,
+        "finalization": None,
+        "reference_runs": None,
+    }
+    uns_updates = {
+        "count_representation_id": count_id,
+        "count_matrix_id": matrix_id,
+        "dataset_revision_id": revision_id,
+    }
+    return fragment, uns_updates
 
 
 def _mygene_map(names: list[str], fmt: str, organism: str) -> list[str] | None:
@@ -144,6 +208,21 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     report["sample_after"] = [str(name) for name in adata.var_names[:10]]
     report["changed"] = report["source"] not in {"already_symbols", "unmapped"} or bool(prefix)
 
+    facts_patch: dict[str, Any] = {"gene_conversion": report}
+    reminted: dict[str, Any] | None = None
+    if report["changed"]:
+        facts = getattr(context, "state_facts", None)
+        outcome = _remint_after_relabel(adata, path, facts if isinstance(facts, dict) else {})
+        if outcome is not None:
+            fragment, uns_updates = outcome
+            facts_patch.update(fragment)
+            metadata = dict(adata.uns.get("scagent_sdk", {}))
+            metadata.update(uns_updates)
+            adata.uns["scagent_sdk"] = metadata
+            reminted = uns_updates
+            report["reminted_identities"] = uns_updates
+            report["invalidated_facts"] = ["annotation", "finalization", "reference_runs"]
+
     output_relative = "gene-symbols.h5ad"
     output_path = context.staging_dir / output_relative
     adata.write_h5ad(output_path, compression="gzip")
@@ -163,12 +242,17 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
             + (f", {n_duplicates} duplicate(s) made unique" if n_duplicates else "")
             + "."
         )
+    if reminted is not None:
+        summary += (
+            " Count representation and dataset revision were re-minted for the new gene "
+            "vocabulary; annotation and finalization evidence must be regenerated."
+        )
 
     return {
         "schema_version": 1,
         "summary": summary,
         "details": report,
-        "facts_patch": {"gene_conversion": report},
+        "facts_patch": facts_patch,
         "artifacts": [
             {
                 "name": "gene-symbols",
