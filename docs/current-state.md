@@ -17,6 +17,37 @@ The project intentionally does not inherit from or run legacy `scagent`. Scienti
 reimplemented in focused packages and checked against legacy code/tests and BioNeMo contributed
 skills only as read-only references.
 
+## Artifact lineage: accepted specification, not implemented (2026-07-27)
+
+`docs/artifact-lineage-and-head-spec.md` (v2.2) is review-cleared and **implementation-ready but
+unimplemented**. Read it before touching the capability executor, session state, or any skill that
+writes an H5AD.
+
+The defect it addresses: session facts merge by identity in the executor and always converge, while
+the H5AD chain merges only by whichever `path` the model passed. A column-adding capability can
+therefore derive from a sibling branch carrying identical identities — which **no floor can
+detect** — leaving facts and reports correct but the delivered H5AD missing an `obs` column. The
+head convention already exists as `facts.analysis.dataset_revision.prepared_path`, written
+independently by eight skill scripts.
+
+The design: an executor-owned lineage **forest** in session state, nodes keyed by `execution_id`,
+parent taken from the *resolved input* rather than the commit-time active head, identity demoted to
+an indexed signature, branch commits state-isolated by a per-node facts snapshot, and fact scope
+declared in a central versioned registry. Pruning and column-overlay storage are deliberate
+follow-ons; the session measured in that document holds 228 MB of artifacts from a 12 MB input and
+no retention policy exists anywhere in `src/scagent_sdk`.
+
+Three standalone defects the review surfaced were **fixed separately** and do not wait on the
+forest:
+
+- `convert_gene_ids` did not re-mint `count_representation`/`dataset_revision` after relabelling
+  the var axis, even though `_count_matrix_identity` hashes `var_names`. Fixed, with the explicit
+  invalidation of `annotation`/`finalization`/`reference_runs` that `current_annotation_evidence`
+  cannot detect on its own (it keys only on `clustering_id`).
+- `recover_pending` ordered crash recovery by UUID directory name. Now ordered by staging event
+  sequence.
+- `investigate_batch` re-asserted `prepared_path` from a read-only tool. Removed.
+
 ## Comprehensive-analysis parity pass (implemented 2026-07-27)
 
 The CRC comparison between legacy `run_2026_07_20_234322` and SDK session
