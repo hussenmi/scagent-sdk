@@ -110,11 +110,20 @@ def _projected_name(
     summary: str,
     artifact_name: str,
     relative_path: str,
+    disambiguate: bool = False,
 ) -> str:
     suffix = Path(relative_path).suffix.lower()
     short_id = _slugify(execution_id, maxlen=8) or "unknown"
     if category == "code":
-        return f"{_code_label(summary, artifact_name)}-{short_id}{suffix or '.py'}"
+        # Code is named for what it does rather than for the artifact, which reads better in a
+        # session listing. That label comes from the record's summary, so it is identical for
+        # every code file in one execution; add the artifact name when there is more than one,
+        # or they collide and fall through to the --view-N guard meant for cross-run reuse.
+        label = _code_label(summary, artifact_name)
+        artifact = _slugify(artifact_name)
+        if disambiguate and artifact and artifact != label:
+            return f"{label}-{artifact}-{short_id}{suffix or '.py'}"
+        return f"{label}-{short_id}{suffix or '.py'}"
     artifact = _slugify(artifact_name) or _slugify(Path(relative_path).stem) or "output"
     tool = _slugify(tool_name, maxlen=48) or "capability"
     return f"{artifact}--{tool}--{short_id}{suffix}"
@@ -364,6 +373,17 @@ def refresh_output_view(
         tool_name = str(raw_record.get("tool_name", "capability"))
         summary = str(raw_record.get("summary", ""))
         sequence = sequences.get(execution_id, 0)
+        code_files = sum(
+            1
+            for raw_file in files
+            if isinstance(raw_file, Mapping)
+            and isinstance(raw_file.get("relative_path"), str)
+            and _classify(
+                str(raw_file["relative_path"]),
+                str(raw_file.get("media_type", "application/octet-stream")),
+            )
+            == "code"
+        )
         for raw_file in files:
             if not isinstance(raw_file, Mapping):
                 continue
@@ -385,6 +405,7 @@ def refresh_output_view(
                 summary=summary,
                 artifact_name=artifact_name,
                 relative_path=relative_path,
+                disambiguate=code_files > 1,
             )
             final_data = _is_final_data(artifact_name, relative_path, tool_name)
             directory = _projected_directory(

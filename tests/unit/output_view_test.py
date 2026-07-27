@@ -92,12 +92,21 @@ def test_committed_files_are_projected_by_kind_without_copying_data(tmp_path: Pa
         ],
     )
 
-    code = next((session.directory / "code").glob("inspect-the-dataset-*.py"))
+    # Two code files in one record: the summary-derived label is the same for both, so the
+    # artifact name disambiguates them. Neither may fall through to the --view-N collision
+    # guard, which exists for cross-run reuse rather than for naming.
+    code_files = sorted(
+        path.name for path in (session.directory / "code").glob("inspect-the-dataset-*.py")
+    )
+    assert code_files == [
+        "inspect-the-dataset-analysis-code-aaaaaaaa.py",
+        "inspect-the-dataset-analysis-recipe-aaaaaaaa.py",
+    ]
+    code = session.directory / "code" / code_files[0]
     figure = next((session.directory / "figures").glob("*.png"))
     reports = sorted((session.directory / "reports").glob("*--aaaaaaaa.*"))
     table = next((session.directory / "tables").glob("*--aaaaaaaa.csv"))
     data = next((session.directory / "data").glob("*--aaaaaaaa.h5ad"))
-    assert code.name == "inspect-the-dataset-aaaaaaaa.py"
     assert code.is_symlink()
     assert figure.is_symlink()
     assert len(reports) == 1
@@ -127,6 +136,58 @@ def test_committed_files_are_projected_by_kind_without_copying_data(tmp_path: Pa
     assert "## Primary results" in markdown
     assert "final-annotated.h5ad" in markdown
     assert "`finalize_analysis`" in markdown
+
+
+def test_single_code_artifact_keeps_the_plain_summary_label(tmp_path: Path) -> None:
+    """The production shape: one code file per execution, named for what it does."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="one-code-file")
+    _commit_artifact(
+        session,
+        execution_id="cccccccc-1111-2222-3333-444444444444",
+        tool_name="run_analysis_code",
+        summary="Custom analysis code completed for: Inspect the dataset",
+        files=[("analysis-code", "analysis.py", "text/x-python", b"print('ok')\n")],
+    )
+
+    assert [path.name for path in (session.directory / "code").glob("*.py")] == [
+        "inspect-the-dataset-cccccccc.py"
+    ]
+
+
+def test_multiple_code_artifacts_never_use_the_collision_guard(tmp_path: Path) -> None:
+    """Two code files in one record must get distinct names, not name plus --view-2.
+
+    The code label is derived from the record summary, so it is identical for every code file in
+    an execution. Without disambiguation the second one lands on the --view-N fallback, which is
+    reserved for reusing a name across runs and makes the pairing arbitrary.
+    """
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="two-code-files")
+    artifact_path = _commit_artifact(
+        session,
+        execution_id="dddddddd-1111-2222-3333-444444444444",
+        tool_name="finalize_analysis",
+        summary="Custom analysis code completed for: Inspect the dataset",
+        files=[
+            ("analysis-code", "analysis.py", "text/x-python", b"print('a')\n"),
+            ("analysis-recipe", "analysis-recipe.py", "text/x-python", b"print('b')\n"),
+        ],
+    )
+
+    projected = sorted(
+        path.name for path in (session.directory / "code").glob("inspect-the-dataset-*.py")
+    )
+    assert projected == [
+        "inspect-the-dataset-analysis-code-dddddddd.py",
+        "inspect-the-dataset-analysis-recipe-dddddddd.py",
+    ]
+    assert not list((session.directory / "code").glob("*--view-*"))
+
+    # Each name resolves to its own artifact, so the pairing is stable rather than filesystem order.
+    code_dir = session.directory / "code"
+    assert (code_dir / projected[0]).resolve() == artifact_path / "analysis.py"
+    assert (code_dir / projected[1]).resolve() == artifact_path / "analysis-recipe.py"
 
 
 def test_nested_artifact_groups_remain_meaningfully_grouped(tmp_path: Path) -> None:
