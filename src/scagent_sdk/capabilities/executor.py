@@ -493,7 +493,37 @@ class CapabilityExecutor:
             raise CapabilityExecutionError("PostToolUse response has no execution ID")
         return self.commit(execution_id)
 
+    def _staged_sequence(self) -> dict[str, int]:
+        """Map execution ID to the sequence of the event that staged it.
+
+        ``_stage_result`` records ``capability.result_staged`` for every execution it stages, so
+        this is the authoritative order in which pending work was produced.
+        """
+
+        order: dict[str, int] = {}
+        try:
+            events = self.session.store.events()
+        except Exception:
+            return order
+        for event in events:
+            if event.kind != "capability.result_staged":
+                continue
+            execution_id = event.payload.get("execution_id")
+            if isinstance(execution_id, str):
+                order.setdefault(execution_id, event.sequence)
+        return order
+
     def recover_pending(self) -> list[str]:
+        """Commit orphaned staged results in the order they were produced.
+
+        Directory names are UUID4s, so sorting them replays crash recovery in an arbitrary order.
+        That matters because commits apply state patches in sequence: recovering two executions
+        backwards can leave the later patch overwritten by the earlier one. Order by the staging
+        event instead. A directory with no staging event -- ``result.json`` is written just before
+        the event is recorded, so a crash between the two is possible -- has no defensible position
+        in that order, and is committed after everything sequenced, by name for determinism.
+        """
+
         recovered: list[str] = []
         candidates = list(self.pending_root.iterdir() if self.pending_root.exists() else [])
         candidates.extend(
@@ -501,7 +531,13 @@ class CapabilityExecutor:
             for path in (self.artifact_root.iterdir() if self.artifact_root.exists() else [])
             if path.name not in self.session.store.state.artifacts
         )
-        for path in sorted(candidates):
+        order = self._staged_sequence()
+        # Sequences are global event numbers, not a dense 0..n range, so the sentinel has to clear
+        # the largest one actually present rather than the count of entries.
+        unsequenced = max(order.values(), default=0) + 1
+        for path in sorted(
+            candidates, key=lambda item: (order.get(item.name, unsequenced), item.name)
+        ):
             if path.is_dir() and (path / "result.json").is_file():
                 if self.commit(path.name):
                     recovered.append(path.name)
