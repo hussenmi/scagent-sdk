@@ -391,10 +391,16 @@ def _resolve_input_identities(
 
 
 def _analysis_patch(
-    identities: dict[str, str], path: Path, adata: Any, cluster_key: str
+    identities: dict[str, str], adata: Any, cluster_key: str
 ) -> dict[str, Any]:
+    """Re-assert the identities this evidence is bound to.
+
+    Deliberately does not touch ``dataset_revision.prepared_path``. Batch investigation reads a
+    matrix and writes none, so asserting a head would let a read-only tool redirect the analysis to
+    whatever file it happened to be handed -- including a stale one.
+    """
+
     return {
-        "dataset_revision": {"prepared_path": str(path)},
         "cell_set": {"id": identities["cell_set_id"], "n_cells": int(adata.n_obs)},
         "count_representation": {"id": identities["count_representation_id"]},
         "representation": {"id": identities["representation_id"]},
@@ -533,7 +539,7 @@ def run_evidence(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # 
     if cluster_key not in adata.obs:
         raise ValueError(f"observation column {cluster_key!r} is absent")
     ident = _resolve_input_identities(adata.uns.get("scagent_sdk", {}), adata, cluster_key)
-    analysis_patch = _analysis_patch(ident, path, adata, cluster_key)
+    analysis_patch = _analysis_patch(ident, adata, cluster_key)
 
     if batch_key is None:
         evidence = {
