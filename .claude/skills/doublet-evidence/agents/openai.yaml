@@ -1,0 +1,4 @@
+interface:
+  display_name: "Doublet Evidence"
+  short_description: "Run and review per-library Scrublet evidence"
+  default_prompt: "Use $doublet-evidence to generate per-library Scrublet calls from verified raw counts, keep calls for review, and remove only predicted_doublet cells after an explicit evidence-based decision."

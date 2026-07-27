@@ -1,0 +1,41 @@
+{
+  "skill": "marker-annotation",
+  "cases": [
+    {
+      "name": "pdc-not-plasma",
+      "prompt": "A cluster's top DEGs include GZMB, LILRA4, IL3RA, CLEC4C, IRF7 and TCF4, with no MZB1/JCHAIN/IGHG1. What cell type is this?",
+      "expect": [
+        "identify plasmacytoid dendritic cells from LILRA4/IL3RA/CLEC4C and the IRF7/TCF4 program",
+        "explicitly reject plasma cell because immunoglobulin/secretory markers are absent",
+        "note that GZMB alone is shared with cytotoxic cells and cannot carry the call"
+      ]
+    },
+    {
+      "name": "gzmb-alone-is-not-plasma",
+      "prompt": "This cluster is GZMB-high. Can we just call it plasma cells?",
+      "expect": [
+        "decline to call plasma without MZB1/JCHAIN/SDC1/XBP1/IGHG1 evidence",
+        "treat GZMB as a shared, down-weighted marker",
+        "ask for the full positive and negative marker picture before labeling"
+      ]
+    },
+    {
+      "name": "conflicting-evidence-lowers-confidence",
+      "prompt": "CellTypist says NK cell but the cluster DEGs are dominated by CD3D/TRAC/IL7R. Finalize it.",
+      "expect": [
+        "treat the cluster DEGs as the primary annotation basis",
+        "flag the disagreement and lower confidence rather than adopting the reference label",
+        "prefer a broader or qualified label if the conflict is unresolved"
+      ]
+    },
+    {
+      "name": "scrublet-is-not-an-identity",
+      "prompt": "Predicted doublets are enriched in this cluster. Label it doublets and move on.",
+      "expect": [
+        "treat Scrublet enrichment as probabilistic evidence for review, not a cell-type label",
+        "inspect marker identity, QC, and library distribution before any removal",
+        "do not finalize a cluster as 'doublet' on the Scrublet call alone"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+schema_version: 1
+skill:
+  id: cluster-qc
+  version: "0.6.0"
+  description: Artifact-scoped three-axis cluster quality evidence, complete figures, visual review, and optional bounded cleanup.
+tools:
+  - name: evaluate_cluster_qc
+    description: Adjudicate each cluster with metric QC, DEG-identity, and covariance/coherence evidence plus technical Moran's I, and remove only a bounded set of clusters on which all three axes converge as junk.
+    entrypoint: scripts/evaluate.py:run
+    environment: gpu-singlecell
+    activity_label: Evaluating cluster QC
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: Current prepared or integrated H5AD path.}
+        cluster_key: {type: string, default: leiden}
+        min_cluster_cells: {type: integer, minimum: 1, default: 20}
+        max_cells_for_silhouette: {type: integer, minimum: 100, default: 20000}
+        doublet_enrichment_ratio: {type: number, minimum: 1, default: 2.0}
+        doublet_rate_floor: {type: number, minimum: 0, maximum: 1, default: 0.1}
+        n_structure_genes:
+          type: integer
+          minimum: 20
+          maximum: 500
+          default: 150
+          description: Informative non-nuisance genes used for within-cluster correlation structure.
+        min_cells_for_structure: {type: integer, minimum: 5, default: 15}
+        max_cells_for_structure: {type: integer, minimum: 100, default: 3000}
+        moran_min_cells: {type: integer, minimum: 10, default: 40}
+        corr_threshold: {type: number, exclusiveMinimum: 0, maximum: 1, default: 0.3}
+        max_heatmaps:
+          type: [integer, "null"]
+          minimum: 1
+          default: null
+          description: Null renders every eligible cluster; an integer bounds pathological cluster counts.
+        metric_warning_z: {type: number, exclusiveMinimum: 0, default: 2.0}
+        metric_extreme_z: {type: number, exclusiveMinimum: 0, default: 3.0}
+        min_logfoldchange: {type: number, default: 0.25}
+        max_adjusted_pvalue: {type: number, exclusiveMinimum: 0, maximum: 1, default: 0.05}
+        auto_remove_convergent:
+          type: boolean
+          default: false
+          description: When false, evidence is produced with no cell removal (inspect/report only).
+        auto_remove_max_fraction:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 0.5
+          default: 0.2
+          description: A convergent removal at or above this fraction is held for review.
+        random_seed: {type: integer, default: 0}
+      required: [path]
+      additionalProperties: false
+  - name: review_cluster_qc
+    description: Record visual inspection of every cluster-QC figure and explicitly adjudicate each flagged cluster; non-keep dispositions remain unresolved until the requested mutation or reclustering occurs.
+    entrypoint: scripts/evaluate.py:review
+    environment: current
+    activity_label: Recording cluster QC review
+    input_schema:
+      type: object
+      properties:
+        evidence_id: {type: string, minLength: 1}
+        reviewed_artifacts:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+        visual_findings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        cluster_reviews:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              disposition:
+                type: string
+                enum: [keep, remove, merge, split, recluster, defer]
+              rationale: {type: string, minLength: 1}
+            required: [disposition, rationale]
+            additionalProperties: false
+      required: [evidence_id, reviewed_artifacts, visual_findings, cluster_reviews]
+      additionalProperties: false

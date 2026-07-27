@@ -1,0 +1,103 @@
+schema_version = 2
+host = "iris"
+
+# Physical runtimes own interpreter and loader activation. Logical capabilities below may
+# share a runtime without duplicating or exposing its host-specific mechanics to skills.
+[runtimes.rapids-main]
+python = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/rapids/bin/python"
+prefix = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/rapids"
+probe_timeout_seconds = 180
+gpu_probe = "cupy"
+probe_modules = ["torch", "numpy", "rapids_singlecell", "cupy", "scvi"]
+provenance_files = [
+  "/home/ibrahih3/projects/scagent-sdk/pixi.toml",
+  "/home/ibrahih3/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.rapids-main.environment]
+SCAGENT_GPU = "1"
+MPLBACKEND = "Agg"
+CUDA_HOME = "{prefix}"
+LD_PRELOAD = "{prefix}/lib/libstdc++.so.6:{prefix}/lib/libnvJitLink.so.13"
+
+[runtimes.cellbender]
+python = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/cellbender/bin/python"
+prefix = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/cellbender"
+probe_timeout_seconds = 300
+gpu_probe = "torch"
+probe_modules = ["torch", "cellbender"]
+provenance_files = [
+  "/home/ibrahih3/projects/scagent-sdk/pixi.toml",
+  "/home/ibrahih3/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.cellbender.environment]
+MPLBACKEND = "Agg"
+
+[runtimes.diffxpy]
+python = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/diffxpy/bin/python"
+prefix = "/home/ibrahih3/projects/scagent-sdk/.pixi/envs/diffxpy"
+probe_timeout_seconds = 180
+gpu_probe = "torch"
+probe_modules = ["numpy", "diffxpy"]
+provenance_files = [
+  "/home/ibrahih3/projects/scagent-sdk/pixi.toml",
+  "/home/ibrahih3/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.diffxpy.environment]
+MPLBACKEND = "Agg"
+TF_CPP_MIN_LOG_LEVEL = "3"
+CUDA_VISIBLE_DEVICES = ""
+
+[capabilities.gpu-singlecell]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 4096
+required_modules = ["anndata", "scanpy", "rapids_singlecell", "cupy", "sklearn"]
+
+[capabilities.gpu-singlecell.environment]
+SCIMILARITY_MODEL_PATH = "/data1/collab002/sail/shared/models/sci/human_v2"
+SCIMILARITY_MODEL_PATH_MOUSE = "/data1/collab002/sail/shared/models/sci/mouse_v1"
+
+[capabilities.scvi]
+runtime = "rapids-main"
+timeout_seconds = 14400
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 8192
+required_modules = ["anndata", "scanpy", "scvi", "cupy"]
+
+[capabilities.celltypist]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = false
+required_modules = ["anndata", "scanpy", "celltypist"]
+
+[capabilities.scimilarity]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 4096
+required_modules = ["anndata", "scanpy", "scimilarity", "cupy"]
+
+[capabilities.scimilarity.environment]
+SCIMILARITY_MODEL_PATH = "/data1/collab002/sail/shared/models/sci/human_v2"
+SCIMILARITY_MODEL_PATH_MOUSE = "/data1/collab002/sail/shared/models/sci/mouse_v1"
+
+[capabilities.cellbender]
+runtime = "cellbender"
+timeout_seconds = 21600
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 8192
+required_modules = ["cellbender", "torch", "h5py", "numpy", "scipy", "matplotlib"]
+
+[capabilities.diffxpy]
+runtime = "diffxpy"
+timeout_seconds = 7200
+gpu_required = false
+required_modules = ["diffxpy", "numpy"]

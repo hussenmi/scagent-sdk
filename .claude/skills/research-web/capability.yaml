@@ -1,0 +1,45 @@
+schema_version: 1
+
+skill:
+  id: research-web
+  version: "0.1.0"
+  description: Search and fetch bounded public web evidence with durable provenance.
+
+readiness:
+  entrypoint: scripts/readiness.py:probe
+
+tools:
+  - name: web_search
+    description: Search the current web with Tavily and return normalized, source-linked results. Requires TAVILY_API_KEY.
+    entrypoint: scripts/research_web.py:web_search
+    environment: current
+    activity_label: Searching web
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        query: {type: string, minLength: 2, maxLength: 400}
+        max_results: {type: integer, minimum: 1, maximum: 10, default: 5}
+        search_depth: {type: string, enum: [basic, advanced], default: basic}
+        topic: {type: string, enum: [general, news], default: general}
+        include_domains:
+          type: array
+          items: {type: string}
+          maxItems: 20
+        exclude_domains:
+          type: array
+          items: {type: string}
+          maxItems: 20
+      required: [query]
+  - name: fetch_web_page
+    description: Fetch bounded text from a public HTTP(S) page or save a public PDF, while blocking private-network targets and recording the source URL.
+    entrypoint: scripts/research_web.py:fetch_web_page
+    environment: current
+    activity_label: Fetching web page
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        url: {type: string, minLength: 8, maxLength: 2048}
+        max_chars: {type: integer, minimum: 1000, maximum: 40000, default: 30000}
+      required: [url]

@@ -1,0 +1,84 @@
+schema_version: 1
+skill:
+  id: doublet-evidence
+  version: "0.2.0"
+  description: GPU Scrublet evidence, explicit review, and identity-safe predicted-call filtering.
+tools:
+  - name: evaluate_doublet_evidence
+    description: Run GPU Scrublet on verified raw counts, normally per biological library, and register calls, plots, an annotated H5AD, and identity-bound evidence without removing cells.
+    entrypoint: scripts/doublets.py:run_evaluate
+    environment: gpu-singlecell
+    activity_label: Evaluating doublet evidence
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Any H5AD containing integer-valued raw counts in layers/counts or X.
+        batch_key:
+          type: [string, "null"]
+          description: Biological capture/library column; null is allowed only for a confirmed single-library run.
+        confirm_unstratified:
+          type: boolean
+          default: false
+          description: Explicit confirmation that null batch_key is scientifically appropriate.
+        expected_doublet_rate:
+          type: number
+          exclusiveMinimum: 0
+          exclusiveMaximum: 0.5
+          default: 0.06
+        sim_doublet_ratio:
+          type: number
+          minimum: 1
+          maximum: 10
+          default: 2.0
+        n_prin_comps:
+          type: integer
+          minimum: 2
+          maximum: 100
+          default: 30
+        min_cells_per_library:
+          type: integer
+          minimum: 20
+          default: 100
+        threshold:
+          type: [number, "null"]
+          minimum: 0
+          default: null
+          description: Optional explicit Scrublet threshold; null uses its predicted_doublet auto-threshold.
+        random_seed:
+          type: integer
+          default: 0
+        overwrite_existing_predictions:
+          type: boolean
+          default: false
+      required: [path, batch_key]
+      additionalProperties: false
+  - name: review_doublet_evidence
+    description: Record a conservative review decision or explicitly remove only current Scrublet predicted_doublet calls, issuing a new raw-count cell-set artifact and invalidating stale downstream evidence.
+    entrypoint: scripts/doublets.py:run_review
+    environment: gpu-singlecell
+    activity_label: Reviewing doublet evidence
+    floors: [current_doublet_evidence]
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Doublet-annotated H5AD registered by the current evidence result.
+        decision:
+          type: string
+          enum: [retain_for_cluster_review, keep_all, remove_predicted, request_guidance]
+        rationale:
+          type: string
+          minLength: 1
+        confirm_filtering:
+          type: boolean
+          default: false
+        max_removal_fraction:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 0.5
+          default: 0.2
+      required: [path, decision, rationale]
+      additionalProperties: false

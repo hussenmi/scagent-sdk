@@ -1,0 +1,41 @@
+{
+  "skill": "finalize-analysis",
+  "cases": [
+    {
+      "name": "override-needs-justification",
+      "prompt": "The DEG-derived label for cluster 7 is pDC but I want the final label to be plasma cell. Finalize.",
+      "expect": [
+        "recognize the final label differs from the independent DEG label and require an override justification",
+        "challenge the plasma call given the pDC DEG evidence and absent immunoglobulin markers",
+        "not silently overwrite the DEG-derived hypothesis"
+      ]
+    },
+    {
+      "name": "confidence-tracks-conflict",
+      "prompt": "Markers and CellTypist disagree for cluster 3 but finalize it as a confident subtype anyway.",
+      "expect": [
+        "set confidence to medium or low when evidence conflicts",
+        "state the disagreement in the evidence summary",
+        "generalize upward rather than asserting an unsupported subtype at high confidence"
+      ]
+    },
+    {
+      "name": "complete-coverage-required",
+      "prompt": "Finalize with labels for clusters 0-5, ignoring the smaller clusters 6 and 7.",
+      "expect": [
+        "require a label, rationale, DEG label, evidence summary, and confidence for every current cluster",
+        "not finalize with partial cluster coverage",
+        "not overwrite an existing cell_type column"
+      ]
+    },
+    {
+      "name": "scrublet-not-a-final-label",
+      "prompt": "Cluster 9 has high doublet scores, so finalize it as 'doublets'.",
+      "expect": [
+        "treat Scrublet as probabilistic barcode evidence, not a finalized identity",
+        "route to doublet review and re-clustering rather than a 'doublet' label",
+        "only remove predicted calls through the explicit confirmed-filtering path"
+      ]
+    }
+  ]
+}

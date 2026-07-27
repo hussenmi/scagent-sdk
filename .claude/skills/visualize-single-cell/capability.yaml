@@ -1,0 +1,105 @@
+schema_version: 1
+skill:
+  id: visualize-single-cell
+  version: "0.2.0"
+  description: Deterministic single-cell figures for QC, embeddings, composition, label agreement, and markers.
+tools:
+  - name: plot_qc_distributions
+    description: Plot per-cell library size, detected genes, mitochondrial percent, and the UMI-rank knee from a count matrix, optionally split by a grouping.
+    entrypoint: scripts/plots.py:plot_qc_distributions
+    environment: gpu-singlecell
+    activity_label: Plotting QC distributions
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: H5AD containing counts in the selected layer or X.}
+        counts_layer: {type: [string, "null"], default: null, description: Count layer name; null or X uses adata.X.}
+        gene_symbol_column: {type: [string, "null"], default: feature_name, description: var column holding gene symbols when var_names are Ensembl IDs.}
+        group_key: {type: [string, "null"], default: null, description: Optional obs column to compare QC across.}
+        max_groups: {type: integer, minimum: 1, maximum: 60, default: 30}
+      required: [path]
+      additionalProperties: false
+  - name: plot_embedding
+    description: Scatter an existing embedding with one panel per obs column or gene; requires an embedding to already exist.
+    entrypoint: scripts/plots.py:plot_embedding
+    environment: gpu-singlecell
+    activity_label: Plotting embedding
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        color_keys:
+          type: array
+          minItems: 1
+          maxItems: 9
+          items: {type: string}
+          description: obs columns or gene names, one panel each.
+        embedding_key: {type: [string, "null"], default: null, description: obsm key such as X_umap, X_scimilarity, or X_pca; the conventional one is used when null.}
+        expression_layer: {type: [string, "null"], default: null, description: Layer for gene panels; raw counts are normalized internally for display.}
+        point_size: {type: number, minimum: 0, default: 0, description: Zero chooses a size from the cell count.}
+        max_categories: {type: integer, minimum: 1, maximum: 60, default: 30}
+        random_seed: {type: integer, default: 0}
+      required: [path, color_keys]
+      additionalProperties: false
+  - name: plot_qc_embedding
+    description: Plot every available standard QC metric, doublet signal, and qc_flag_* column on an existing embedding for spatial quality review.
+    entrypoint: scripts/plots.py:plot_qc_embedding
+    environment: gpu-singlecell
+    activity_label: Plotting QC on embedding
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        embedding_key: {type: [string, "null"], default: null}
+        point_size: {type: number, minimum: 0, default: 0}
+        max_categories: {type: integer, minimum: 1, maximum: 60, default: 30}
+        random_seed: {type: integer, default: 0}
+      required: [path]
+      additionalProperties: false
+  - name: plot_group_composition
+    description: Plot the fractional composition of one categorical obs column within another, as stacked bars or a heatmap depending on cardinality.
+    entrypoint: scripts/plots.py:plot_group_composition
+    environment: gpu-singlecell
+    activity_label: Plotting composition
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        group_key: {type: string, description: obs column defining the groups on the x axis.}
+        class_key: {type: string, description: obs column whose fractions are shown within each group.}
+        max_classes: {type: integer, minimum: 1, maximum: 60, default: 30}
+      required: [path, group_key, class_key]
+      additionalProperties: false
+  - name: plot_label_agreement
+    description: Cross-tabulate two label columns as a row-normalized heatmap with exact-agreement and top-disagreement evidence.
+    entrypoint: scripts/plots.py:plot_label_agreement
+    environment: gpu-singlecell
+    activity_label: Plotting label agreement
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        first_key: {type: string}
+        second_key: {type: string}
+        max_labels: {type: integer, minimum: 2, maximum: 60, default: 25}
+      required: [path, first_key, second_key]
+      additionalProperties: false
+  - name: plot_marker_expression
+    description: Dot plot of mean expression and detection fraction for named genes across a grouping; raw counts are normalized internally for display.
+    entrypoint: scripts/plots.py:plot_marker_expression
+    environment: gpu-singlecell
+    activity_label: Plotting marker expression
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        group_key: {type: string}
+        genes:
+          type: array
+          minItems: 1
+          maxItems: 60
+          items: {type: string}
+        expression_layer: {type: [string, "null"], default: null}
+        max_groups: {type: integer, minimum: 1, maximum: 60, default: 30}
+      required: [path, group_key, genes]
+      additionalProperties: false

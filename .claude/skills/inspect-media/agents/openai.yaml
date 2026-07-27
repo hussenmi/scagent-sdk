@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inspect Media"
+  short_description: "Inspect images and PDF pages visually"
+  default_prompt: "Use $inspect-media to inspect this image or PDF with visual and extracted evidence."

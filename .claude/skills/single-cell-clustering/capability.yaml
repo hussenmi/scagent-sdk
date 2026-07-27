@@ -1,0 +1,37 @@
+schema_version: 1
+skill:
+  id: single-cell-clustering
+  version: "0.1.0"
+  description: Independent Leiden clustering and group-wise gene ranking.
+tools:
+  - name: cluster_single_cells
+    description: Run Leiden on an existing named neighbor graph and save labels under an explicit observation key.
+    entrypoint: scripts/clustering.py:cluster_cells
+    environment: gpu-singlecell
+    activity_label: Clustering cells
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        neighbors_key: {type: string, default: neighbors}
+        cluster_key: {type: string, default: leiden}
+        resolution: {type: number, exclusiveMinimum: 0, default: 0.8}
+        random_seed: {type: integer, default: 0}
+      required: [path]
+      additionalProperties: false
+  - name: rank_single_cell_groups
+    description: Rank genes for an existing grouping and save a complete differential-expression table.
+    entrypoint: scripts/clustering.py:rank_groups
+    environment: gpu-singlecell
+    activity_label: Ranking group genes
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        group_key: {type: string}
+        method: {type: string, enum: [wilcoxon, t-test, t-test_overestim_var, logreg], default: wilcoxon}
+        layer: {type: [string, "null"], default: null}
+        use_raw: {type: boolean, default: false}
+        reference: {type: string, default: rest}
+      required: [path, group_key]
+      additionalProperties: false

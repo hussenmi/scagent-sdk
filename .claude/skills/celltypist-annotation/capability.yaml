@@ -1,0 +1,37 @@
+schema_version: 1
+skill:
+  id: celltypist-annotation
+  version: "0.3.0"
+  description: Standalone per-cell CellTypist predictions and optional grouping summaries.
+readiness:
+  entrypoint: scripts/readiness.py:probe
+  environment: celltypist
+tools:
+  - name: run_celltypist_annotation
+    description: Run a cached CellTypist model on raw counts and gene symbols, saving per-cell labels and confidence.
+    entrypoint: scripts/run_celltypist.py:run
+    environment: celltypist
+    activity_label: Running CellTypist
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: "Any H5AD with raw counts in the selected layer or X."}
+        model: {type: string, default: Immune_All_Low.pkl, description: Cached model filename or absolute model path.}
+        counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}
+        output_key: {type: string, default: celltypist_prediction}
+      required: [path]
+      additionalProperties: false
+  - name: summarize_celltypist_by_cluster
+    description: Aggregate existing per-cell CellTypist predictions and confidence over any supplied grouping as an optional step separate from inference.
+    entrypoint: scripts/run_celltypist.py:summarize_by_cluster
+    environment: celltypist
+    activity_label: Summarizing CellTypist predictions
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        cluster_key: {type: string}
+        prediction_key: {type: string, default: celltypist_prediction}
+        confidence_key: {type: string, default: celltypist_prediction_confidence}
+      required: [path, cluster_key]
+      additionalProperties: false

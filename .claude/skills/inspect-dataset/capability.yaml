@@ -1,0 +1,77 @@
+schema_version: 1
+
+skill:
+  id: inspect-dataset
+  version: "0.2.0"
+  description: Establish deterministic file identity and report H5AD contents before scientific analysis.
+
+tools:
+  - name: inspect_dataset
+    description: Inspect a local dataset file, fingerprint it, and record provenance without loading the matrix.
+    entrypoint: scripts/inspect_dataset.py:run
+    environment: current
+    activity_label: Inspecting dataset
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Absolute or working-directory-relative path to the dataset file.
+        hash_mode:
+          type: string
+          enum: [sampled, full]
+          default: sampled
+          description: Sampled hashes metadata plus file head/tail; full hashes every byte.
+      required: [path]
+  - name: describe_dataset
+    description: Report the contents of an H5AD file (shape, X/layer/raw value facts, obs/var columns, embeddings, gene-identifier signals) without the model writing exploratory code. Judgment-free facts only.
+    entrypoint: scripts/describe.py:run
+    environment: gpu-singlecell
+    activity_label: Describing dataset contents
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Absolute or working-directory-relative path to an .h5ad file.
+        max_values:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: Maximum distinct values to list per low-cardinality obs/var column.
+        sample_rows:
+          type: integer
+          minimum: 100
+          maximum: 100000
+          default: 4000
+          description: Rows materialized in memory for matrix value sampling on backed files.
+      required: [path]
+  - name: convert_gene_ids
+    description: Convert var_names to gene symbols (offline, via the dataset's own symbol column) and save a new provenance-bearing AnnData with original IDs preserved. Use when describe_dataset reports Ensembl/Entrez/mixed var_names, before tools that align to a gene-symbol space (annotation, marker overlap, plotting).
+    entrypoint: scripts/convert.py:run
+    environment: gpu-singlecell
+    activity_label: Converting gene identifiers
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Absolute or working-directory-relative path to an .h5ad file.
+        organism:
+          type: string
+          enum: [auto, human, mouse]
+          default: auto
+          description: Species for optional case normalization and mygene scope; auto-detected from identifiers.
+        normalize_case:
+          type: boolean
+          default: false
+          description: Best-effort symbol case for the organism (human UPPER / mouse Title). Prefer reference-vocabulary alignment at annotation time.
+        use_mygene:
+          type: boolean
+          default: false
+          description: Opt-in online Ensembl/Entrez→symbol lookup via mygene.info when no in-file symbol column exists. Fails soft when offline.
+      required: [path]

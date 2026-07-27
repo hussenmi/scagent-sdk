@@ -1,0 +1,190 @@
+{
+  "skill_name": "scimilarity-annotation",
+  "evals": [
+    {
+      "id": "direct-raw-counts",
+      "prompt": "Run SCimilarity on CRC_counts.h5ad. It has raw counts in X and human symbols in var['feature_name']. Do not cluster the data.",
+      "expected_output": "Calls run_scimilarity_annotation directly with counts_layer X or null and organism human. It reports gene overlap, model path, embedding, per-cell predictions, and distance evidence.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "direct-call",
+          "description": "SCimilarity inference is called directly from its intrinsic inputs.",
+          "check": "The response calls run_scimilarity_annotation without a preprocessing or clustering dependency."
+        },
+        {
+          "id": "no-dag",
+          "description": "No unrelated predecessor operations are invented.",
+          "check": "The response does not claim PCA, neighbors, UMAP, Leiden, or cluster QC is required."
+        },
+        {
+          "id": "count-and-symbol-contract",
+          "description": "The count source and symbol source are explicit.",
+          "check": "The response uses raw X and recognizes feature_name as a candidate gene-symbol source."
+        }
+      ]
+    },
+    {
+      "id": "mouse-model",
+      "prompt": "Embed and annotate mouse cells with SCimilarity. var_names contain Ensembl IDs and var['mgi_symbol'] contains Cd3d, Ms4a1, Lyz, and Trp53.",
+      "expected_output": "Selects organism mouse, uses the configured mouse model or asks for an explicit model path if it is unavailable, aligns mgi_symbol to the model vocabulary, and does not infer species from letter case.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "mouse-config",
+          "description": "Uses the mouse model contract.",
+          "check": "The response selects organism mouse and SCIMILARITY_MODEL_PATH_MOUSE or an explicit mouse model path."
+        },
+        {
+          "id": "symbol-column",
+          "description": "Uses MGI symbols instead of raw Ensembl IDs.",
+          "check": "The response identifies mgi_symbol as the compatible gene-name source."
+        }
+      ]
+    },
+    {
+      "id": "normalized-input-refusal",
+      "prompt": "Run SCimilarity on scaled.h5ad; X has negative z-scores and there is no counts layer.",
+      "expected_output": "Refuses the input because it is not finite nonnegative integer counts, explains that SCimilarity owns normalization, and asks for a raw-count representation.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "intrinsic-refusal",
+          "description": "Refusal is tied to the model's real input contract.",
+          "check": "The response refuses scaled values and requests raw counts."
+        },
+        {
+          "id": "no-false-prerequisites",
+          "description": "Remediation does not introduce unrelated dependencies.",
+          "check": "The response does not require PCA, UMAP, or clustering."
+        }
+      ]
+    },
+    {
+      "id": "unknown-organism-is-asked-not-guessed",
+      "prompt": "Annotate cells.h5ad with SCimilarity. It has raw counts in X and gene symbols in var_names. I don't know what species it is.",
+      "expected_output": "Does not call the tool with a guessed organism. Asks which species the data is, or establishes it from dataset metadata first, explaining that human and mouse are separate references and that symbol casing does not determine species.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "no-guessed-organism",
+          "description": "Species is never assumed when unknown.",
+          "check": "The response does not silently pass organism human (or mouse); it asks or establishes the species first."
+        },
+        {
+          "id": "casing-is-not-species",
+          "description": "Does not reason from uppercase/lowercase symbols to a species.",
+          "check": "The response does not claim uppercase symbols prove human or mixed case proves mouse."
+        }
+      ]
+    },
+    {
+      "id": "species-contradiction-is-not-overridden-reflexively",
+      "prompt": "SCimilarity refused my run: 'declared organism mouse contradicts the input genes: input genes match 2,292 human-specific symbols but only 22 mouse-specific symbols.' Just make it work.",
+      "expected_output": "Explains that the data appears to be human and reruns with organism human, rather than setting allow_species_mismatch to bypass the check. Only offers the override for a deliberate cross-species experiment, and calls its output exploratory.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "fix-the-declaration",
+          "description": "The refusal is treated as evidence, not an obstacle.",
+          "check": "The response reruns with organism human instead of setting allow_species_mismatch=true."
+        },
+        {
+          "id": "override-is-qualified",
+          "description": "If the override is mentioned, it is qualified.",
+          "check": "Any mention of allow_species_mismatch describes it as deliberate cross-species exploration whose output is not an annotation."
+        }
+      ]
+    },
+    {
+      "id": "reference-query-for-an-ambiguous-cluster",
+      "prompt": "Cluster 7 in my annotated.h5ad got a low-confidence label and its SCimilarity distances are high. What is it actually similar to in the reference?",
+      "expected_output": "Calls query_reference_cells with group_key leiden and group_values ['7'] (or the equivalent grouping), then interprets the returned reference cell-type, tissue, and disease composition together with coherence and neighbor distance, treating them as evidence rather than a final label.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "uses-the-query-tool",
+          "description": "Reference characterization uses the atlas query, not another label transfer.",
+          "check": "The response calls query_reference_cells rather than rerunning run_scimilarity_annotation or writing custom search code."
+        },
+        {
+          "id": "interprets-coherence",
+          "description": "Coherence is read as population homogeneity evidence.",
+          "check": "The response interprets low coherence as a possibly mixed population rather than as a confidence score, and does not compare coherence across different k."
+        },
+        {
+          "id": "one-call-for-many-groups",
+          "description": "Index cost is respected.",
+          "check": "If several clusters are of interest, the response queries them in one call rather than one call per cluster."
+        }
+      ]
+    },
+    {
+      "id": "constrained-annotation-for-known-tissue",
+      "prompt": "SCimilarity annotated my colon biopsy and called some cells cardiac myocyte and alveolar macrophage. Those cannot be there.",
+      "expected_output": "Reruns run_scimilarity_annotation with target_celltypes restricted to plausible colon cell types, using exact model labels, and reports the agreement with the unconstrained calls plus which safelisted types matched no cells. Treats the implausible calls as evidence about reference coverage or contamination rather than silently deleting them.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "uses-constrained-annotation",
+          "check": "The response uses target_celltypes rather than post hoc renaming or dropping the implausible labels.",
+          "description": "The constraint is applied at inference, where the model can act on it."
+        },
+        {
+          "id": "agreement-is-reported",
+          "check": "The response reports how far constrained and unconstrained annotation agree, and does not present the constrained labels as verified truth.",
+          "description": "A safelist changes what is reachable, not what is correct."
+        }
+      ]
+    },
+    {
+      "id": "per-cell-query-stays-bounded",
+      "prompt": "Take my 40,000-cell dataset and search the SCimilarity reference for each cell so we can see what every cell matches.",
+      "expected_output": "Explains that per-cell atlas search costs one index search per cell and does not scale to 40,000, then offers the bounded alternatives: query_mode centroid over a grouping, or query_mode cells for a named handful of cells. Does not set max_query_cells to 40000.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "refuses-the-unbounded-shape",
+          "check": "The response does not attempt 40,000 per-cell queries or raise max_query_cells to accommodate them.",
+          "description": "Cost is a scientific design question, not a parameter to override."
+        },
+        {
+          "id": "offers-centroid-instead",
+          "check": "The response proposes centroid mode over clusters or labels as the way to cover the whole dataset.",
+          "description": "The right tool for a whole dataset is one query per population."
+        }
+      ]
+    },
+    {
+      "id": "self-study-hits-are-excluded",
+      "prompt": "My dataset is one of the studies in the SCimilarity reference. Query the atlas for what cluster 4 resembles.",
+      "expected_output": "Calls query_reference_cells with exclude_studies naming the dataset's own reference study id, or asks for that id, explaining that self-matches would otherwise dominate the neighbors and make the result circular. Interprets an emptied result as insufficient independent support at that k, not as a weak biological match.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "excludes-self",
+          "check": "The response uses exclude_studies (or asks which study id to exclude) before interpreting composition.",
+          "description": "Self-referencing hits invalidate the composition read."
+        },
+        {
+          "id": "reads-emptiness-correctly",
+          "check": "If exclusion leaves no neighbors, the response treats it as needing a larger k or a different query, not as evidence about the biology.",
+          "description": "An empty post-exclusion result is a coverage statement."
+        }
+      ]
+    },
+    {
+      "id": "optional-cluster-summary",
+      "prompt": "SCimilarity already ran and its per-cell predictions are saved. Summarize them by my cell_state column.",
+      "expected_output": "Calls summarize_scimilarity_by_cluster on the annotated H5AD with cluster_key cell_state and reports the group-level prediction distribution.",
+      "files": [],
+      "assertions": [
+        {
+          "id": "separate-summary",
+          "description": "Aggregation is separate from inference.",
+          "check": "The response uses summarize_scimilarity_by_cluster rather than rerunning inference."
+        }
+      ]
+    }
+  ]
+}

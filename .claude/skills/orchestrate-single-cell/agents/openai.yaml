@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate Single-Cell"
+  short_description: "Guide evidence-driven single-cell analysis"
+  default_prompt: "Use $orchestrate-single-cell to plan and carry out this single-cell analysis."

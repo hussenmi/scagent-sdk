@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from scagent_sdk.capabilities.executor import _concise_capability_error
+from scagent_sdk.capabilities.registry import CapabilityRegistry
+
+
+def _package() -> Any:
+    skills_root = Path(__file__).parents[2] / ".claude" / "skills"
+    return next(
+        item
+        for item in CapabilityRegistry(skills_root).discover()
+        if item.manifest.skill_id == "analysis-workspace"
+    )
+
+
+def _tool(name: str) -> Any:
+    package = _package()
+    tool = next(tool for tool in package.manifest.tools if tool.name == name)
+    return package.load_handler(tool)
+
+
+def test_custom_python_has_no_ast_denylist() -> None:
+    handler = _tool("run_analysis_code")
+    assert "_validate" not in handler.__globals__
+    source = (_package().root / "scripts" / "run_code.py").read_text(encoding="utf-8")
+    assert "BLOCKED_IMPORTS" not in source
+    assert 'compile(code, "analysis.py", "exec")' in source
+
+
+def test_general_shell_supports_pipes_expansion_and_provenance(tmp_path: Path) -> None:
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    context = SimpleNamespace(session_dir=tmp_path, staging_dir=staging)
+    result = _tool("run_shell_command")(
+        {
+            "command": "printf 'alpha\\nbeta\\n' | tail -n 1",
+            "timeout_seconds": 5,
+        },
+        context,
+    )
+    assert result["details"]["stdout"] == "beta\n"
+    assert (staging / "shell-command.sh").is_file()
+    assert (staging / "shell-run.json").is_file()
+
+
+def test_general_shell_refuses_catastrophic_root_removal(tmp_path: Path) -> None:
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    context = SimpleNamespace(session_dir=tmp_path, staging_dir=staging)
+    with pytest.raises(ValueError, match="catastrophic destructive pattern"):
+        _tool("run_shell_command")({"command": "rm -rf /"}, context)
+
+
+def test_concise_error_extracts_final_exception_line() -> None:
+    message = (
+        "run_analysis_code failed in gpu-singlecell (exit 1): Traceback (most recent call last):\n"
+        '  File "x", line 43, in run\n'
+        "    raise ValueError(...)\n"
+        "ValueError: input count matrix is invalid"
+    )
+    assert _concise_capability_error(message) == "input count matrix is invalid"
+
+
+def test_concise_error_passes_through_single_line_messages() -> None:
+    message = "scientific floor denied execution: [dataset_identity] no identity. Run inspect."
+    assert _concise_capability_error(message) == message
+
+
+def test_concise_error_is_bounded() -> None:
+    assert len(_concise_capability_error("KeyError: " + "z" * 5000)) <= 300

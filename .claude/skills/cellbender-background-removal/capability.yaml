@@ -1,0 +1,87 @@
+schema_version: 1
+skill:
+  id: cellbender-background-removal
+  version: "0.2.0"
+  description: Strict raw-droplet validation and GPU CellBender ambient-background removal.
+tools:
+  - name: validate_cellbender_input
+    description: Validate any raw 10x H5 for empty-droplet evidence, establish its byte identity, and produce a UMI-rank plot and suitability attestation without changing data.
+    entrypoint: scripts/run_cellbender.py:run_validate
+    environment: cellbender
+    activity_label: Validating CellBender input
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Any candidate raw, unfiltered 10x H5 path.
+      required: [path]
+      additionalProperties: false
+  - name: remove_ambient_background
+    description: Run GPU CellBender on a currently validated raw droplet matrix, register all outputs and provenance, and issue a corrected-count dataset lineage that invalidates stale downstream evidence.
+    entrypoint: scripts/run_cellbender.py:run_remove
+    environment: cellbender
+    activity_label: Removing ambient background
+    floors: [dataset_identity, cellbender_input_suitable]
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Exact raw 10x H5 path from the current suitability attestation.
+        expected_cells:
+          type: [integer, "null"]
+          minimum: 1
+          default: null
+          description: Optional expected cell count; omit on the first run unless justified.
+        total_droplets_included:
+          type: [integer, "null"]
+          minimum: 2
+          default: null
+          description: Optional rank-ordered droplet count; omit unless the UMI curve justifies it.
+        fpr:
+          type: number
+          minimum: 0
+          exclusiveMaximum: 1
+          default: 0.01
+          description: CellBender target false-positive rate.
+        epochs:
+          type: [integer, "null"]
+          minimum: 1
+          default: null
+          description: Optional epoch override; null uses CellBender 0.3.2's default.
+        model:
+          type: string
+          enum: [naive, simple, ambient, swapping, full]
+          default: full
+        low_count_threshold:
+          type: [integer, "null"]
+          minimum: 0
+          default: null
+        posterior_batch_size:
+          type: [integer, "null"]
+          minimum: 1
+          default: null
+        exclude_feature_types:
+          type: array
+          items: {type: string, minLength: 1}
+          uniqueItems: true
+          default: []
+          description: Additional feature types to leave unchanged; detected non-Gene Expression types are excluded automatically.
+        selected_output:
+          type: string
+          enum: [filtered, full]
+          default: filtered
+          description: Corrected matrix that becomes the active dataset revision.
+        checkpoint_path:
+          type: [string, "null"]
+          default: null
+          description: Optional prior CellBender checkpoint; copied into staging and never modified in place.
+        timeout_seconds:
+          type: integer
+          minimum: 60
+          maximum: 21000
+          default: 21000
+          description: Inner timeout kept below the broker's six-hour hard limit so failure artifacts can commit.
+      required: [path]
+      additionalProperties: false

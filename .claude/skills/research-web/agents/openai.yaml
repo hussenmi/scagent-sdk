@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Web"
+  short_description: "Search the web with traceable sources"
+  default_prompt: "Use $research-web to find current, source-linked evidence for this question."

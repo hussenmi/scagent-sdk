@@ -1,0 +1,29 @@
+schema_version = 1
+
+[profile]
+name = "local-default"
+runtime = "claude-agent-sdk"
+transport = "litellm"
+model = "scagent-primary"
+small_fast_model = "scagent-fast"
+base_url = "http://127.0.0.1:4000"
+api_key_env = "SCAGENT_SDK_GATEWAY_API_KEY"
+allow_noauth = true
+system_prompt = "prompts/base.md"
+max_turns = 40
+skills = []
+
+[health]
+paths = ["/health/liveliness", "/health"]
+
+# Reasoning is enabled at the gateway (the litellm config sets enable_thinking and merges
+# reasoning into <think> blocks), so inject no Claude-native thinking options here ("native");
+# the terminal extracts and dims the reasoning it receives.
+[thinking]
+mode = "native"
+show = true
+save = true
+
+[environment]
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+

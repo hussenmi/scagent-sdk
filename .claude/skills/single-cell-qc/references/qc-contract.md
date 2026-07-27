@@ -1,0 +1,15 @@
+# QC evidence and filtering contract
+
+The standard cell metrics are total counts, detected genes, and mitochondrial-count percentage.
+They describe technical or physiological signals; none alone proves a cell is unusable.
+
+Human mitochondrial symbols commonly begin `MT-`. Mouse symbols commonly begin `mt-` or `Mt-`.
+When `var_names` are Ensembl identifiers, a symbol column such as `feature_name`,
+`gene_symbol`, or `mgi_symbol` is used if present.
+
+`calculate_single_cell_qc` writes Boolean flags for the requested thresholds and reports exact
+flag counts. It does not subset the object.
+
+`filter_single_cells` and `filter_single_cell_genes` are mutation operations. Each requires an
+explicit confirmation argument, saves a new H5AD, records before/after counts, refreshes affected
+identities, and invalidates downstream state. They never overwrite the source.

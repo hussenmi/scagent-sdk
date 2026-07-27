@@ -1,0 +1,48 @@
+schema_version: 1
+skill:
+  id: finalize-analysis
+  version: "0.4.0"
+  description: Gated label adjudication and final artifact publication.
+tools:
+  - name: finalize_analysis
+    description: Validate complete cluster labels and rationales, save final annotated AnnData and report, and mark the scientific session finalized.
+    entrypoint: scripts/finalize.py:run
+    environment: gpu-singlecell
+    activity_label: Finalizing analysis
+    floors:
+      [dataset_identity, current_cell_qc_review, current_cluster_qc, batch_decision,
+       current_annotation_evidence]
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: Current prepared or integrated H5AD path.}
+        cluster_key: {type: string, default: leiden}
+        label_key: {type: string, default: cell_type}
+        labels:
+          type: object
+          additionalProperties: {type: string, minLength: 1}
+        rationales:
+          type: object
+          additionalProperties: {type: string, minLength: 1}
+        deg_labels:
+          type: object
+          description: Independently written label hypothesis derived from current cluster DEG/marker evidence.
+          additionalProperties: {type: string, minLength: 1}
+        evidence_summaries:
+          type: object
+          description: Per-cluster synthesis naming DEG markers and independent reference evidence.
+          additionalProperties: {type: string, minLength: 1}
+        confidence:
+          type: object
+          additionalProperties: {type: string, enum: [high, medium, low]}
+        overrides:
+          type: object
+          default: {}
+          description: Required per-cluster justification whenever the final label differs from deg_labels.
+          additionalProperties: {type: string, minLength: 1}
+        analysis_summary: {type: string, minLength: 1}
+        caveats:
+          type: array
+          items: {type: string}
+      required: [path, labels, rationales, deg_labels, evidence_summaries, confidence, analysis_summary]
+      additionalProperties: false

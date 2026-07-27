@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from scagent_sdk.capabilities.registry import CapabilityRegistry
+
+
+def _packages() -> dict[str, Any]:
+    root = Path(__file__).parents[2] / ".claude" / "skills"
+    return {package.manifest.skill_id: package for package in CapabilityRegistry(root).discover()}
+
+
+def _handler(skill: str, tool_name: str) -> Any:
+    package = _packages()[skill]
+    tool = next(tool for tool in package.manifest.tools if tool.name == tool_name)
+    return package.load_handler(tool)
+
+
+def test_qc_defaults_to_auto_and_exposes_review_tool() -> None:
+    package = _packages()["single-cell-qc"]
+    tools = {tool.name: tool for tool in package.manifest.tools}
+    assert package.manifest.version == "0.2.0"
+    assert tools["calculate_single_cell_qc"].input_schema["properties"]["counts_layer"][
+        "default"
+    ] == "auto"
+    assert "review_single_cell_qc" in tools
+
+
+def test_qc_auto_layer_prefers_counts_then_x() -> None:
+    resolve = _handler("single-cell-qc", "calculate_single_cell_qc").__globals__[
+        "_resolve_layer"
+    ]
+    assert resolve(SimpleNamespace(layers={"counts": object()}), "auto") == "counts"
+    assert resolve(SimpleNamespace(layers={}), "auto") is None
+    assert resolve(SimpleNamespace(layers={}), None) is None
+    assert resolve(SimpleNamespace(layers={"raw": object()}), "raw") == "raw"
+
+
+def test_qc_review_requires_every_figure_and_resolves_keep_all() -> None:
+    review = _handler("single-cell-qc", "review_single_cell_qc")
+    context = SimpleNamespace(
+        state_facts={
+            "cell_qc": {
+                "status": "assessed",
+                "assessment_id": "qc-a",
+                "cell_set_id": "cells-a",
+                "count_representation_id": "counts-a",
+                "required_visual_artifacts": ["figures/a.png", "figures/b.png"],
+            }
+        }
+    )
+    arguments = {
+        "assessment_id": "qc-a",
+        "decision": "keep_all",
+        "rationale": "The high-MT population is coherent and retained for cluster review.",
+        "visual_findings": ["The high-MT tail is continuous rather than bimodal."],
+        "reviewed_artifacts": ["figures/a.png"],
+    }
+    with pytest.raises(ValueError, match="visual review is incomplete"):
+        review(arguments, context)
+    arguments["reviewed_artifacts"].append("figures/b.png")
+    result = review(arguments, context)
+    assert result["facts_patch"]["cell_qc"]["review"]["status"] == "resolved"
+
+
+def test_umap_default_uses_scanpy_convention_without_stripping_prefix() -> None:
+    helper = _handler(
+        "dimensionality-reduction", "compute_single_cell_umap"
+    ).__globals__["_scanpy_umap_key"]
+    assert helper("X_umap") is None
+    assert helper("umap_secondary") == "umap_secondary"
+
+
+def test_cluster_review_requires_all_figures_and_exact_flagged_clusters() -> None:
+    review = _handler("cluster-qc", "review_cluster_qc")
+    context = SimpleNamespace(
+        state_facts={
+            "cluster_qc": {
+                "status": "attested",
+                "evidence_id": "cluster-qc-a",
+                "clustering_id": "clusters-a",
+                "review_clusters": ["2"],
+                "required_visual_artifacts": ["metric.png", "umap.png", "cluster_2.png"],
+            }
+        }
+    )
+    arguments = {
+        "evidence_id": "cluster-qc-a",
+        "reviewed_artifacts": ["metric.png", "umap.png", "cluster_2.png"],
+        "visual_findings": ["Cluster 2 has a coherent covariance block."],
+        "cluster_reviews": {
+            "2": {
+                "disposition": "keep",
+                "rationale": "Identity DEGs and structured covariance outweigh the metric flag.",
+            }
+        },
+    }
+    result = review(arguments, context)
+    fact = result["facts_patch"]["cluster_qc"]["review"]
+    assert fact["status"] == "resolved"
+    assert fact["unresolved_clusters"] == []
+
+    arguments["cluster_reviews"]["2"]["disposition"] = "recluster"
+    result = review(arguments, context)
+    assert result["facts_patch"]["cluster_qc"]["review"]["status"] == "action_required"
+
+
+def test_annotation_review_requires_second_reference_or_specific_waiver() -> None:
+    review = _handler("marker-annotation", "review_annotation_evidence")
+    context = SimpleNamespace(
+        state_facts={
+            "analysis": {"clustering": {"id": "clusters-a"}},
+            "annotation": {
+                "evidence": {
+                    "markers": {
+                        "status": "complete",
+                        "clustering_id": "clusters-a",
+                        "evidence_id": "markers-a",
+                    },
+                    "scimilarity": {
+                        "status": "complete",
+                        "clustering_id": "clusters-a",
+                        "evidence_id": "scim-a",
+                    },
+                }
+            },
+        }
+    )
+    arguments = {
+        "methods_reviewed": ["markers", "scimilarity"],
+        "reviewed_artifacts": ["cluster-deg.csv", "scimilarity-clusters.csv"],
+        "agreement_findings": ["DEGs and SCimilarity agree at broad lineage level."],
+        "unresolved_clusters": [],
+        "rationale": "Labels remain DEG-led.",
+    }
+    with pytest.raises(ValueError, match="reference_waiver"):
+        review(arguments, context)
+    arguments["reference_waiver"] = "No compatible cached CellTypist model exists."
+    result = review(arguments, context)
+    assert result["facts_patch"]["annotation"]["review"]["status"] == "resolved"
+

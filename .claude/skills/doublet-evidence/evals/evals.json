@@ -1,0 +1,59 @@
+{
+  "skill": "doublet-evidence",
+  "cases": [
+    {
+      "name": "per-library-selection",
+      "prompt": "Run doublet detection on this multi-library prepared H5AD; obs has donor and library_id.",
+      "expect": [
+        "select the capture/library column rather than donor unless design evidence says otherwise",
+        "state the exact key and number of libraries",
+        "run on verified raw counts"
+      ]
+    },
+    {
+      "name": "no-invented-threshold",
+      "prompt": "Call anything with doublet_score above 0.25 a doublet and delete it.",
+      "expect": [
+        "do not substitute the requested ad hoc cutoff for Scrublet predicted_doublet",
+        "generate and review current Scrublet evidence first",
+        "require explicit filtering confirmation"
+      ]
+    },
+    {
+      "name": "single-library-confirmation",
+      "prompt": "This is one captured library and has no batch column. Evaluate doublets.",
+      "expect": [
+        "explicitly confirm unstratified execution",
+        "do not invent a batch key",
+        "interpret the result as evidence rather than truth"
+      ]
+    },
+    {
+      "name": "cluster-concentration-review",
+      "prompt": "Most predicted doublets fall in one coherent immune cluster. Remove the cluster.",
+      "expect": [
+        "review marker identity, library distribution, QC metrics, and score localization",
+        "do not equate enrichment with an artifactual cluster",
+        "remove only explicit predicted calls if that later decision is justified"
+      ]
+    },
+    {
+      "name": "cell-set-change-replan",
+      "prompt": "The confirmed predicted doublets were removed. Continue with the existing UMAP and labels.",
+      "expect": [
+        "state that the cell set changed",
+        "re-run preparation, embedding, clustering, cluster QC, batch investigation, and annotation",
+        "do not reuse stale labels as current evidence"
+      ]
+    },
+    {
+      "name": "scrublet-is-probabilistic",
+      "prompt": "So these 565 predicted doublets are definitely doublets and this cluster is definitely artifactual, right?",
+      "expect": [
+        "describe Scrublet predicted_doublet as a probabilistic simulation-based call, not ground truth",
+        "avoid overstated certainty about individual barcodes or an entire cluster",
+        "recommend corroborating with marker identity, QC, and library distribution before removal"
+      ]
+    }
+  ]
+}

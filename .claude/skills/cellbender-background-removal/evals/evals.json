@@ -1,0 +1,50 @@
+{
+  "skill": "cellbender-background-removal",
+  "cases": [
+    {
+      "name": "raw-droplet-request",
+      "prompt": "Remove ambient RNA from this raw_feature_bc_matrix.h5 before QC.",
+      "expect": [
+        "inspect exact dataset identity",
+        "validate empty-droplet suitability",
+        "run CellBender only after validation",
+        "review metrics and report",
+        "state that downstream QC is still required"
+      ]
+    },
+    {
+      "name": "filtered-input-refusal",
+      "prompt": "Run CellBender on filtered_feature_bc_matrix.h5.",
+      "expect": [
+        "refuse filtered input",
+        "request a raw unfiltered droplet matrix",
+        "do not treat import or process startup as validation"
+      ]
+    },
+    {
+      "name": "routine-analysis-skip",
+      "prompt": "Cluster this already processed H5AD.",
+      "expect": [
+        "do not select CellBender merely because it is available"
+      ]
+    },
+    {
+      "name": "warning-replan",
+      "prompt": "Continue after CellBender reported a failed convergence or implausible cell prior.",
+      "expect": [
+        "do not claim a clean matrix",
+        "inspect logs and UMI evidence",
+        "revise justified parameters or stop with an explicit blocker"
+      ]
+    },
+    {
+      "name": "suitability-threshold-is-not-cell-count",
+      "prompt": "The validator required 3,963 low-count barcodes and observed 323,534. How many cells should I pass as expected_cells?",
+      "expect": [
+        "state that 3,963 is only the one-percent minimum empty-tail evidence gate",
+        "do not report 3,963 as a cell estimate",
+        "leave expected_cells unset unless independent evidence or a justified UMI-knee estimate is available"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+schema_version: 1
+
+skill:
+  id: research-literature
+  version: "0.1.0"
+  description: Search biomedical literature and retrieve open-access full text with citation-grade provenance.
+
+tools:
+  - name: search_literature
+    description: Search MEDLINE/PubMed, PubMed Central, and preprint servers through Europe PMC. Returns structured citation records (PMID, PMCID, DOI, authors, journal, year, abstract, open-access flag). Use for biological claims that need a citation; use research-web for software documentation.
+    entrypoint: scripts/research_literature.py:search_literature
+    environment: current
+    activity_label: Searching literature
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        query: {type: string, minLength: 2, maxLength: 400}
+        max_results: {type: integer, minimum: 1, maximum: 25, default: 8}
+        recent_years: {type: integer, minimum: 1, maximum: 50}
+        sort: {type: string, enum: [relevance, date], default: relevance}
+        reviews_only: {type: boolean, default: false}
+        open_access_only: {type: boolean, default: false}
+        include_preprints: {type: boolean, default: true}
+        pubmed_only: {type: boolean, default: false}
+      required: [query]
+  - name: fetch_article_fulltext
+    description: Retrieve the open-access full text of an article from Europe PMC by PMCID (preferred) or PMID, as bounded readable text with a durable artifact. Fails with guidance when the article is not open access.
+    entrypoint: scripts/research_literature.py:fetch_article_fulltext
+    environment: current
+    activity_label: Fetching article full text
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        pmcid: {type: string, minLength: 4, maxLength: 16}
+        pmid: {type: string, minLength: 1, maxLength: 9}
+        max_chars: {type: integer, minimum: 1000, maximum: 40000, default: 30000}

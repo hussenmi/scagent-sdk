@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inspect Dataset"
+  short_description: "Inspect datasets before scientific analysis"
+  default_prompt: "Use $inspect-dataset to inspect this dataset and record its basic identity."

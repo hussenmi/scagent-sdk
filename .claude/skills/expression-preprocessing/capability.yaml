@@ -1,0 +1,34 @@
+schema_version: 1
+skill:
+  id: expression-preprocessing
+  version: "0.1.0"
+  description: Independent normalization and highly-variable-gene selection.
+tools:
+  - name: normalize_single_cell_expression
+    description: Normalize a raw-count layer to a target total and log1p-transform X while preserving raw counts.
+    entrypoint: scripts/preprocess.py:normalize_expression
+    environment: gpu-singlecell
+    activity_label: Normalizing expression
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        counts_layer: {type: string, default: counts}
+        target_sum: {type: number, exclusiveMinimum: 0, default: 10000}
+      required: [path]
+      additionalProperties: false
+  - name: select_highly_variable_genes
+    description: Compute and record a highly-variable-gene mask without subsetting or running dimensionality reduction.
+    entrypoint: scripts/preprocess.py:select_hvg
+    environment: gpu-singlecell
+    activity_label: Selecting variable genes
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        n_top_genes: {type: integer, minimum: 2, default: 3000}
+        flavor: {type: string, enum: [seurat, cell_ranger, seurat_v3, seurat_v3_paper], default: seurat}
+        layer: {type: [string, "null"], default: null, description: Optional matrix layer; null uses X.}
+        batch_key: {type: [string, "null"], default: null}
+      required: [path]
+      additionalProperties: false

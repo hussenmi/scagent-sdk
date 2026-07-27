@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Literature"
+  short_description: "Search papers and read open-access full text"
+  default_prompt: "Use $research-literature to find citation-backed evidence for this biological claim."

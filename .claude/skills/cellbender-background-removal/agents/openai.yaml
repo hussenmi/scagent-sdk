@@ -1,0 +1,4 @@
+interface:
+  display_name: "CellBender Background Removal"
+  short_description: "Validate raw droplets and remove ambient RNA"
+  default_prompt: "Use $cellbender-background-removal to validate this raw droplet matrix and run CellBender only if the input is scientifically suitable."

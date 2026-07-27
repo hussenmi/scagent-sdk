@@ -1,0 +1,71 @@
+schema_version: 1
+skill:
+  id: scimilarity-annotation
+  version: "0.5.0"
+  description: Standalone SCimilarity per-cell embedding, constrained and unconstrained reference annotation, and reference atlas cell query.
+readiness:
+  entrypoint: scripts/readiness.py:probe
+  environment: scimilarity
+tools:
+  - name: run_scimilarity_annotation
+    description: Run SCimilarity on raw counts, compatible gene identifiers, and a local reference model, saving per-cell embeddings, kNN predictions, and novelty distances.
+    entrypoint: scripts/run_scimilarity.py:run
+    environment: scimilarity
+    activity_label: Running SCimilarity
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: Any H5AD containing raw counts in the selected layer or X.}
+        organism: {type: string, enum: [human, mouse], description: "Required. Declare the dataset species explicitly; it is never inferred from gene-symbol casing, and it is verified against the organism-specific parts of both model vocabularies."}
+        allow_species_mismatch: {type: boolean, default: false, description: Run even when the input genes contradict the declared organism. Exploratory only; the mismatch is recorded with the run.}
+        model_path: {type: [string, "null"], default: null, description: Local model directory; otherwise uses the organism-specific configured path.}
+        counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}
+        min_gene_overlap: {type: integer, minimum: 1, default: 5000}
+        output_key: {type: string, default: scimilarity_prediction}
+        knn_k: {type: integer, minimum: 1, maximum: 1000, default: 50, description: Reference neighbors that vote on each cell's label. Larger k smooths noisy per-cell calls; smaller k follows local structure.}
+        weighting: {type: boolean, default: false, description: Weight each neighbor's vote by inverse distance instead of counting votes equally.}
+        target_celltypes: {type: [array, "null"], default: null, items: {type: string}, description: "Constrained annotation: restrict predictions to these reference labels, which must be exact labels of this model (validated, with near-miss hints). Runs alongside the unconstrained call from the same embeddings and reports how far the two agree. Use when the tissue's expected cell types are known and unconstrained output includes implausible types."}
+      required: [path, organism]
+      additionalProperties: false
+  - name: summarize_scimilarity_by_cluster
+    description: Aggregate existing per-cell SCimilarity predictions over any supplied grouping; this optional step is separate from model inference.
+    entrypoint: scripts/run_scimilarity.py:summarize_by_cluster
+    environment: scimilarity
+    activity_label: Summarizing SCimilarity predictions
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: H5AD produced by run_scimilarity_annotation or containing an equivalent prediction column.}
+        cluster_key: {type: string}
+        prediction_key: {type: string, default: scimilarity_prediction}
+      required: [path, cluster_key]
+      additionalProperties: false
+  - name: query_reference_cells
+    description: Search the SCimilarity reference cell atlas for the cells most similar to a selected population, returning reference cell-type, tissue, disease, and study composition, neighbor distances, and query coherence. Use to characterize novel or ambiguous populations; needs the model's cell-search index and loads it into memory, so query the groups of interest in one call.
+    entrypoint: scripts/query_reference.py:query
+    environment: scimilarity
+    activity_label: Querying SCimilarity reference cells
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: H5AD containing raw counts in the selected layer or X.}
+        organism: {type: string, enum: [human, mouse], description: "Required. Declare the dataset species explicitly; verified against both model vocabularies before the index is loaded."}
+        group_key: {type: [string, "null"], default: null, description: obs column whose groups each become one centroid query (for example a clustering or an annotation column). Provide this or cell_ids.}
+        group_values: {type: [array, "null"], default: null, items: {type: string}, description: Which values of group_key to query. Omit to query every group, which fails rather than truncating if there are more than max_queries.}
+        cell_ids: {type: [array, "null"], default: null, items: {type: string}, description: Explicit obs_names forming a single centroid query. Provide this or group_key.}
+        k: {type: integer, minimum: 10, maximum: 10000, default: 100, description: Reference cells retrieved per query. Coherence is scored against this k, so compare coherence only across equal k.}
+        max_dist: {type: [number, "null"], default: null, description: Return every reference cell within this embedding distance instead of a fixed k. Distances are model-specific, not calibrated probabilities.}
+        query_mode: {type: string, enum: [centroid, cells], default: centroid, description: "centroid averages each selected group into one query vector (ask about a population). cells makes every selected cell its own query (ask what one specific cell resembles), which costs one atlas search per cell."}
+        max_query_cells: {type: integer, minimum: 1, maximum: 200, default: 10, description: "Hard cap on per-cell queries in cells mode. Deliberately small: a larger selection is refused with its size rather than silently subsampled or left running."}
+        exclude_studies: {type: [array, "null"], default: null, items: {type: string}, description: "Drop hits from these reference study ids before summarizing. Use when the query data is itself in the reference, where self-matches otherwise dominate; the removed count is reported, and a query left with no neighbors says so."}
+        summarize_samples: {type: boolean, default: true, description: Also report which reference studies and samples the hits came from, as a fraction of each sample's cells — distinguishes a population scattered across many samples from one concentrated in a specific sample.}
+        compare_to_reference_background: {type: boolean, default: true, description: Also report the reference-wide disease and tissue composition for the leading matched cell type, so query fractions can be read as enrichment rather than in isolation.}
+        min_query_cells: {type: integer, minimum: 2, default: 10, description: In centroid mode, groups smaller than this are reported as skipped rather than queried.}
+        measure_coherence: {type: boolean, default: true, description: "Measure whether each query lands in one region of the reference. It costs about ten extra atlas searches per query — measured at 55s versus 6s per query against the 43M-cell human atlas — so set false when you only need composition for many groups."}
+        max_queries: {type: integer, minimum: 1, maximum: 200, default: 40, description: Refuse rather than silently truncate when a grouping has more groups than this.}
+        allow_species_mismatch: {type: boolean, default: false, description: Query a reference whose vocabulary contradicts the declared organism. Exploratory only.}
+        model_path: {type: [string, "null"], default: null, description: Local model directory containing cellsearch/; otherwise uses the organism-specific configured path.}
+        counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}
+        min_gene_overlap: {type: integer, minimum: 1, default: 5000}
+      required: [path, organism]
+      additionalProperties: false

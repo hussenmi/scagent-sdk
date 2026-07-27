@@ -1,0 +1,26 @@
+schema_version: 1
+skill:
+  id: single-cell-counts
+  version: "0.1.0"
+  description: Independent raw-count source resolution and materialization.
+tools:
+  - name: materialize_count_matrix
+    description: Load H5AD or 10x data, validate and select one raw-count source, and save a count-ready H5AD with preserved observations and variables.
+    entrypoint: scripts/counts.py:run
+    environment: gpu-singlecell
+    activity_label: Materializing raw counts
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: Absolute input H5AD, 10x H5, or 10x Matrix Market directory.}
+        counts_source:
+          type: string
+          enum: [auto, X, raw, layer]
+          default: auto
+          description: Select X, aligned .raw, or a named layer; auto refuses ambiguous or non-count inputs.
+        counts_layer:
+          type: [string, "null"]
+          default: null
+          description: Required when counts_source is layer.
+      required: [path]
+      additionalProperties: false

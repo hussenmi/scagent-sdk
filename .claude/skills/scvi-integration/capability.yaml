@@ -1,0 +1,22 @@
+schema_version: 1
+skill:
+  id: scvi-integration
+  version: "0.3.0"
+  description: Standalone count-aware scVI latent-model training.
+tools:
+  - name: train_scvi_latent
+    description: Train scVI from raw counts with an explicit batch covariate and save the model plus X_scVI latent representation; do not build neighbors, UMAP, or clusters.
+    entrypoint: scripts/integrate.py:run
+    environment: scvi
+    activity_label: Training scVI latent model
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: "Prepared H5AD path with layers['counts']."}
+        batch_key: {type: string}
+        n_latent: {type: integer, minimum: 2, maximum: 100, default: 30}
+        n_layers: {type: integer, minimum: 1, maximum: 5, default: 2}
+        max_epochs: {type: integer, minimum: 1, default: 200}
+        random_seed: {type: integer, default: 0}
+      required: [path, batch_key]
+      additionalProperties: false

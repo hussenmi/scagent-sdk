@@ -1,0 +1,30 @@
+# Iris deployment verified against the vLLM service on iscp001.
+# The Claude Agent SDK calls LiteLLM's Anthropic Messages endpoint. LiteLLM then
+# translates to the upstream OpenAI-compatible chat-completions API.
+# Qwen's reasoning mode is OFF by default on vLLM; enable_thinking (passed to the server via
+# chat_template_kwargs) turns it on, and merge_reasoning_content_in_choices folds the resulting
+# reasoning_content into the message as <think>...</think>, which the terminal extracts and dims.
+model_list:
+  - model_name: scagent-primary
+    litellm_params:
+      model: openai/Qwen3.6-27B
+      api_base: http://iscp001:8000/v1
+      api_key: local-noauth
+      merge_reasoning_content_in_choices: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+  - model_name: scagent-fast
+    litellm_params:
+      model: openai/Qwen3.6-27B
+      api_base: http://iscp001:8000/v1
+      api_key: local-noauth
+      merge_reasoning_content_in_choices: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+litellm_settings:
+  drop_params: true
+  use_chat_completions_url_for_anthropic_messages: true

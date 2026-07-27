@@ -1,0 +1,51 @@
+schema_version: 1
+
+skill:
+  id: inspect-media
+  version: "0.1.0"
+  description: Attach bounded image and rendered PDF evidence to the multimodal model.
+
+tools:
+  - name: inspect_image
+    description: Validate a local raster image, create a bounded orientation-correct preview, and attach its pixels for visual interpretation.
+    entrypoint: scripts/inspect_media.py:inspect_image
+    environment: current
+    activity_label: Inspecting image
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Absolute or working-directory-relative path to a local image.
+        max_side:
+          type: integer
+          minimum: 512
+          maximum: 4096
+          default: 2560
+          description: Maximum preview width or height in pixels.
+      required: [path]
+  - name: inspect_pdf
+    description: Extract bounded text from a local PDF, render selected pages, and attach the page images for layout, figure, and table interpretation.
+    entrypoint: scripts/inspect_media.py:inspect_pdf
+    environment: current
+    activity_label: Inspecting PDF
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          description: Absolute or working-directory-relative path to a local PDF.
+        pages:
+          type: array
+          items: {type: integer, minimum: 1}
+          maxItems: 8
+          description: One-based pages to render. Defaults to the first four pages.
+        max_text_chars:
+          type: integer
+          minimum: 1000
+          maximum: 40000
+          default: 30000
+          description: Maximum extracted text characters returned to the model.
+      required: [path]

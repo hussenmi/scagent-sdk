@@ -1,0 +1,86 @@
+schema_version: 1
+skill:
+  id: single-cell-qc
+  version: "0.2.0"
+  description: Comprehensive flag-first QC, visual review, and explicit filtering operations.
+tools:
+  - name: calculate_single_cell_qc
+    description: Calculate count-derived cell and gene QC metrics, add threshold flags, and save evidence without removing cells or genes.
+    entrypoint: scripts/qc.py:calculate_qc
+    environment: gpu-singlecell
+    activity_label: Calculating single-cell QC
+    input_schema:
+      type: object
+      properties:
+        path: {type: string, description: H5AD containing raw counts in a layer or X.}
+        counts_layer:
+          type: [string, "null"]
+          default: auto
+          description: "'auto' uses layers['counts'] when present and otherwise validates X; null explicitly uses X."
+        organism: {type: string, enum: [human, mouse], default: human}
+        min_genes: {type: [integer, "null"], minimum: 0, default: 200}
+        max_genes: {type: [integer, "null"], minimum: 1, default: null}
+        max_pct_mito: {type: [number, "null"], minimum: 0, maximum: 100, default: 20}
+      required: [path]
+      additionalProperties: false
+  - name: review_single_cell_qc
+    description: Record a visual, evidence-bound QC decision after inspecting every standard QC figure; filtering remains a separate explicit mutation.
+    entrypoint: scripts/qc.py:review_qc
+    environment: current
+    activity_label: Recording cell QC review
+    input_schema:
+      type: object
+      properties:
+        assessment_id: {type: string, minLength: 1}
+        decision:
+          type: string
+          enum: [keep_all, filter_cells, request_guidance, not_applicable]
+        rationale: {type: string, minLength: 1}
+        visual_findings:
+          type: array
+          minItems: 1
+          items: {type: string, minLength: 1}
+        reviewed_artifacts:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+      required: [assessment_id, decision, rationale, visual_findings, reviewed_artifacts]
+      additionalProperties: false
+  - name: filter_single_cells
+    description: Apply explicit detected-gene and mitochondrial thresholds to a count-bearing H5AD, saving a new artifact and cell-set identity.
+    entrypoint: scripts/qc.py:filter_cells
+    environment: gpu-singlecell
+    activity_label: Filtering single cells
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        counts_layer:
+          type: [string, "null"]
+          default: auto
+          description: "'auto' uses layers['counts'] when present and otherwise validates X; null explicitly uses X."
+        organism: {type: string, enum: [human, mouse], default: human}
+        min_genes: {type: [integer, "null"], minimum: 0, default: 200}
+        max_genes: {type: [integer, "null"], minimum: 1, default: null}
+        max_pct_mito: {type: [number, "null"], minimum: 0, maximum: 100, default: 20}
+        confirm_filtering: {type: boolean, description: Explicit confirmation that this operation changes the cell set.}
+      required: [path, confirm_filtering]
+      additionalProperties: false
+  - name: filter_single_cell_genes
+    description: Remove genes detected in fewer than the requested number of cells, independently of cell filtering and downstream preprocessing.
+    entrypoint: scripts/qc.py:filter_genes
+    environment: gpu-singlecell
+    activity_label: Filtering single-cell genes
+    input_schema:
+      type: object
+      properties:
+        path: {type: string}
+        counts_layer:
+          type: [string, "null"]
+          default: auto
+          description: "'auto' uses layers['counts'] when present and otherwise validates X; null explicitly uses X."
+        min_cells: {type: integer, minimum: 1, default: 3}
+        confirm_filtering: {type: boolean, description: Explicit confirmation that this operation changes the feature set.}
+      required: [path, confirm_filtering]
+      additionalProperties: false

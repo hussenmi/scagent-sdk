@@ -1,0 +1,30 @@
+# The Claude Agent SDK speaks Anthropic Messages to this gateway. LiteLLM translates the
+# request to an OpenAI-compatible local vLLM or NIM endpoint. Keep these aliases explicit:
+# Claude Code may use a separate small/fast model for background work.
+model_list:
+  - model_name: scagent-primary
+    litellm_params:
+      model: os.environ/SCAGENT_SDK_UPSTREAM_MODEL
+      api_base: os.environ/SCAGENT_SDK_UPSTREAM_BASE_URL
+      api_key: os.environ/SCAGENT_SDK_UPSTREAM_API_KEY
+      merge_reasoning_content_in_choices: true
+      # Reasoning models served by vLLM often default thinking OFF; enable it explicitly.
+      # Harmless for backends that ignore chat_template_kwargs.
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+  - model_name: scagent-fast
+    litellm_params:
+      model: os.environ/SCAGENT_SDK_FAST_MODEL
+      api_base: os.environ/SCAGENT_SDK_UPSTREAM_BASE_URL
+      api_key: os.environ/SCAGENT_SDK_UPSTREAM_API_KEY
+      merge_reasoning_content_in_choices: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+litellm_settings:
+  drop_params: true
+  use_chat_completions_url_for_anthropic_messages: true
+
