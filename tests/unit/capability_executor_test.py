@@ -110,8 +110,10 @@ tools:
     )
     (skill / "scripts" / "run.py").write_text(
         "def run(arguments, context):\n"
+        # Fact roots are registered in scagent_sdk.state.lineage and fail closed, so a fixture
+        # cannot invent one; dataset_contents is session-scoped and adequate here.
         "    return {'summary': 'large', 'details': {'value': 'x' * 50000}, "
-        "'facts_patch': {'large': True}}\n",
+        "'facts_patch': {'dataset_contents': {'large': True}}}\n",
         encoding="utf-8",
     )
     package = CapabilityRegistry(skill.parent).discover()[0]
@@ -128,7 +130,7 @@ tools:
     final.parent.mkdir(parents=True, exist_ok=True)
     pending.rename(final)
     assert executor.recover_pending() == [execution_id]
-    assert session.store.state.facts["large"] is True
+    assert session.store.state.facts["dataset_contents"]["large"] is True
     assert json.loads((final / "details.json").read_text())["value"].startswith("x")
 
 

@@ -22,11 +22,14 @@ from scagent_sdk.state.lineage import (
     fact_scope,
     head_path,
     identity_signature,
+    merge_diff,
     node_for_path,
+    node_scoped_roots,
     partition_facts_patch,
     place_node,
     reachable_from_heads,
 )
+from scagent_sdk.state.store import apply_merge_patch
 
 
 def _node(
@@ -111,11 +114,42 @@ def test_reference_runs_is_session_scoped_despite_nesting_a_cell_set_id() -> Non
 
 def test_every_registered_root_has_a_valid_scope() -> None:
     assert set(FACT_ROOT_SCOPES.values()) == {"node", "session"}
+    assert node_scoped_roots() == {
+        root for root, scope in FACT_ROOT_SCOPES.items() if scope == "node"
+    }
 
 
 def test_unregistered_fact_root_fails_closed() -> None:
     with pytest.raises(LineageContractError, match="unregistered fact root"):
         fact_scope("pathways")
+
+
+def test_merge_diff_replaces_rather_than_merges() -> None:
+    """A merge patch only names keys, so switching lines of descent needs an explicit diff.
+
+    ``{"cluster_qc": new}`` merges recursively and leaves stale nested keys behind; the whole point
+    is that the result equals the target exactly.
+    """
+
+    current = {"cluster_qc": {"axes": {"metric": 1, "deg": 2}}, "batch": {"decision": "keep"}}
+    target = {"cluster_qc": {"axes": {"metric": 9}}}
+    patch = merge_diff(current, target)
+
+    assert patch == {"cluster_qc": {"axes": {"deg": None, "metric": 9}}, "batch": None}
+    assert apply_merge_patch(current, patch) == target
+
+
+def test_merge_diff_of_identical_values_is_empty() -> None:
+    value = {"annotation": {"evidence": {"markers": "complete"}}}
+    assert merge_diff(value, value) == {}
+
+
+def test_merge_diff_handles_type_changes_and_additions() -> None:
+    current = {"a": {"nested": 1}, "keep": 1}
+    target = {"a": "scalar", "b": [1, 2], "keep": 1}
+    patch = merge_diff(current, target)
+
+    assert apply_merge_patch(current, patch) == target
 
 
 def test_patch_is_split_by_scope() -> None:

@@ -105,6 +105,33 @@ def identity_signature(
     return f"identity:v{IDENTITY_SIGNATURE_VERSION}:sha256:{digest}"
 
 
+def node_scoped_roots() -> frozenset[str]:
+    return frozenset(root for root, scope in FACT_ROOT_SCOPES.items() if scope == "node")
+
+
+def merge_diff(current: Mapping[str, Any], target: Mapping[str, Any]) -> dict[str, Any]:
+    """An RFC 7396 patch that turns ``current`` into exactly ``target``.
+
+    Needed because a merge patch only ever adds or deletes the keys it names. Moving the head to a
+    line of descent that does not inherit the previous head's facts has to *replace* the node-scoped
+    view, and ``{"cluster_qc": new_value}`` would leave stale nested keys behind.
+    """
+
+    patch: dict[str, Any] = {}
+    for key in current:
+        if key not in target:
+            patch[key] = None
+    for key, desired in target.items():
+        existing = current.get(key)
+        if isinstance(desired, Mapping) and isinstance(existing, Mapping):
+            nested = merge_diff(existing, desired)
+            if nested:
+                patch[key] = nested
+        elif key not in current or existing != desired:
+            patch[key] = desired
+    return patch
+
+
 def fact_scope(root: str) -> Scope:
     """Return the registered scope for a top-level fact root, or raise."""
 
@@ -154,6 +181,9 @@ class LineageNode:
     branch_intent: bool
     skill_id: str
     tool_name: str
+    # Node-scoped fact patches attached to this node, in commit order: the creating execution's
+    # own patch first, then any read-only evidence recorded against it.
+    fact_patches: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +194,7 @@ class LineageNode:
             "resolved_input_execution_id": self.resolved_input_execution_id,
             "branch_intent": self.branch_intent,
             "created_by": {"skill_id": self.skill_id, "tool_name": self.tool_name},
+            "fact_patches": [dict(patch) for patch in self.fact_patches],
         }
 
 
@@ -276,6 +307,77 @@ def place_node(
         "active_execution_id": active if node.branch_intent else node.execution_id,
         "nodes": nodes,
     }
+
+
+def node_patch(node: LineageNode, *, active_execution_id: str | None) -> dict[str, Any]:
+    """Minimal RFC 7396 patch that adds ``node`` to the stored forest.
+
+    Sending the whole forest on every commit would rewrite every node into every event; only the
+    new node and the head pointer actually change.
+
+    ``None`` fields are omitted, because a merge patch treats null as *delete*: emitting
+    ``parent_execution_id: None`` for a root node erases the key instead of storing it. Readers use
+    ``.get()``, so an absent optional field and a null one mean the same thing.
+    """
+
+    stored = {key: value for key, value in node.to_dict().items() if value is not None}
+    patch: dict[str, Any] = {"nodes": {node.execution_id: stored}}
+    if active_execution_id is not None:
+        patch["active_execution_id"] = active_execution_id
+    return patch
+
+
+def attach_patch(
+    lineage: Mapping[str, Any], execution_id: str, patch: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Minimal patch appending one node-scoped fact patch to an existing node.
+
+    Read-only evidence tools produce no matrix and so create no node, but they do write node-scoped
+    facts. Those must land on the node they describe, or a later checkout restores a snapshot that
+    silently lacks them. Merge-patch replaces lists wholesale, so the full new list is emitted.
+    """
+
+    node = _node(lineage, execution_id)
+    if node is None:
+        raise LineageContractError(
+            f"cannot attach facts to an unknown lineage node: {execution_id}"
+        )
+    existing = node.get("fact_patches")
+    patches = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(
+        existing, list
+    ) else []
+    patches.append(dict(patch))
+    return {"nodes": {execution_id: {"fact_patches": patches}}}
+
+
+def resolve_node_facts(
+    lineage: Mapping[str, Any],
+    execution_id: str,
+    *,
+    merge: Any,
+) -> dict[str, Any]:
+    """Fold every node-scoped patch from the root down to ``execution_id``.
+
+    Patches are stored rather than snapshots: a snapshot per node would place one full copy of the
+    session's facts on every node, which for a real session is hundreds of kilobytes each. Folding
+    along the ancestry costs a walk and reproduces the same value.
+
+    ``merge`` is the RFC 7396 apply function, injected so this module stays free of imports from
+    the store it supports.
+    """
+
+    resolved: dict[str, Any] = {}
+    for node_id in reversed(ancestry(lineage, execution_id)):
+        node = _node(lineage, node_id)
+        if node is None:
+            continue
+        patches = node.get("fact_patches")
+        if not isinstance(patches, list):
+            continue
+        for patch in patches:
+            if isinstance(patch, Mapping):
+                resolved = merge(resolved, patch)
+    return resolved
 
 
 def checkout(lineage: Mapping[str, Any], execution_id: str) -> dict[str, Any]:

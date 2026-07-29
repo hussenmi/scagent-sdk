@@ -30,8 +30,29 @@ from scagent_sdk.errors import CapabilityExecutionError, CapabilityInterrupted
 from scagent_sdk.execution.broker import EnvironmentBroker
 from scagent_sdk.floors import FloorEvaluator
 from scagent_sdk.session import AnalysisSession
+from scagent_sdk.state.lineage import (
+    LineageNode,
+    active_head,
+    attach_patch,
+    classify_input,
+    identity_signature,
+    merge_diff,
+    node_for_path,
+    node_patch,
+    node_scoped_roots,
+    partition_facts_patch,
+    resolve_node_facts,
+)
+from scagent_sdk.state.store import apply_merge_patch
 
 _EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning):\s+(.*)$")
+# Which argument carries the matrix a tool reads, and which suffix marks the matrix it writes.
+# Interim: every current manifest names its matrix input ``path`` (89 of 89 recorded calls) and no
+# execution has ever produced more than one ``.h5ad`` (0 of 61). Both become declared fields --
+# ``primary_matrix_input``/``primary_matrix_output`` -- in the spec's D5; until then a second
+# matrix output raises rather than being guessed at.
+_MATRIX_INPUT_ARGUMENT = "path"
+_MATRIX_SUFFIX = ".h5ad"
 # How long a forced stop waits for a signalled worker to unwind before giving up on it.
 _WORKER_STOP_SECONDS = 15.0
 _PATH_ARGUMENT_NAMES = frozenset({"cwd", "path"})
@@ -88,6 +109,32 @@ def _resolve_session_paths(
         return str(candidate)
     session_candidate = (session_dir / candidate).resolve()
     return str(session_candidate) if session_candidate.exists() else value
+
+
+def _matrix_input(arguments: Mapping[str, Any]) -> str | None:
+    """The matrix path a tool was asked to read, if any."""
+
+    value = arguments.get(_MATRIX_INPUT_ARGUMENT)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value if value.lower().endswith(_MATRIX_SUFFIX) else None
+
+
+def _matrix_output(files: list[dict[str, Any]]) -> str | None:
+    """The single matrix a result declares, or None. Raises when a result declares two."""
+
+    matrices = [
+        str(item["relative_path"])
+        for item in files
+        if str(item.get("relative_path", "")).lower().endswith(_MATRIX_SUFFIX)
+    ]
+    if len(matrices) > 1:
+        raise CapabilityExecutionError(
+            "a capability declared more than one matrix artifact "
+            f"({', '.join(sorted(matrices))}); lineage cannot infer which one continues the "
+            "analysis. Declare primary_matrix_output in capability.yaml."
+        )
+    return matrices[0] if matrices else None
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -169,6 +216,7 @@ class CapabilityExecutor:
             state_facts=deepcopy(self.session.store.state.facts),
         )
         resolved_arguments = _resolve_session_paths(arguments, self.session.directory)
+        dispatch = self._dispatch_lineage(resolved_arguments)
         try:
             failures = FloorEvaluator().failures(self.session.store.state, tool.floors)
             if failures:
@@ -202,6 +250,7 @@ class CapabilityExecutor:
                 result,
                 environment,
                 arguments=arguments,
+                dispatch=dispatch,
             )
         except asyncio.CancelledError:
             # A forced stop unwinds the whole turn; record why this execution has no result
@@ -247,6 +296,26 @@ class CapabilityExecutor:
             ]
             + model_content,
             "structuredContent": envelope,
+        }
+
+    def _dispatch_lineage(self, resolved_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Record, at dispatch, which artifact this execution consumes and from which head.
+
+        Both are captured here rather than at commit because both change: the head advances as
+        other executions commit, and deriving a parent from the head at commit time is what
+        recorded three clusterings off one UMAP as a chain.
+        """
+
+        lineage = self.session.store.state.lineage
+        requested = _matrix_input(resolved_arguments)
+        resolved_node = node_for_path(lineage, requested) if requested else None
+        return {
+            "base_head_execution_id": active_head(lineage),
+            "requested_input": requested,
+            "resolved_input_execution_id": resolved_node,
+            "input_relation": classify_input(lineage, resolved_node) if requested else None,
+            # Branch intent arrives with D4; until then every commit continues the active line.
+            "branch_intent": False,
         }
 
     async def _execute_in_environment(
@@ -300,6 +369,39 @@ class CapabilityExecutor:
             )
 
     @staticmethod
+    def _figure_directive(result: CapabilityResult) -> str:
+        """The instruction that turns attached pixels into an actual reading of them.
+
+        Attaching an image only guarantees the model *received* it. Nothing obliges it to say
+        anything before calling the next tool, so figures were routinely generated, passed over,
+        and then attested to much later when a review floor blocked progress — a review written
+        from recall instead of from the figure. Legacy `scagent` avoided this by appending the
+        figures as their own user turn carrying an interpretive prompt, which the model had to
+        answer before it could do anything else. This is the same instruction, delivered as the
+        last block of the tool result so it is the final thing read before the model responds.
+
+        Deliberately generic: what a given figure *means* is the skill's business, and the
+        runtime package holds no biology.
+        """
+
+        names = [media.name for media in result.model_media]
+        count = len(names)
+        listed = ", ".join(names)
+        return (
+            f"{count} figure{'s are' if count != 1 else ' is'} attached above ({listed}).\n\n"
+            "Read them now, before your next tool call. For each one, state what it actually "
+            "shows, what it implies for the decision in front of you, and anything that needs "
+            "acting on. Reference what you can see in the pixels — not what the summary or the "
+            "table behind the figure says.\n\n"
+            "If a panel is empty, a legend is unreadable, categories share a color, or the data "
+            "occupies a sliver of the axes, say so and treat the visual review as incomplete: "
+            "regenerate a legible view or read the underlying table instead of guessing. If you "
+            "are mid-pipeline and no genuine decision point has been reached, keep this brief "
+            "and carry on with the next step — but do not skip it, and do not defer it to a "
+            "later review call."
+        )
+
+    @staticmethod
     def _model_content(
         context: CapabilityContext, result: CapabilityResult
     ) -> list[dict[str, Any]]:
@@ -338,6 +440,8 @@ class CapabilityExecutor:
                     "mimeType": media.media_type,
                 }
             )
+        if content:
+            content.append({"type": "text", "text": CapabilityExecutor._figure_directive(result)})
         return content
 
     def _stage_result(
@@ -349,6 +453,7 @@ class CapabilityExecutor:
         environment: dict[str, Any],
         *,
         arguments: dict[str, Any],
+        dispatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         details_bytes = json.dumps(
             result.details, sort_keys=True, allow_nan=False, separators=(",", ":")
@@ -385,9 +490,16 @@ class CapabilityExecutor:
                     "size_bytes": source.stat().st_size,
                 }
             )
+        dispatch_lineage = dict(dispatch or {})
+        # Validate here, while the result is still only staged, so a contract breach surfaces as an
+        # ordinary tool error the model can act on rather than as a PostToolUse hook failure after
+        # the compute has already been reported as successful.
+        dispatch_lineage["matrix_output"] = _matrix_output(files)
+        partition_facts_patch(result.facts_patch)
         persisted = {
             "schema_version": result.schema_version,
             "execution_id": context.execution_id,
+            "lineage": dispatch_lineage,
             "skill_id": package.manifest.skill_id,
             "skill_version": package.manifest.version,
             "skill_fingerprint": package.fingerprint,
@@ -423,6 +535,7 @@ class CapabilityExecutor:
                 "input_state_revision": context.state_revision,
                 "arguments": arguments,
                 "files": files,
+                "lineage": dispatch_lineage,
             },
         )
         artifact_relative_path = f"artifacts/capabilities/{context.execution_id}"
@@ -448,6 +561,123 @@ class CapabilityExecutor:
             "model_media": persisted["model_media"],
         }
 
+    def _reject_stale_base(self, execution_id: str, data: Mapping[str, Any]) -> None:
+        """Refuse a matrix commit whose head moved while it was running.
+
+        Compute runs for minutes in a subprocess. Without this, a long training run that started
+        from one head silently rebases onto whatever appeared meanwhile, which is the divergence
+        this design exists to prevent. Only matrix-producing results are checked: read-only
+        evidence moves no head.
+        """
+
+        dispatch = data.get("lineage")
+        if not isinstance(dispatch, Mapping) or not dispatch.get("matrix_output"):
+            return
+        if dispatch.get("branch_intent"):
+            return
+        base = dispatch.get("base_head_execution_id")
+        if not isinstance(base, str):
+            return
+        current = active_head(self.session.store.state.lineage)
+        if current is not None and current != base:
+            raise CapabilityExecutionError(
+                f"cannot commit {execution_id}: it derived from head {base} but the active head "
+                f"is now {current}. Re-run it against the current head, or declare explicit "
+                "branch intent to keep both."
+            )
+
+    def _lineage_state_patch(
+        self, execution_id: str, data: Mapping[str, Any], artifact_relative: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Route a committed result into the lineage forest and global facts.
+
+        Returns ``(lineage_patch, facts_patch)``. Node-scoped facts always land on the node they
+        describe; they reach global facts only when that node is the active head, so a branch
+        cannot rewrite the identities of the matrix the session is actually working on. Session-
+        scoped facts always merge globally.
+        """
+
+        lineage = self.session.store.state.lineage
+        dispatch = data.get("lineage")
+        dispatch = dispatch if isinstance(dispatch, Mapping) else {}
+        facts_patch = data.get("facts_patch")
+        facts_patch = facts_patch if isinstance(facts_patch, Mapping) else {}
+        node_facts, session_facts = partition_facts_patch(facts_patch)
+
+        matrix_output = dispatch.get("matrix_output")
+        branch_intent = bool(dispatch.get("branch_intent"))
+        requested = dispatch.get("requested_input")
+        requested = requested if isinstance(requested, str) else None
+        parent = dispatch.get("resolved_input_execution_id")
+        parent = parent if isinstance(parent, str) else None
+        if parent is None and requested is not None:
+            # Crash recovery stages several executions before any of them commits, so the forest
+            # was empty when their inputs were resolved at dispatch. The path was still recorded,
+            # so resolve it against the forest as it stands now.
+            parent = node_for_path(lineage, requested)
+        head = active_head(lineage)
+
+        if not isinstance(matrix_output, str) or not matrix_output:
+            # Read-only: no node, no head movement. Its node-scoped evidence still has to be
+            # attached to the node it describes, or a later checkout loses it.
+            target = parent or head
+            if target is None:
+                # Nothing tracked yet; the forest cannot hold the patch, so keep prior behaviour.
+                return {}, dict(facts_patch)
+            lineage_patch = attach_patch(lineage, target, node_facts) if node_facts else {}
+            visible = dict(session_facts)
+            # Global facts are the active head's resolved view. A patch on the head, or on any
+            # ancestor the head inherits from, belongs in that view; a patch on a sibling branch
+            # does not. Testing for "head or ancestor" rather than "head" keeps global facts equal
+            # to resolve_node_facts(active) instead of silently diverging from it.
+            if classify_input(lineage, target) in {"head", "ancestor"}:
+                visible.update(node_facts)
+            return lineage_patch, visible
+
+        # Matrix-producing: a new node whose parent is the artifact actually consumed.
+        inherited = (
+            resolve_node_facts(lineage, parent, merge=apply_merge_patch) if parent else {}
+        )
+        node_view = apply_merge_patch(inherited, node_facts)
+        projected = apply_merge_patch(deepcopy(self.session.store.state.facts), dict(facts_patch))
+        node = LineageNode(
+            execution_id=execution_id,
+            parent_execution_id=parent,
+            head_path=f"{artifact_relative}/{matrix_output}",
+            identity_signature=identity_signature(projected),
+            requested_input=(
+                str(dispatch["requested_input"])
+                if isinstance(dispatch.get("requested_input"), str)
+                else None
+            ),
+            resolved_input_execution_id=parent,
+            branch_intent=branch_intent,
+            skill_id=str(data.get("skill_id", "")),
+            tool_name=str(data.get("tool_name", "")),
+            fact_patches=(dict(node_facts),) if node_facts else (),
+        )
+        lineage_patch = node_patch(
+            node, active_execution_id=head if branch_intent else execution_id
+        )
+        visible = dict(session_facts)
+        if not branch_intent:
+            if parent == head:
+                # Continuing the active line: the head inherits exactly what global facts hold.
+                visible.update(node_facts)
+            else:
+                # Forking off an ancestor or sibling moves the head onto a line that does not
+                # inherit the previous head's node-scoped facts, so that view is replaced rather
+                # than merged. Without this, evidence from the abandoned line lingers in global
+                # facts and floors evaluate against a matrix the session is no longer on.
+                roots = node_scoped_roots()
+                current_view = {
+                    key: value
+                    for key, value in self.session.store.state.facts.items()
+                    if key in roots
+                }
+                visible.update(merge_diff(current_view, node_view))
+        return lineage_patch, visible
+
     def commit(self, execution_id: str) -> bool:
         pending = self.pending_root / execution_id
         final = self.artifact_root / execution_id
@@ -458,6 +688,13 @@ class CapabilityExecutor:
         if not result_path.is_file():
             raise CapabilityExecutionError(f"pending capability result not found: {execution_id}")
         data = json.loads(result_path.read_text(encoding="utf-8"))
+        artifact_relative = str(final.relative_to(self.session.directory))
+        lineage_patch, visible_facts = self._lineage_state_patch(
+            execution_id, data, artifact_relative
+        )
+        # Checked before the staging directory is moved: rejecting after the move would leave a
+        # committed-looking artifact directory with no lineage node and no state record.
+        self._reject_stale_base(execution_id, data)
         if pending.is_dir():
             final.parent.mkdir(parents=True, exist_ok=True)
             os.replace(pending, final)
@@ -474,15 +711,19 @@ class CapabilityExecutor:
             "path": str(final.relative_to(self.session.directory)),
             "files": data["files"],
             "model_media": data.get("model_media", []),
+            "lineage": data.get("lineage", {}),
         }
+        state_patch: dict[str, Any] = {
+            "facts": visible_facts,
+            "decisions": data["decisions_patch"],
+            "artifacts": {execution_id: artifact_record},
+        }
+        if lineage_patch:
+            state_patch["lineage"] = lineage_patch
         self.session.store.record(
             "capability.result_committed",
             payload={"execution_id": execution_id, **artifact_record},
-            state_patch={
-                "facts": data["facts_patch"],
-                "decisions": data["decisions_patch"],
-                "artifacts": {execution_id: artifact_record},
-            },
+            state_patch=state_patch,
         )
         self.session.refresh_outputs_best_effort()
         return True
@@ -513,15 +754,22 @@ class CapabilityExecutor:
                 order.setdefault(execution_id, event.sequence)
         return order
 
+    @property
+    def quarantine_root(self) -> Path:
+        return self.session.directory / "runtime" / "capabilities" / "quarantine"
+
     def recover_pending(self) -> list[str]:
         """Commit orphaned staged results in the order they were produced.
 
         Directory names are UUID4s, so sorting them replays crash recovery in an arbitrary order.
-        That matters because commits apply state patches in sequence: recovering two executions
-        backwards can leave the later patch overwritten by the earlier one. Order by the staging
-        event instead. A directory with no staging event -- ``result.json`` is written just before
-        the event is recorded, so a crash between the two is possible -- has no defensible position
-        in that order, and is committed after everything sequenced, by name for determinism.
+        That matters because commits apply state patches in sequence and advance the lineage head:
+        recovering two executions backwards leaves the later patch overwritten by the earlier one,
+        and can record a parent that is not the artifact actually consumed.
+
+        ``result.json`` is written just before ``capability.result_staged`` is recorded, so a crash
+        between the two leaves a directory with no sequence. Such a result has no defensible
+        position in the order, so it is quarantined and reported rather than adopted at a guessed
+        one. Nothing is deleted: the directory is moved aside intact for inspection.
         """
 
         recovered: list[str] = []
@@ -532,13 +780,39 @@ class CapabilityExecutor:
             if path.name not in self.session.store.state.artifacts
         )
         order = self._staged_sequence()
-        # Sequences are global event numbers, not a dense 0..n range, so the sentinel has to clear
-        # the largest one actually present rather than the count of entries.
-        unsequenced = max(order.values(), default=0) + 1
-        for path in sorted(
-            candidates, key=lambda item: (order.get(item.name, unsequenced), item.name)
-        ):
-            if path.is_dir() and (path / "result.json").is_file():
-                if self.commit(path.name):
-                    recovered.append(path.name)
+        pending: list[tuple[int, Path]] = []
+        unsequenced: list[Path] = []
+        for path in candidates:
+            if not path.is_dir() or not (path / "result.json").is_file():
+                continue
+            sequence = order.get(path.name)
+            if sequence is None:
+                unsequenced.append(path)
+            else:
+                pending.append((sequence, path))
+        for _, path in sorted(pending, key=lambda item: (item[0], item[1].name)):
+            if self.commit(path.name):
+                recovered.append(path.name)
+        for path in sorted(unsequenced):
+            self._quarantine(path)
         return recovered
+
+    def _quarantine(self, path: Path) -> None:
+        """Move an unorderable staged result aside and record why."""
+
+        target = self.quarantine_root / path.name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                os.replace(path, target)
+        except OSError:
+            return
+        with suppress(Exception):
+            self.session.store.record(
+                "capability.result_quarantined",
+                payload={
+                    "execution_id": path.name,
+                    "reason": "no capability.result_staged event; commit order is undefined",
+                    "path": str(target.relative_to(self.session.directory)),
+                },
+            )
