@@ -20,7 +20,9 @@ skills only as read-only references.
 ## Artifact lineage: implemented (2026-07-30)
 
 `docs/artifact-lineage-and-head-spec.md` (v2.2) is implemented across five staged commits. Read it
-before touching the capability executor, session state, or any skill that writes an H5AD.
+before touching the capability executor, session state, or any skill that writes an H5AD;
+`docs/lineage-implementation-review.md` records what landed per stage, how each part was verified,
+where the implementation departed from the spec, and what is still open.
 
 | stage | commit | what landed |
 |---|---|---|
