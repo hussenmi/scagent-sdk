@@ -35,6 +35,7 @@ async def _run(args: argparse.Namespace) -> None:
         execution_id=payload["context"]["execution_id"],
         state_revision=payload["context"]["state_revision"],
         state_facts=payload["context"]["state_facts"],
+        state_lineage=payload["context"].get("state_lineage", {}),
     )
     handler = _load_handler(args.entrypoint, args.function)
     value = handler(payload["arguments"], context)

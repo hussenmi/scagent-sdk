@@ -58,6 +58,7 @@ tools:
       type: object
       additionalProperties: false
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path:
           type: string
           description: Absolute or working-directory-relative path to an .h5ad file.

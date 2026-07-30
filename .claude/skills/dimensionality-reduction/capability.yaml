@@ -12,6 +12,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         n_components: {type: integer, minimum: 2, maximum: 200, default: 50}
         use_highly_variable: {type: boolean, default: true}
@@ -27,6 +28,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         representation_key: {type: string, default: X_pca}
         neighbors_key: {type: string, default: neighbors}
@@ -44,6 +46,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         neighbors_key: {type: string, default: neighbors}
         umap_key: {type: string, default: X_umap}

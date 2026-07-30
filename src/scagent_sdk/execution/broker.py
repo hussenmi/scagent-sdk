@@ -401,6 +401,7 @@ print(json.dumps({{
                 "execution_id": context.execution_id,
                 "state_revision": context.state_revision,
                 "state_facts": context.state_facts,
+                "state_lineage": context.state_lineage,
             },
         }
         input_path.write_text(

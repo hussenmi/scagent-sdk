@@ -1,0 +1,31 @@
+schema_version: 1
+skill:
+  id: analysis-versions
+  version: "0.1.0"
+  description: Inspect recorded dataset versions and switch which one the analysis continues from.
+tools:
+  - name: list_analysis_versions
+    description: Describe every dataset version this analysis has produced, which one is active, and how they relate.
+    entrypoint: scripts/versions.py:list_versions
+    activity_label: Listing analysis versions
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+  - name: switch_analysis_version
+    description: Make a recorded dataset version active so later steps continue from it and its evidence becomes current. Requires an explicit scientific rationale.
+    entrypoint: scripts/versions.py:switch_version
+    activity_label: Switching analysis version
+    lineage_operation: checkout
+    input_schema:
+      type: object
+      properties:
+        version_id:
+          type: string
+          description: Version identifier reported by list_analysis_versions; an unambiguous prefix is accepted.
+        rationale:
+          type: string
+          minLength: 1
+          description: Why this version is the right one to continue from, in scientific terms.
+      required: [version_id, rationale]
+      additionalProperties: false

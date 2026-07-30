@@ -12,6 +12,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         neighbors_key: {type: string, default: neighbors}
         cluster_key: {type: string, default: leiden}
@@ -28,6 +29,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         group_key: {type: string}
         method: {type: string, enum: [wilcoxon, t-test, t-test_overestim_var, logreg], default: wilcoxon}

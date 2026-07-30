@@ -15,6 +15,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string, description: Any H5AD containing raw counts in the selected layer or X.}
         organism: {type: string, enum: [human, mouse], description: "Required. Declare the dataset species explicitly; it is never inferred from gene-symbol casing, and it is verified against the organism-specific parts of both model vocabularies."}
         allow_species_mismatch: {type: boolean, default: false, description: Run even when the input genes contradict the declared organism. Exploratory only; the mismatch is recorded with the run.}

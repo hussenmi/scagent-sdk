@@ -15,6 +15,7 @@ CAPABILITY_SCHEMA_VERSION = 1
 _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ENTRYPOINT = re.compile(r"^(?P<path>[^:]+\.py):(?P<function>[A-Za-z_][A-Za-z0-9_]*)$")
+_LINEAGE_OPERATIONS = frozenset({"checkout"})
 
 
 def _mapping(value: Any, *, name: str) -> dict[str, Any]:
@@ -47,6 +48,10 @@ class CapabilityTool:
     # detected by suffix, because CellBender emits three ``.h5`` matrices of which only the
     # filtered one continues the analysis, and several tools write a matrix only conditionally.
     primary_matrix_output: str | None = None
+    # A lineage mutation the executor performs on this tool's behalf. Skills must never write
+    # session state, so a tool that switches the active version declares the intent and validates
+    # its target; the executor applies it. Currently only ``checkout``.
+    lineage_operation: str | None = None
 
     def __post_init__(self) -> None:
         if not _TOOL_NAME.fullmatch(self.name):
@@ -84,6 +89,11 @@ class CapabilityTool:
                 )
         if self.primary_matrix_output is not None:
             _nonempty(self.primary_matrix_output, name=f"tool {self.name}.primary_matrix_output")
+        if self.lineage_operation is not None and self.lineage_operation not in _LINEAGE_OPERATIONS:
+            raise CapabilityManifestError(
+                f"tool {self.name}.lineage_operation must be one of "
+                f"{sorted(_LINEAGE_OPERATIONS)}, not {self.lineage_operation!r}"
+            )
 
     @property
     def entrypoint_parts(self) -> tuple[Path, str]:
@@ -102,6 +112,7 @@ class CapabilityTool:
             "input_schema": self.input_schema,
             "primary_matrix_input": self.primary_matrix_input,
             "primary_matrix_output": self.primary_matrix_output,
+            "lineage_operation": self.lineage_operation,
         }
 
     @classmethod
@@ -128,6 +139,11 @@ class CapabilityTool:
                 primary_matrix_output=(
                     _nonempty(data["primary_matrix_output"], name="tool.primary_matrix_output")
                     if data.get("primary_matrix_output") is not None
+                    else None
+                ),
+                lineage_operation=(
+                    _nonempty(data["lineage_operation"], name="tool.lineage_operation")
+                    if data.get("lineage_operation") is not None
                     else None
                 ),
             )

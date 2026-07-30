@@ -12,6 +12,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string, description: H5AD containing raw counts in a layer or X.}
         counts_layer:
           type: [string, "null"]
@@ -56,6 +57,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         counts_layer:
           type: [string, "null"]
@@ -78,6 +80,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         counts_layer:
           type: [string, "null"]

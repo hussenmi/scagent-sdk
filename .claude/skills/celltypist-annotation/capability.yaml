@@ -15,6 +15,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string, description: "Any H5AD with raw counts in the selected layer or X."}
         model: {type: string, default: Immune_All_Low.pkl, description: Cached model filename or absolute model path.}
         counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}

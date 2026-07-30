@@ -11,7 +11,13 @@ from scagent_sdk.errors import CapabilityExecutionError
 
 RESULT_SCHEMA_VERSION = 1
 INLINE_RESULT_LIMIT_BYTES = 48 * 1024
-MODEL_MEDIA_LIMIT = 8
+# A capability must be able to show the model every figure it just produced. A per-cluster
+# covariance pass legitimately renders one heatmap per cluster, and a count cap of 8 meant the
+# model was *required* to review figures it was never shown — it had to reopen them one at a
+# time after a floor blocked it, and wrote its review from recall rather than from pixels. The
+# byte budgets below are the limit that should bind: a full 28-cluster heatmap set measures
+# ~2.8 MiB, comfortably inside them. This ceiling only stops a runaway skill.
+MODEL_MEDIA_LIMIT = 64
 # Per-image and per-result byte budgets for pixels sent to the model. A downscaled preview is
 # far below these; the ceilings exist so one oversized figure cannot consume a turn's transport.
 MODEL_MEDIA_LIMIT_BYTES = 2 * 1024 * 1024
@@ -29,6 +35,9 @@ class CapabilityContext:
     execution_id: str
     state_revision: int
     state_facts: dict[str, Any]
+    # Read-only view of the artifact lineage. Supplied so a tool can describe the available
+    # versions or validate a switch target; only the executor ever mutates it.
+    state_lineage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

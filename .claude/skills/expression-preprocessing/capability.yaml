@@ -12,6 +12,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         counts_layer: {type: string, default: counts}
         target_sum: {type: number, exclusiveMinimum: 0, default: 10000}
@@ -26,6 +27,7 @@ tools:
     input_schema:
       type: object
       properties:
+        branch_from: {type: string, description: "Fork an alternative from a recorded version instead of continuing the current one. The active version does not change. Use this to compare alternatives - not to work around a superseded path."}
         path: {type: string}
         n_top_genes: {type: integer, minimum: 2, default: 3000}
         flavor: {type: string, enum: [seurat, cell_ranger, seurat_v3, seurat_v3_paper], default: seurat}
