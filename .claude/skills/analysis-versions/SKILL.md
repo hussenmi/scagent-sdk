@@ -27,7 +27,9 @@ evidence the analysis is about, so say what the alternatives were and why this o
 
 To compare rather than replace, pass `branch_from` to the transforming tool with the version to fork
 from. That records an alternative without moving the active version, so several can exist at once —
-for example clustering the same embedding at more than one resolution.
+for example clustering the same embedding at more than one resolution. Use the full or unambiguous
+short `version_id` from `list_analysis_versions`, or its reported artifact path; the executor
+resolves the reference and supplies the canonical absolute input to the scientific skill.
 
 Evidence produced on an alternative belongs to that alternative and is not the session's current
 evidence until it is switched to. Compare alternatives from what each step returned and from their

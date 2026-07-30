@@ -178,15 +178,29 @@ where the implementation departed from the spec, and what is still open.
 path — now the normal way to call a tool — makes the divergence unrepresentable. Verified live
 against `sessions/crc_truth_labeled.h5ad` through the real broker at stages 3 and 4.
 
+**Correctness hardening after implementation review.** The follow-up reviews found eight gaps and
+they are now closed: untracked transforms require explicit `adopt_untracked`; the manifest loader
+adds that executor-owned control to the model-visible schemas of all 20 transforming tools;
+node-scoped facts from an untracked read-only input fail before staging instead of attaching to the
+active dataset; the head compare, lineage patch, artifact move, and event append share the
+session-store lock; `prepared_path` is derived from the node head and skills cannot write it;
+`branch_from` accepts a version ID/prefix or artifact and injects its canonical absolute path; legacy
+reconstruction uses a versioned tool/artifact-role registry, including CellBender `.h5` and
+multi-H5AD executions; and moved sessions recover historical absolute inputs by their complete
+executor-owned artifact tail. A degraded reconstruction preserves the legacy fact checkpoint rather
+than shrinking it. Identity signatures derive from the parent-resolved node view, never from active
+global facts.
+
 **The bug was real and had already happened.** Reconstructing the nine sessions on disk found it in
 `run_20260728T153108Z_de92e7`: `finalize_analysis` read `clustered.h5ad` rather than the annotated
 output, so its `final-annotated.h5ad` carries neither annotator's per-cell columns. Nothing in the
 old state recorded that; the forest makes it visible.
 
-**Migration status.** All nine sessions open, upgrade to state v2, and reconstruct without failure.
-Three predate argument recording, so no input path was ever stored and every version reconstructs as
-a root — reported as a migration warning rather than implied. Node-scoped facts round-trip exactly
-for every session that recorded its arguments.
+**Migration status.** All 11 sessions currently on disk reconstruct without failure. Rebuilding
+each under a synthetic restored location produced the same parent map and resolved head facts as its
+original location. Three predate argument recording, so no input path was ever stored and every
+version reconstructs as a root — reported as a migration warning rather than implied; those degraded
+migrations retain the legacy fact checkpoint. The full suite is green at 628 tests.
 
 **Still deferred (D11):** pruning and column overlays. `reachable_from_heads` is the prerequisite and
 exists; retention policy needs a branch-status vocabulary (`retained`/`pinned`/`rejected`) and is a
@@ -202,7 +216,9 @@ Working rules the implementation establishes:
 - Omitting the dataset path is normal. The executor injects the current artifact and reports it as
   `resolved_input`; `path` is no longer in `required` for any tool that consumes the analysis matrix.
 - A tool that transforms the dataset refuses a superseded artifact and names the current one.
-  Read-only inspection of an earlier or unrelated file is unrestricted.
+  An untracked matrix can replace a non-empty analysis only with `adopt_untracked: true`.
+  Read-only inspection of an unrelated file remains allowed, but node-scoped evidence from it is
+  refused because there is no lineage node to which it can truthfully attach.
 - `branch_from` forks an alternative without moving the active version; `analysis-versions` lists
   versions and switches between them. A branch's evidence is not session evidence until it is active.
 - Fact roots are registered as node- or session-scoped and **fail closed**; identity axes likewise.

@@ -141,7 +141,7 @@ def compute_pca(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     (context.staging_dir / "pca").mkdir(parents=True, exist_ok=True)
     fig.savefig(context.staging_dir / variance_figure, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    final_path, artifacts = _publish(
+    _, artifacts = _publish(
         adata,
         context,
         output_name="pca.h5ad",
@@ -165,7 +165,6 @@ def compute_pca(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },
@@ -248,7 +247,7 @@ def build_neighbors(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "n_pcs": n_pcs,
         "random_seed": seed,
     }
-    final_path, artifacts = _publish(
+    _, artifacts = _publish(
         adata,
         context,
         output_name="neighbors.h5ad",
@@ -265,7 +264,6 @@ def build_neighbors(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },
@@ -334,7 +332,7 @@ def compute_umap(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "spread": spread,
         "random_seed": seed,
     }
-    final_path, artifacts = _publish(
+    _, artifacts = _publish(
         adata,
         context,
         output_name="umap.h5ad",
@@ -348,7 +346,6 @@ def compute_umap(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },

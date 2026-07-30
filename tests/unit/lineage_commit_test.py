@@ -61,12 +61,20 @@ tools:
         path: {type: string}
         facts: {type: object}
     primary_matrix_input: path
+  - name: review_facts
+    description: write node-scoped evidence from facts only
+    entrypoint: scripts/run.py:write_evidence
+    input_schema:
+      type: object
+      properties:
+        facts: {type: object}
 """,
         encoding="utf-8",
     )
     (skill / "scripts" / "run.py").write_text(
         '''
 def make_matrix(arguments, context):
+    assert "adopt_untracked" not in arguments, arguments
     (context.staging_dir / "matrix.h5ad").write_bytes(b"H5AD")
     facts = dict(arguments.get("facts") or {})
     clustering = arguments.get("clustering")
@@ -114,8 +122,12 @@ class _Harness:
         self.tools = {tool.name: tool for tool in self.package.manifest.tools}
         self.session = AnalysisSession.create(tmp_path / "sessions", title=title)
         self.executor = CapabilityExecutor(self.session)
+        self.seed_path = tmp_path / f"{title}-seed.h5ad"
+        self.seed_path.write_bytes(b"H5AD")
 
     def run(self, tool: str, commit: bool = True, **arguments: Any) -> str:
+        if tool == "make_matrix" and "path" not in arguments and active_head(self.lineage) is None:
+            arguments["path"] = str(self.seed_path)
         response = asyncio.run(
             self.executor.execute(self.package, self.tools[tool], dict(arguments))
         )
@@ -156,6 +168,11 @@ def test_first_matrix_creates_a_root_node_and_becomes_the_head(tmp_path: Path) -
     assert node.get("parent_execution_id") is None
     assert node["head_path"] == f"artifacts/capabilities/{first}/matrix.h5ad"
     assert node["identity_signature"].startswith("identity:v1:sha256:")
+    prepared = f"artifacts/capabilities/{first}/matrix.h5ad"
+    assert harness.facts["analysis"]["dataset_revision"]["prepared_path"] == prepared
+    assert resolve_node_facts(harness.lineage, first, merge=apply_merge_patch)["analysis"][
+        "dataset_revision"
+    ]["prepared_path"] == prepared
 
 
 def test_parent_is_the_artifact_actually_consumed(tmp_path: Path) -> None:
@@ -199,6 +216,39 @@ def test_untracked_input_starts_a_root_rather_than_inventing_a_parent(tmp_path: 
 
     assert harness.lineage["nodes"][execution].get("parent_execution_id") is None
     assert harness.lineage["nodes"][execution]["requested_input"] == str(external)
+
+
+def test_untracked_input_mid_session_requires_explicit_adoption(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "untracked-mid-session")
+    original = harness.run("make_matrix")
+    external = tmp_path / "replacement.h5ad"
+    external.write_bytes(b"replacement")
+
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package, harness.tools["make_matrix"], {"path": str(external)}
+        )
+    )
+
+    assert response["is_error"] is True
+    assert "adopt_untracked" in response["error_summary"]
+    assert active_head(harness.lineage) == original
+
+
+def test_explicit_adoption_starts_a_new_root_and_moves_the_head(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "adopt")
+    original = harness.run("make_matrix")
+    external = tmp_path / "replacement.h5ad"
+    external.write_bytes(b"replacement")
+
+    adopted = harness.run(
+        "make_matrix", path=str(external), adopt_untracked=True, clustering="clust:new"
+    )
+
+    assert active_head(harness.lineage) == adopted
+    assert harness.lineage["nodes"][adopted].get("parent_execution_id") is None
+    assert harness.lineage["nodes"][adopted]["adopt_intent"] is True
+    assert classify_input(harness.lineage, original) == "sibling"
 
 
 def test_identity_signature_tracks_a_changed_clustering(tmp_path: Path) -> None:
@@ -272,6 +322,60 @@ def test_read_only_evidence_without_an_input_targets_the_head(tmp_path: Path) ->
 
     resolved = resolve_node_facts(harness.lineage, matrix, merge=apply_merge_patch)
     assert resolved["annotation"] == {"review": "resolved"}
+
+
+def test_read_only_node_facts_from_an_untracked_matrix_are_refused(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "external-evidence")
+    head = harness.run("make_matrix")
+    external = tmp_path / "unrelated.h5ad"
+    external.write_bytes(b"unrelated")
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package,
+            harness.tools["write_evidence"],
+            {
+                "path": str(external),
+                "facts": {"annotation": {"evidence": {"markers": "wrong-dataset"}}},
+            },
+        )
+    )
+
+    assert response["is_error"] is True
+    assert "untracked matrix" in response["error_summary"]
+    assert active_head(harness.lineage) == head
+    assert "annotation" not in harness.facts
+
+
+def test_pathless_node_facts_require_an_existing_analysis_version(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "evidence-before-version")
+
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package,
+            harness.tools["review_facts"],
+            {"facts": {"annotation": {"review": "orphan"}}},
+        )
+    )
+
+    assert response["is_error"] is True
+    assert "before an analysis version existed" in response["error_summary"]
+    assert harness.facts == {}
+
+
+def test_read_only_session_facts_from_an_untracked_matrix_remain_allowed(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "external-provenance")
+    head = harness.run("make_matrix")
+    external = tmp_path / "unrelated.h5ad"
+    external.write_bytes(b"unrelated")
+
+    harness.run(
+        "write_evidence",
+        path=str(external),
+        facts={"dataset_contents": {"path": str(external)}},
+    )
+
+    assert active_head(harness.lineage) == head
+    assert harness.facts["dataset_contents"]["path"] == str(external)
 
 
 def test_evidence_on_an_ancestor_is_inherited_by_the_head(tmp_path: Path) -> None:
@@ -377,7 +481,9 @@ def test_unregistered_fact_root_fails_as_a_tool_error_not_a_hook_error(tmp_path:
     harness = _Harness(tmp_path, "unregistered")
     response = asyncio.run(
         harness.executor.execute(
-            harness.package, harness.tools["make_matrix"], {"facts": {"pathways": {"a": 1}}}
+            harness.package,
+            harness.tools["make_matrix"],
+            {"path": str(harness.seed_path), "facts": {"pathways": {"a": 1}}},
         )
     )
 
@@ -385,6 +491,27 @@ def test_unregistered_fact_root_fails_as_a_tool_error_not_a_hook_error(tmp_path:
     assert "unregistered fact root: 'pathways'" in response["error_summary"]
     # Nothing was staged into state, so the session is untouched.
     assert harness.session.store.state.artifacts == {}
+    assert harness.lineage["nodes"] == {}
+
+
+def test_skill_cannot_write_the_executor_owned_prepared_path(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "prepared-owner")
+
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package,
+            harness.tools["make_matrix"],
+            {
+                "path": str(harness.seed_path),
+                "facts": {
+                    "analysis": {"dataset_revision": {"prepared_path": "wrong.h5ad"}}
+                },
+            },
+        )
+    )
+
+    assert response["is_error"] is True
+    assert "prepared_path is executor-owned" in response["error_summary"]
     assert harness.lineage["nodes"] == {}
 
 
@@ -407,6 +534,70 @@ def test_commit_is_refused_when_the_head_moved_underneath_it(tmp_path: Path) -> 
     assert (harness.executor.pending_root / slow).is_dir()
     assert not (harness.executor.artifact_root / slow).exists()
     assert slow not in harness.session.store.state.artifacts
+
+
+def test_stale_head_check_uses_state_reloaded_inside_the_store_lock(tmp_path: Path) -> None:
+    """A second process has a stale in-memory checkpoint even though disk already advanced."""
+
+    harness = _Harness(tmp_path, "cross-process-stale")
+    base = harness.run("make_matrix")
+    second_session = AnalysisSession.resume(
+        harness.session.directory.parent, harness.session.session_id
+    )
+    second_executor = CapabilityExecutor(second_session)
+    response = asyncio.run(
+        second_executor.execute(
+            harness.package, harness.tools["make_matrix"], {"path": harness.matrix_path(base)}
+        )
+    )
+    slow = response["structuredContent"]["scagent_execution_id"]
+
+    fast = harness.run("make_matrix", path=harness.matrix_path(base))
+    assert active_head(harness.lineage) == fast
+    with pytest.raises(CapabilityExecutionError, match="active head is now"):
+        second_executor.commit(slow)
+
+    assert (second_executor.pending_root / slow).is_dir()
+
+
+def test_two_initial_roots_cannot_both_commit_without_adoption(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "cross-process-empty")
+    second_session = AnalysisSession.resume(
+        harness.session.directory.parent, harness.session.session_id
+    )
+    second_executor = CapabilityExecutor(second_session)
+    other = tmp_path / "other-root.h5ad"
+    other.write_bytes(b"other")
+    response = asyncio.run(
+        second_executor.execute(
+            harness.package, harness.tools["make_matrix"], {"path": str(other)}
+        )
+    )
+    second_root = response["structuredContent"]["scagent_execution_id"]
+
+    harness.run("make_matrix")
+    with pytest.raises(CapabilityExecutionError, match="active head is now"):
+        second_executor.commit(second_root)
+
+
+def test_duplicate_commit_from_a_stale_store_is_idempotent(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "duplicate-commit")
+    execution = harness.run("make_matrix", commit=False)
+    second_session = AnalysisSession.resume(
+        harness.session.directory.parent, harness.session.session_id
+    )
+    second_executor = CapabilityExecutor(second_session)
+
+    assert harness.executor.commit(execution) is True
+    assert second_executor.commit(execution) is False
+
+    committed = [
+        event
+        for event in second_executor.session.store.events()
+        if event.kind == "capability.result_committed"
+        and event.payload.get("execution_id") == execution
+    ]
+    assert len(committed) == 1
 
 
 def test_read_only_commit_is_not_blocked_by_a_moved_head(tmp_path: Path) -> None:

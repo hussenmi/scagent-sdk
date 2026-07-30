@@ -80,7 +80,6 @@ def cluster_cells(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     )
     adata.uns["scagent_sdk"] = metadata
     output_name = "clustered.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     adata.write_h5ad(context.staging_dir / output_name, compression="gzip")
     sizes = labels.value_counts().sort_index()
     sizes.rename_axis("cluster").rename("n_cells").to_csv(
@@ -103,7 +102,6 @@ def cluster_cells(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },

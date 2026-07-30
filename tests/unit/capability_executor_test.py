@@ -161,7 +161,11 @@ def test_executor_enforces_scientific_floors_without_sdk_hook(tmp_path: Path) ->
     session = AnalysisSession.create(tmp_path / "sessions", title="defense in depth")
 
     response = asyncio.run(
-        CapabilityExecutor(session).execute(package, package.manifest.tools[0], {})
+        CapabilityExecutor(session).execute(
+            package,
+            package.manifest.tools[0],
+            {"path": str(tmp_path / "unmaterialized.h5ad")},
+        )
     )
 
     assert response["is_error"] is True

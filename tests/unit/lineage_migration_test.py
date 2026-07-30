@@ -9,6 +9,7 @@ the recorded history cannot answer a question.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -161,7 +162,54 @@ def test_multiple_matrix_artifacts_are_reported() -> None:
     payload["files"].append({"name": "extra", "relative_path": "second.h5ad"})
 
     _, warnings = rebuild_forest([(execution_id, payload, patch)], merge=apply_merge_patch)
-    assert any("declared 2 matrix artifacts" in warning for warning in warnings)
+    assert any("found 2 possible matrix artifacts" in warning for warning in warnings)
+
+
+def test_cellbender_h5_primary_output_reconstructs_by_historical_role() -> None:
+    event = _event(
+        "cellbender",
+        skill="cellbender-background-removal",
+        tool="remove_ambient_background",
+    )
+    event[1]["files"] = [
+        {"name": "cellbender-full-output", "relative_path": "output.h5"},
+        {"name": "cellbender-filtered-output", "relative_path": "output_filtered.h5"},
+        {"name": "cellbender-posterior", "relative_path": "posterior.h5"},
+    ]
+    child = _event(
+        "counts",
+        skill="single-cell-counts",
+        tool="materialize_count_matrix",
+        reads=_artifact("cellbender", "output_filtered.h5"),
+        writes="counts-ready.h5ad",
+    )
+
+    forest, warnings = rebuild_forest([event, child], merge=apply_merge_patch)
+
+    assert ancestry(forest, "counts") == ["counts", "cellbender"]
+    assert forest["nodes"]["cellbender"]["head_path"].endswith("output_filtered.h5")
+    assert warnings == []
+
+
+def test_historical_role_selects_the_primary_when_one_execution_has_two_h5ads() -> None:
+    event = _event(
+        "sci",
+        skill="scimilarity-annotation",
+        tool="run_scimilarity_annotation",
+    )
+    event[1]["files"] = [
+        {"name": "diagnostic-copy", "relative_path": "scimilarity-mahal.h5ad"},
+        {
+            "name": "scimilarity-annotated-anndata",
+            "relative_path": "scimilarity-annotated.h5ad",
+        },
+    ]
+
+    forest, warnings = rebuild_forest([event], merge=apply_merge_patch)
+
+    assert forest["nodes"]["sci"]["head_path"].endswith("scimilarity-annotated.h5ad")
+    assert len(warnings) == 1
+    assert "no input path was recorded" in warnings[0]
 
 
 def test_reconstruction_is_deterministic() -> None:
@@ -199,8 +247,22 @@ def test_opening_a_v1_session_reconstructs_and_upgrades_it(tmp_path: Path) -> No
     root = _v1_session(
         tmp_path,
         [
-            _event("a", writes="matrix.h5ad", facts={"cell_qc": {"step": 1}}),
-            _event("b", reads=_artifact("a"), writes="matrix.h5ad"),
+            _event(
+                "a",
+                writes="matrix.h5ad",
+                facts={
+                    "analysis": {
+                        "dataset_revision": {"id": "rev:1", "prepared_path": "stale.h5ad"}
+                    },
+                    "cell_qc": {"step": 1},
+                },
+            ),
+            _event(
+                "b",
+                reads=_artifact("a"),
+                writes="matrix.h5ad",
+                facts={"analysis": {"dataset_revision": {"prepared_path": "also-stale.h5ad"}}},
+            ),
         ],
     )
 
@@ -209,8 +271,97 @@ def test_opening_a_v1_session_reconstructs_and_upgrades_it(tmp_path: Path) -> No
     assert store.state.schema_version == 2
     assert active_head(store.state.lineage) == "b"
     assert ancestry(store.state.lineage, "b") == ["b", "a"]
+    expected_path = _artifact("b")
+    assert store.state.facts["analysis"]["dataset_revision"]["prepared_path"] == expected_path
+    assert resolve_node_facts(
+        store.state.lineage, "b", merge=apply_merge_patch
+    )["analysis"]["dataset_revision"]["prepared_path"] == expected_path
     # Written through, so the reconstruction is paid for once.
     assert json.loads((store.session_dir / "state.json").read_text())["schema_version"] == 2
+
+
+def test_moved_session_reconstructs_absolute_historical_paths_without_losing_facts(
+    tmp_path: Path,
+) -> None:
+    """Absolute event arguments must not make a restored backup look like separate roots."""
+
+    execution_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+    )
+    original_parent = tmp_path / "original"
+    original_session = original_parent / "sessions" / "run_v1_000000"
+    events = [
+        _event(execution_ids[0], writes="matrix.h5ad", facts={"cell_qc": {"kept": True}}),
+        _event(
+            execution_ids[1],
+            reads=str(original_session / _artifact(execution_ids[0])),
+            writes="matrix.h5ad",
+            facts={"batch": {"status": "reviewed"}},
+        ),
+        _event(
+            execution_ids[2],
+            reads=str(original_session / _artifact(execution_ids[1])),
+            writes="matrix.h5ad",
+            facts={"doublets": {"status": "reviewed"}},
+        ),
+    ]
+    original_root = _v1_session(original_parent, events)
+    for execution_id in execution_ids:
+        artifact = original_root / "run_v1_000000" / _artifact(execution_id)
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"H5AD")
+
+    restored_root = tmp_path / "restored" / "sessions"
+    restored_root.mkdir(parents=True)
+    shutil.copytree(
+        original_root / "run_v1_000000",
+        restored_root / "run_v1_000000",
+        symlinks=False,
+    )
+
+    store = SessionStore.open(restored_root, "run_v1_000000")
+
+    assert ancestry(store.state.lineage, execution_ids[2]) == list(reversed(execution_ids))
+    assert {"cell_qc", "batch", "doublets"} <= store.state.facts.keys()
+    assert not [event for event in store.events() if event.kind == "session.state_migrated"]
+
+
+def test_degraded_reconstruction_preserves_the_legacy_fact_checkpoint(tmp_path: Path) -> None:
+    """Unrecoverable topology may stay flat, but migration must never shrink recorded evidence."""
+
+    root = _v1_session(
+        tmp_path,
+        [
+            _event("a", writes="matrix.h5ad", facts={"cell_qc": {"kept": True}}),
+            _event(
+                "b",
+                reads="/unrelated/location/a/matrix.h5ad",
+                writes="matrix.h5ad",
+                facts={"batch": {"status": "reviewed"}},
+            ),
+            _event(
+                "c",
+                reads="/unrelated/location/b/matrix.h5ad",
+                writes="matrix.h5ad",
+                facts={"doublets": {"status": "reviewed"}},
+            ),
+        ],
+    )
+
+    store = SessionStore.open(root, "run_v1_000000")
+
+    assert all(
+        node.get("parent_execution_id") is None
+        for node in store.state.lineage["nodes"].values()
+    )
+    assert {"cell_qc", "batch", "doublets"} <= store.state.facts.keys()
+    migration = next(event for event in store.events() if event.kind == "session.state_migrated")
+    assert any(
+        "preserved legacy global facts" in warning
+        for warning in migration.payload["warnings"]
+    )
 
 
 def test_migration_is_idempotent(tmp_path: Path) -> None:
@@ -278,7 +429,9 @@ def test_the_reference_session_reconstructs_exactly() -> None:
         committed.append(
             (str(event["payload"]["execution_id"]), event["payload"], event["state_patch"])
         )
-    forest, warnings = rebuild_forest(committed, merge=apply_merge_patch)
+    forest, warnings = rebuild_forest(
+        committed, merge=apply_merge_patch, session_dir=_REFERENCE_SESSION
+    )
 
     head = active_head(forest)
     assert head is not None
@@ -328,7 +481,9 @@ def test_the_reference_session_facts_survive_reconstruction() -> None:
             committed.append(
                 (str(event["payload"]["execution_id"]), event["payload"], event["state_patch"])
             )
-    forest, _ = rebuild_forest(committed, merge=apply_merge_patch)
+    forest, _ = rebuild_forest(
+        committed, merge=apply_merge_patch, session_dir=_REFERENCE_SESSION
+    )
 
     recorded = json.loads((_REFERENCE_SESSION / "state.json").read_text())["facts"]
     expected = {key: value for key, value in recorded.items() if key in node_scoped_roots()}
@@ -336,4 +491,10 @@ def test_the_reference_session_facts_survive_reconstruction() -> None:
 
     assert sorted(resolved) == sorted(expected)
     for key in expected:
-        assert resolved[key] == expected[key], key
+        if key != "analysis":
+            assert resolved[key] == expected[key], key
+    expected_analysis = json.loads(json.dumps(expected["analysis"]))
+    expected_analysis["dataset_revision"]["prepared_path"] = forest["nodes"][
+        active_head(forest)
+    ]["head_path"]
+    assert resolved["analysis"] == expected_analysis

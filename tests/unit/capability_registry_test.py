@@ -48,6 +48,31 @@ def test_registry_discovers_and_loads_executable_project_skill() -> None:
     assert {skill.name for skill in skills if not skill.executable} == {"orchestrate-single-cell"}
 
 
+def test_every_transforming_tool_exposes_the_executor_owned_adoption_control() -> None:
+    """The model sees this runtime-injected property despite strict raw YAML schemas."""
+
+    root = Path(__file__).parents[2] / ".claude" / "skills"
+    transforming = [
+        (package.manifest.skill_id, tool)
+        for package in CapabilityRegistry(root).discover()
+        for tool in package.manifest.tools
+        if tool.primary_matrix_output is not None
+    ]
+
+    assert len(transforming) == 20
+    missing = [
+        f"{skill_id}.{tool.name}"
+        for skill_id, tool in transforming
+        if "adopt_untracked" not in tool.input_schema.get("properties", {})
+    ]
+    assert missing == []
+    for _, tool in transforming:
+        schema = tool.input_schema["properties"]["adopt_untracked"]
+        assert schema["type"] == "boolean"
+        assert schema["default"] is False
+        assert "adopt_untracked" not in tool.input_schema.get("required", [])
+
+
 def test_manifest_rejects_escaping_entrypoint(tmp_path: Path) -> None:
     manifest_path = tmp_path / "capability.yaml"
     manifest_path.write_text(

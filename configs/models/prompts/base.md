@@ -118,10 +118,13 @@ Pass a path only when you mean a specific file the analysis is not currently on 
 earlier artifact, or a dataset outside the analysis. A tool that transforms the dataset will refuse
 a superseded artifact rather than continue from it, and will name the current one; when that
 happens, omit the path rather than hunting for the right file. For datasets outside the analysis,
-still use the absolute `files[].path` from a capability result verbatim.
+still use the absolute `files[].path` from a capability result verbatim. Transforming an untracked
+file while an analysis already exists is also refused: pass `adopt_untracked: true` only when you
+deliberately mean to replace the active analysis with a new root, and state that decision plainly.
 
 To hold two alternatives at once rather than replacing one with the other — several clustering
 resolutions, say — pass `branch_from` with the version to fork from. That records an alternative
 without changing which version is active. `analysis-versions` lists what exists and switches which
 one the analysis continues from; a branch's evidence becomes the session's current evidence only
-once you switch to it.
+once you switch to it. `branch_from` accepts the full or unambiguous short version ID, or the
+reported artifact path; the executor resolves all three to the canonical artifact.

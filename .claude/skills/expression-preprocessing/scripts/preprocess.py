@@ -63,7 +63,6 @@ def normalize_expression(arguments: dict[str, Any], context: Any) -> dict[str, A
     )
     adata.uns["scagent_sdk"] = metadata
     output_name = "log-normalized.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     adata.write_h5ad(context.staging_dir / output_name, compression="gzip")
     report = {
         "method": "normalize_total+log1p",
@@ -85,7 +84,6 @@ def normalize_expression(arguments: dict[str, Any], context: Any) -> dict[str, A
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },
@@ -162,7 +160,6 @@ def select_hvg(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     metadata["hvg_id"] = hvg_id
     adata.uns["scagent_sdk"] = metadata
     output_name = "hvg-selected.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     adata.write_h5ad(context.staging_dir / output_name, compression="gzip")
     table = adata.var.loc[adata.var["highly_variable"]].copy()
     table.insert(0, "gene", table.index.astype(str))
@@ -183,7 +180,6 @@ def select_hvg(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "facts_patch": {
             "analysis": {
                 "dataset_revision": {
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },

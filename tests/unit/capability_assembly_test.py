@@ -46,6 +46,13 @@ def test_assembler_builds_allowlisted_tool_and_committing_post_hook(tmp_path: Pa
 
     assert "mcp__inspect_dataset__inspect_dataset" in extensions.allowed_tools
     assert "orchestrate-single-cell" in extensions.skills
+    transforming = next(
+        candidate
+        for server in extensions.mcp_servers.values()
+        for candidate in server["tools"]
+        if candidate.name == "convert_gene_ids"
+    )
+    assert "adopt_untracked" in transforming.input_schema["properties"]
     registered = extensions.mcp_servers["inspect_dataset"]["tools"][0]
     response = asyncio.run(registered.handler({"path": str(dataset)}))
     hook = extensions.hooks["PostToolUse"][0].hooks[0]

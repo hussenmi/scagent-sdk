@@ -67,8 +67,9 @@ tools:
     (skill / "scripts" / "run.py").write_text(
         '''
 def make_matrix(arguments, context):
-    # branch_from is an executor control argument and must never reach a skill.
+    # Lineage controls are executor-owned and must never reach a skill.
     assert "branch_from" not in arguments, arguments
+    assert "adopt_untracked" not in arguments, arguments
     (context.staging_dir / "matrix.h5ad").write_bytes(b"H5AD")
     facts = dict(arguments.get("facts") or {})
     clustering = arguments.get("clustering")
@@ -78,7 +79,7 @@ def make_matrix(arguments, context):
         facts["analysis"] = analysis
     return {
         "summary": "wrote a matrix",
-        "details": {},
+        "details": {"received_path": arguments.get("path")},
         "facts_patch": facts,
         "artifacts": [
             {
@@ -123,9 +124,13 @@ class _Harness:
         self.packages = {t.name: (p, t) for p in packages for t in p.manifest.tools}
         self.session = AnalysisSession.create(tmp_path / "sessions", title=title)
         self.executor = CapabilityExecutor(self.session)
+        self.seed_path = tmp_path / f"{title}-seed.h5ad"
+        self.seed_path.write_bytes(b"H5AD")
 
     def call(self, tool: str, **arguments: Any) -> dict[str, Any]:
         package, spec = self.packages[tool]
+        if tool == "make_matrix" and "path" not in arguments and active_head(self.lineage) is None:
+            arguments["path"] = str(self.seed_path)
         return asyncio.run(self.executor.execute(package, spec, dict(arguments)))
 
     def run(self, tool: str, **arguments: Any) -> str:
@@ -208,8 +213,47 @@ def test_branch_from_is_never_passed_through_to_the_skill(tmp_path: Path) -> Non
     """The skill asserts its absence; this records that the contract is the executor's."""
 
     harness = _Harness(tmp_path, "control-argument")
+    _, tool = harness.packages["make_matrix"]
+    assert "adopt_untracked" in tool.input_schema["properties"]
     base = harness.run("make_matrix")
     assert harness.run("make_matrix", branch_from=harness.matrix_path(base))
+
+
+@pytest.mark.parametrize("reference_kind", ["version", "short-version", "reported-artifact"])
+def test_branch_reference_resolves_to_the_canonical_absolute_artifact(
+    tmp_path: Path, reference_kind: str
+) -> None:
+    harness = _Harness(tmp_path, f"branch-reference-{reference_kind}")
+    base = harness.run("make_matrix")
+    reported = harness.lineage["nodes"][base]["head_path"]
+    reference = {
+        "version": base,
+        "short-version": base[:8],
+        "reported-artifact": reported,
+    }[reference_kind]
+
+    response = harness.call("make_matrix", branch_from=reference)
+
+    assert response.get("is_error") is not True, response
+    assert response["structuredContent"]["details"]["received_path"] == harness.matrix_path(base)
+    branch = response["structuredContent"]["scagent_execution_id"]
+    assert harness.executor.commit(branch)
+    assert harness.lineage["nodes"][branch]["parent_execution_id"] == base
+
+
+def test_branch_signature_is_derived_from_its_parent_not_the_active_line(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "branch-signature")
+    base = harness.run(
+        "make_matrix", facts={"analysis": {"representation": {"id": "rep:base"}}}
+    )
+    active = harness.run(
+        "make_matrix", facts={"analysis": {"representation": {"id": "rep:active"}}}
+    )
+    branch = harness.run("make_matrix", branch_from=base)
+
+    nodes = harness.lineage["nodes"]
+    assert nodes[branch]["identity_signature"] == nodes[base]["identity_signature"]
+    assert nodes[branch]["identity_signature"] != nodes[active]["identity_signature"]
 
 
 def test_branch_from_rejects_an_unrecorded_artifact(tmp_path: Path) -> None:
@@ -220,7 +264,7 @@ def test_branch_from_rejects_an_unrecorded_artifact(tmp_path: Path) -> None:
 
     response = harness.call("make_matrix", branch_from=str(external))
     assert response["is_error"] is True
-    assert "must name an artifact this analysis produced" in response["error_summary"]
+    assert "must name a version or artifact this analysis produced" in response["error_summary"]
 
 
 def test_branch_from_and_an_explicit_path_together_are_refused(tmp_path: Path) -> None:
@@ -300,6 +344,9 @@ def test_switching_moves_the_head_and_the_facts_together(tmp_path: Path) -> None
 
     assert active_head(harness.lineage) == branch
     assert harness.facts["analysis"]["clustering"]["id"] == "clust:alt"
+    assert harness.facts["analysis"]["dataset_revision"]["prepared_path"] == (
+        f"artifacts/capabilities/{branch}/matrix.h5ad"
+    )
     assert harness.facts["cluster_qc"] == {"status": "alt-evidence"}
     # Global facts equal the newly active version's resolved view.
     resolved = resolve_node_facts(harness.lineage, branch, merge=apply_merge_patch)

@@ -632,7 +632,6 @@ def filter_cells(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         metadata.pop(key, None)
     filtered.uns["scagent_sdk"] = metadata
     output_name = "cells-filtered.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     report = {
         "operation": "filter_cells",
         "before_cells": before,
@@ -653,7 +652,6 @@ def filter_cells(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
             "analysis": {
                 "dataset_revision": {
                     "id": metadata["dataset_revision_id"],
-                    "prepared_path": final_path,
                     "n_cells": int(filtered.n_obs),
                     "n_genes": int(filtered.n_vars),
                 },
@@ -741,7 +739,6 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         metadata.pop(key, None)
     filtered.uns["scagent_sdk"] = metadata
     output_name = "genes-filtered.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     filtered.write_h5ad(context.staging_dir / output_name, compression="gzip")
     report = {
         "operation": "filter_genes",
@@ -763,7 +760,6 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
             "analysis": {
                 "dataset_revision": {
                     "id": revision_id,
-                    "prepared_path": final_path,
                     "n_cells": int(filtered.n_obs),
                     "n_genes": int(filtered.n_vars),
                 },

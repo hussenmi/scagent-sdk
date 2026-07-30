@@ -17,7 +17,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 # --- identity signature (D1) ---------------------------------------------------------------
@@ -60,6 +62,32 @@ FACT_ROOT_SCOPES: dict[str, Scope] = {
     "dataset_contents": "session",
     "gene_conversion": "session",
     "reference_runs": "session",
+}
+
+# Historical events predate declared matrix roles. Keep the role vocabulary versioned here so a
+# migration does not guess by extension: CellBender's continuing matrix is ``.h5``, and some tools
+# may emit more than one AnnData artifact in one execution.
+LEGACY_PRIMARY_MATRIX_OUTPUTS_V1: dict[tuple[str, str], str] = {
+    ("cellbender-background-removal", "remove_ambient_background"): "cellbender-filtered-output",
+    ("celltypist-annotation", "run_celltypist_annotation"): "celltypist-annotated-anndata",
+    ("cluster-qc", "evaluate_cluster_qc"): "cluster-qc-filtered-raw-counts",
+    ("dimensionality-reduction", "compute_single_cell_pca"): "pca-anndata",
+    ("dimensionality-reduction", "build_single_cell_neighbors"): "neighbors-anndata",
+    ("dimensionality-reduction", "compute_single_cell_umap"): "umap-anndata",
+    ("doublet-evidence", "evaluate_doublet_evidence"): "doublet-annotated-anndata",
+    ("doublet-evidence", "review_doublet_evidence"): "doublet-filtered-raw-counts",
+    ("expression-preprocessing", "normalize_single_cell_expression"): "log-normalized-anndata",
+    ("expression-preprocessing", "select_highly_variable_genes"): "hvg-anndata",
+    ("finalize-analysis", "finalize_analysis"): "final-annotated-anndata",
+    ("inspect-dataset", "convert_gene_ids"): "gene-symbols",
+    ("scimilarity-annotation", "run_scimilarity_annotation"): "scimilarity-annotated-anndata",
+    ("scvi-integration", "train_scvi_latent"): "scvi-latent-anndata",
+    ("single-cell-clustering", "cluster_single_cells"): "clustered-anndata",
+    ("single-cell-clustering", "rank_single_cell_groups"): "ranked-groups-anndata",
+    ("single-cell-counts", "materialize_count_matrix"): "count-ready-anndata",
+    ("single-cell-qc", "calculate_single_cell_qc"): "qc-anndata",
+    ("single-cell-qc", "filter_single_cells"): "qc-anndata",
+    ("single-cell-qc", "filter_single_cell_genes"): "gene-filtered-anndata",
 }
 
 
@@ -161,6 +189,41 @@ def partition_facts_patch(
     return node, session
 
 
+def has_prepared_path(patch: Mapping[str, Any]) -> bool:
+    """Whether a skill patch tries to write the executor-owned active artifact pointer."""
+
+    analysis = patch.get("analysis")
+    revision = analysis.get("dataset_revision") if isinstance(analysis, Mapping) else None
+    return isinstance(revision, Mapping) and "prepared_path" in revision
+
+
+def strip_prepared_path(patch: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop legacy skill ownership of ``analysis.dataset_revision.prepared_path``."""
+
+    cleaned = deepcopy(dict(patch))
+    analysis = cleaned.get("analysis")
+    if not isinstance(analysis, dict):
+        return cleaned
+    revision = analysis.get("dataset_revision")
+    if isinstance(revision, dict):
+        revision.pop("prepared_path", None)
+    return cleaned
+
+
+def with_prepared_path(patch: Mapping[str, Any], head_path: str) -> dict[str, Any]:
+    """Return a node patch whose active-artifact pointer is derived from its lineage node."""
+
+    owned = strip_prepared_path(patch)
+    analysis_value = owned.get("analysis")
+    analysis = dict(analysis_value) if isinstance(analysis_value, Mapping) else {}
+    revision_value = analysis.get("dataset_revision")
+    revision = dict(revision_value) if isinstance(revision_value, Mapping) else {}
+    revision["prepared_path"] = head_path
+    analysis["dataset_revision"] = revision
+    owned["analysis"] = analysis
+    return owned
+
+
 # --- forest topology (D2) ------------------------------------------------------------------
 
 
@@ -181,6 +244,7 @@ class LineageNode:
     branch_intent: bool
     skill_id: str
     tool_name: str
+    adopt_intent: bool = False
     # Node-scoped fact patches attached to this node, in commit order: the creating execution's
     # own patch first, then any read-only evidence recorded against it.
     fact_patches: tuple[dict[str, Any], ...] = ()
@@ -193,6 +257,7 @@ class LineageNode:
             "requested_input": self.requested_input,
             "resolved_input_execution_id": self.resolved_input_execution_id,
             "branch_intent": self.branch_intent,
+            "adopt_intent": self.adopt_intent,
             "created_by": {"skill_id": self.skill_id, "tool_name": self.tool_name},
             "fact_patches": [dict(patch) for patch in self.fact_patches],
         }
@@ -265,17 +330,29 @@ def classify_input(lineage: Mapping[str, Any], execution_id: str | None) -> Path
     return "sibling"
 
 
-def node_for_path(lineage: Mapping[str, Any], path: str) -> str | None:
-    """Find the execution that produced ``path``, matching on the session-relative suffix.
+def node_for_path(
+    lineage: Mapping[str, Any], path: str, *, session_dir: str | Path | None = None
+) -> str | None:
+    """Find the execution that produced ``path``.
 
-    Envelopes hand the model absolute paths while records stay session-relative, so a supplied
-    path is compared by suffix rather than by string equality.
+    With a session directory, compare canonical absolute paths. Suffix matching would let an
+    unrelated file ending in ``artifacts/capabilities/<id>/...`` impersonate a tracked artifact.
+    The no-directory fallback remains for pure contract tests and legacy callers.
     """
 
     nodes = lineage.get("nodes")
     if not isinstance(nodes, Mapping) or not path:
         return None
     normalized = str(path).replace("\\", "/").rstrip("/")
+    supplied = None
+    root = Path(session_dir).expanduser().resolve() if session_dir is not None else None
+    if root is not None:
+        supplied_path = Path(path).expanduser()
+        supplied = (
+            supplied_path.resolve()
+            if supplied_path.is_absolute()
+            else (root / supplied_path).resolve()
+        )
     for execution_id, node in nodes.items():
         if not isinstance(node, Mapping):
             continue
@@ -283,9 +360,77 @@ def node_for_path(lineage: Mapping[str, Any], path: str) -> str | None:
         if not isinstance(candidate, str) or not candidate:
             continue
         relative = candidate.replace("\\", "/").rstrip("/")
-        if normalized == relative or normalized.endswith("/" + relative):
+        if root is not None:
+            candidate_path = Path(candidate).expanduser()
+            canonical = (
+                candidate_path.resolve()
+                if candidate_path.is_absolute()
+                else (root / candidate_path).resolve()
+            )
+            matches = canonical == supplied
+        else:
+            matches = normalized == relative or normalized.endswith("/" + relative)
+        if matches:
             return str(execution_id)
     return None
+
+
+def _historical_node_for_path(
+    lineage: Mapping[str, Any], path: str, *, session_dir: str | Path | None = None
+) -> str | None:
+    """Resolve a recorded input path while rebuilding a possibly moved session.
+
+    Live dispatch deliberately accepts only a canonical path match. Historical events, however,
+    recorded absolute paths rooted at the session's location at execution time. After a backup is
+    restored elsewhere those paths are stale even though the executor-owned
+    ``artifacts/capabilities/<execution_id>/...`` identity is unchanged.
+
+    Try the strict live rule first, then match the complete executor-owned artifact tail. This
+    fallback is migration-only: it cannot weaken live input validation, and requiring the known
+    execution ID plus the complete relative artifact path avoids basename-only collisions.
+    """
+
+    matched = node_for_path(lineage, path, session_dir=session_dir)
+    if matched is not None:
+        return matched
+    nodes = lineage.get("nodes")
+    if not isinstance(nodes, Mapping) or not path:
+        return None
+    normalized = str(path).replace("\\", "/").rstrip("/")
+    matches: list[str] = []
+    for execution_id, node in nodes.items():
+        if not isinstance(node, Mapping):
+            continue
+        candidate = node.get("head_path")
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        relative = candidate.replace("\\", "/").lstrip("./").rstrip("/")
+        owned_prefix = f"artifacts/capabilities/{execution_id}/"
+        if not relative.startswith(owned_prefix):
+            continue
+        if normalized == relative or normalized.endswith("/" + relative):
+            matches.append(str(execution_id))
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_node_reference(
+    lineage: Mapping[str, Any], reference: str, *, session_dir: str | Path
+) -> str | None:
+    """Resolve an exact/short execution ID or an artifact path to one node."""
+
+    nodes = lineage.get("nodes")
+    if not isinstance(nodes, Mapping):
+        return None
+    if reference in nodes:
+        return reference
+    prefixes = sorted(str(key) for key in nodes if str(key).startswith(reference))
+    if len(prefixes) > 1:
+        raise LineageContractError(
+            f"lineage reference {reference!r} matches several versions; supply more characters"
+        )
+    if prefixes:
+        return prefixes[0]
+    return node_for_path(lineage, reference, session_dir=session_dir)
 
 
 def place_node(
@@ -392,6 +537,7 @@ def rebuild_forest(
     committed: Sequence[tuple[str, Mapping[str, Any], Mapping[str, Any]]],
     *,
     merge: Any,
+    session_dir: str | Path | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Reconstruct the forest by replaying committed capability events.
 
@@ -422,17 +568,28 @@ def rebuild_forest(
         arguments = payload.get("arguments")
         arguments = arguments if isinstance(arguments, Mapping) else {}
 
-        # Historical events predate the declared matrix roles, so the output is identified by
-        # container suffix. Safe for reconstruction: no recorded execution ever wrote two.
-        matrices = [
+        dispatch = payload.get("lineage")
+        declared_name = dispatch.get("matrix_output") if isinstance(dispatch, Mapping) else None
+        if not isinstance(declared_name, str) or not declared_name:
+            declared_name = LEGACY_PRIMARY_MATRIX_OUTPUTS_V1.get(
+                (str(payload.get("skill_id", "")), str(payload.get("tool_name", "")))
+            )
+        declared = [
+            str(item.get("relative_path"))
+            for item in files
+            if isinstance(item, Mapping) and item.get("name") == declared_name
+        ]
+        fallback = [
             str(item.get("relative_path"))
             for item in files
             if isinstance(item, Mapping)
             and str(item.get("relative_path", "")).lower().endswith(".h5ad")
         ]
-        if len(matrices) > 1:
+        matrices = declared or fallback
+        if not declared and len(fallback) > 1:
             warnings.append(
-                f"{execution_id}: declared {len(matrices)} matrix artifacts; used {matrices[0]}"
+                f"{execution_id}: found {len(fallback)} possible matrix artifacts without a "
+                f"historical role declaration; used {fallback[0]}"
             )
 
         raw_facts = state_patch.get("facts")
@@ -445,10 +602,15 @@ def rebuild_forest(
                 continue
             if scope == "node":
                 node_facts[str(root)] = value
+        node_facts = strip_prepared_path(node_facts)
 
         requested = arguments.get("path")
         requested = requested if isinstance(requested, str) and requested.strip() else None
-        parent = node_for_path(forest, requested) if requested else None
+        parent = (
+            _historical_node_for_path(forest, requested, session_dir=session_dir)
+            if requested
+            else None
+        )
 
         if not matrices:
             # Attach node-scoped evidence to the version it describes: the artifact it read, or the
@@ -465,6 +627,7 @@ def rebuild_forest(
         if parent is None:
             matrices_without_parent += 1
         head_relative = f"{artifact_root}/{matrices[0]}" if artifact_root else matrices[0]
+        node_facts = with_prepared_path(node_facts, head_relative)
         inherited = resolve_node_facts(forest, parent, merge=merge) if parent else {}
         created = payload.get("tool_name")
         node = LineageNode(
@@ -477,6 +640,7 @@ def rebuild_forest(
             # Historical sessions had no branching vocabulary, so every recorded matrix continued
             # the line of work as it stood.
             branch_intent=False,
+            adopt_intent=False,
             skill_id=str(payload.get("skill_id", "")),
             tool_name=str(created) if isinstance(created, str) else "",
             fact_patches=(dict(node_facts),) if node_facts else (),

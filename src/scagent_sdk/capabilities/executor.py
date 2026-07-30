@@ -26,6 +26,7 @@ from scagent_sdk.capabilities.results import (
     CapabilityContext,
     CapabilityResult,
 )
+from scagent_sdk.contracts.state import SessionState
 from scagent_sdk.errors import CapabilityExecutionError, CapabilityInterrupted
 from scagent_sdk.execution.broker import EnvironmentBroker
 from scagent_sdk.floors import FloorEvaluator
@@ -36,6 +37,7 @@ from scagent_sdk.state.lineage import (
     attach_patch,
     checkout,
     classify_input,
+    has_prepared_path,
     head_path,
     identity_signature,
     merge_diff,
@@ -44,6 +46,8 @@ from scagent_sdk.state.lineage import (
     node_scoped_roots,
     partition_facts_patch,
     resolve_node_facts,
+    resolve_node_reference,
+    with_prepared_path,
 )
 from scagent_sdk.state.store import apply_merge_patch
 
@@ -58,10 +62,15 @@ _MATRIX_SUFFIX = ".h5ad"
 # so the model may pass it, but removed before dispatch: branching is a lineage concern and no skill
 # should have to know the forest exists.
 _BRANCH_ARGUMENT = "branch_from"
+_ADOPT_UNTRACKED_ARGUMENT = "adopt_untracked"
 # How long a forced stop waits for a signalled worker to unwind before giving up on it.
 _WORKER_STOP_SECONDS = 15.0
 _PATH_ARGUMENT_NAMES = frozenset({"cwd", "path"})
 _PATH_ARGUMENT_SUFFIXES = ("_dir", "_directory", "_file", "_path")
+
+
+class _AlreadyCommitted(Exception):
+    """Internal signal for a duplicate commit observed only after the store reloads state."""
 
 
 def _concise_capability_error(message: str) -> str:
@@ -111,7 +120,7 @@ def _resolve_session_paths(
         return value
     candidate = Path(value).expanduser()
     if candidate.is_absolute():
-        return str(candidate)
+        return str(candidate.resolve())
     session_candidate = (session_dir / candidate).resolve()
     return str(session_candidate) if session_candidate.exists() else value
 
@@ -341,6 +350,21 @@ class CapabilityExecutor:
         branch_from = resolved_arguments.pop(_BRANCH_ARGUMENT, None)
         if not isinstance(branch_from, str) or not branch_from.strip():
             branch_from = None
+        adopt_value = resolved_arguments.pop(_ADOPT_UNTRACKED_ARGUMENT, False)
+        if not isinstance(adopt_value, bool):
+            raise CapabilityExecutionError(
+                f"{_ADOPT_UNTRACKED_ARGUMENT} must be true or false"
+            )
+        adopt_untracked = adopt_value
+        if adopt_untracked and not continues_lineage:
+            raise CapabilityExecutionError(
+                f"{tool.name} does not transform the dataset, so it cannot adopt a new analysis "
+                f"root; drop {_ADOPT_UNTRACKED_ARGUMENT}."
+            )
+        if adopt_untracked and branch_from is not None:
+            raise CapabilityExecutionError(
+                f"pass either {_BRANCH_ARGUMENT} or {_ADOPT_UNTRACKED_ARGUMENT}, not both"
+            )
         if branch_from is not None:
             if not continues_lineage:
                 raise CapabilityExecutionError(
@@ -352,30 +376,43 @@ class CapabilityExecutor:
                     f"pass either {tool.primary_matrix_input} or {_BRANCH_ARGUMENT}, not both: "
                     "one continues the current line of work and the other deliberately forks it."
                 )
-            if node_for_path(lineage, branch_from) is None:
+            branch_node = resolve_node_reference(
+                lineage, branch_from, session_dir=self.session.directory
+            )
+            if branch_node is None:
                 raise CapabilityExecutionError(
-                    f"{_BRANCH_ARGUMENT} must name an artifact this analysis produced, and "
-                    f"{branch_from} is not one. Branch from a recorded version."
+                    f"{_BRANCH_ARGUMENT} must name a version or artifact this analysis produced, "
+                    f"and {branch_from} is not one. Branch from a recorded version."
                 )
-            requested = branch_from
+            nodes = lineage.get("nodes")
+            branch = nodes.get(branch_node, {}) if isinstance(nodes, Mapping) else {}
+            branch_path = branch.get("head_path") if isinstance(branch, Mapping) else None
+            if not isinstance(branch_path, str) or not branch_path:
+                raise CapabilityExecutionError(
+                    f"recorded version {branch_node} has no analysis artifact"
+                )
+            requested = str((self.session.directory / branch_path).resolve())
             source = "branch"
             if tool.primary_matrix_input is not None:
-                resolved_arguments[tool.primary_matrix_input] = branch_from
+                resolved_arguments[tool.primary_matrix_input] = requested
 
         if tool.primary_matrix_input is not None and requested is None:
             resolved_head = head_path(lineage)
             if resolved_head is None:
-                if continues_lineage and head is not None:
-                    raise CapabilityExecutionError(
-                        f"{tool.name} needs a matrix but the lineage has no active artifact; "
-                        f"pass {tool.primary_matrix_input} explicitly."
-                    )
+                raise CapabilityExecutionError(
+                    f"{tool.name} needs a matrix but the lineage has no active artifact; "
+                    f"pass {tool.primary_matrix_input} explicitly."
+                )
             else:
                 requested = str((self.session.directory / resolved_head).resolve())
                 resolved_arguments[tool.primary_matrix_input] = requested
                 source = "injected"
 
-        resolved_node = node_for_path(lineage, requested) if requested else None
+        resolved_node = (
+            node_for_path(lineage, requested, session_dir=self.session.directory)
+            if requested
+            else None
+        )
         relation = classify_input(lineage, resolved_node) if requested else None
         if continues_lineage and branch_from is None and relation in {"ancestor", "sibling"}:
             current = head_path(lineage) or "(none)"
@@ -385,6 +422,25 @@ class CapabilityExecutor:
                 f"later steps added. Omit {tool.primary_matrix_input} to use the current artifact "
                 f"({current}), or pass {_BRANCH_ARGUMENT} instead to keep both as alternatives."
             )
+        nodes = lineage.get("nodes")
+        forest_nonempty = isinstance(nodes, Mapping) and bool(nodes)
+        untracked_source = relation == "untracked" or (
+            requested is None and tool.primary_matrix_input is None
+        )
+        if continues_lineage and adopt_untracked:
+            if not untracked_source:
+                raise CapabilityExecutionError(
+                    f"{_ADOPT_UNTRACKED_ARGUMENT} is only for an untracked input; use the active "
+                    f"head normally or {_BRANCH_ARGUMENT} for a recorded alternative."
+                )
+            source = "adopted"
+        elif continues_lineage and forest_nonempty and untracked_source and branch_from is None:
+            label = requested or "this tool's external matrix source"
+            raise CapabilityExecutionError(
+                f"{tool.name} would replace the active analysis with untracked input {label}. "
+                f"Pass {_ADOPT_UNTRACKED_ARGUMENT}=true to adopt it explicitly, or omit the matrix "
+                "path to continue from the active artifact."
+            )
         return {
             "base_head_execution_id": head,
             "requested_input": requested,
@@ -392,6 +448,7 @@ class CapabilityExecutor:
             "input_relation": relation,
             "input_source": source if requested else None,
             "branch_intent": branch_from is not None,
+            "adopt_intent": adopt_untracked,
         }
 
     async def _execute_in_environment(
@@ -570,9 +627,29 @@ class CapabilityExecutor:
         # Validate here, while the result is still only staged, so a contract breach surfaces as an
         # ordinary tool error the model can act on rather than as a PostToolUse hook failure after
         # the compute has already been reported as successful.
-        dispatch_lineage["matrix_output"] = _matrix_output(tool, files)
+        matrix_output = _matrix_output(tool, files)
+        dispatch_lineage["matrix_output"] = matrix_output
         dispatch_lineage["operation"] = tool.lineage_operation
-        partition_facts_patch(result.facts_patch)
+        if has_prepared_path(result.facts_patch):
+            raise CapabilityExecutionError(
+                "facts.analysis.dataset_revision.prepared_path is executor-owned; "
+                "remove it from the skill result"
+            )
+        node_facts, _ = partition_facts_patch(result.facts_patch)
+        if matrix_output is None and node_facts:
+            requested = dispatch_lineage.get("requested_input")
+            parent = dispatch_lineage.get("resolved_input_execution_id")
+            if isinstance(requested, str) and not isinstance(parent, str):
+                raise CapabilityExecutionError(
+                    "a read-only tool returned node-scoped facts for an untracked matrix; those "
+                    "facts cannot be attached to the active analysis. Adopt the matrix through a "
+                    "transforming tool first, or return only session-scoped provenance."
+                )
+            if requested is None and dispatch_lineage.get("base_head_execution_id") is None:
+                raise CapabilityExecutionError(
+                    "a read-only tool returned node-scoped facts before an analysis version "
+                    "existed, so there is no lineage node to attach them to"
+                )
         persisted = {
             "schema_version": result.schema_version,
             "execution_id": context.execution_id,
@@ -649,7 +726,9 @@ class CapabilityExecutor:
             ),
         }
 
-    def _reject_stale_base(self, execution_id: str, data: Mapping[str, Any]) -> None:
+    def _reject_stale_base(
+        self, execution_id: str, data: Mapping[str, Any], state: SessionState
+    ) -> None:
         """Refuse a matrix commit whose head moved while it was running.
 
         Compute runs for minutes in a subprocess. Without this, a long training run that started
@@ -663,11 +742,19 @@ class CapabilityExecutor:
             return
         if dispatch.get("branch_intent"):
             return
-        base = dispatch.get("base_head_execution_id")
-        if not isinstance(base, str):
-            return
-        current = active_head(self.session.store.state.lineage)
-        if current is not None and current != base:
+        base_value = dispatch.get("base_head_execution_id")
+        base = base_value if isinstance(base_value, str) else None
+        current = active_head(state.lineage)
+        requested = dispatch.get("requested_input")
+        parent = dispatch.get("resolved_input_execution_id")
+        parent = parent if isinstance(parent, str) else None
+        if parent is None and isinstance(requested, str):
+            parent = node_for_path(
+                state.lineage, requested, session_dir=self.session.directory
+            )
+        # Recovery may stage a child before its parent is committed. Once ordered recovery has
+        # committed that parent, the recorded input resolves to the current head and is safe.
+        if current != base and parent != current:
             raise CapabilityExecutionError(
                 f"cannot commit {execution_id}: it derived from head {base} but the active head "
                 f"is now {current}. Re-run it against the current head, or declare explicit "
@@ -675,7 +762,10 @@ class CapabilityExecutor:
             )
 
     def _checkout_state_patch(
-        self, data: Mapping[str, Any], session_facts: Mapping[str, Any]
+        self,
+        data: Mapping[str, Any],
+        session_facts: Mapping[str, Any],
+        state: SessionState,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Switch the active version, moving the head and the node-scoped facts together.
 
@@ -691,11 +781,11 @@ class CapabilityExecutor:
             raise CapabilityExecutionError(
                 "a checkout capability must report details.target_execution_id"
             )
-        lineage = self.session.store.state.lineage
+        lineage = state.lineage
         switched = checkout(lineage, target)
         roots = node_scoped_roots()
         current_view = {
-            key: value for key, value in self.session.store.state.facts.items() if key in roots
+            key: value for key, value in state.facts.items() if key in roots
         }
         target_view = resolve_node_facts(lineage, target, merge=apply_merge_patch)
         visible = dict(session_facts)
@@ -703,7 +793,11 @@ class CapabilityExecutor:
         return {"active_execution_id": switched["active_execution_id"]}, visible
 
     def _lineage_state_patch(
-        self, execution_id: str, data: Mapping[str, Any], artifact_relative: str
+        self,
+        execution_id: str,
+        data: Mapping[str, Any],
+        artifact_relative: str,
+        state: SessionState,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Route a committed result into the lineage forest and global facts.
 
@@ -713,7 +807,7 @@ class CapabilityExecutor:
         scoped facts always merge globally.
         """
 
-        lineage = self.session.store.state.lineage
+        lineage = state.lineage
         dispatch = data.get("lineage")
         dispatch = dispatch if isinstance(dispatch, Mapping) else {}
         facts_patch = data.get("facts_patch")
@@ -721,10 +815,11 @@ class CapabilityExecutor:
         node_facts, session_facts = partition_facts_patch(facts_patch)
 
         if dispatch.get("operation") == "checkout":
-            return self._checkout_state_patch(data, session_facts)
+            return self._checkout_state_patch(data, session_facts, state)
 
         matrix_output = dispatch.get("matrix_output")
         branch_intent = bool(dispatch.get("branch_intent"))
+        adopt_intent = bool(dispatch.get("adopt_intent"))
         requested = dispatch.get("requested_input")
         requested = requested if isinstance(requested, str) else None
         parent = dispatch.get("resolved_input_execution_id")
@@ -733,16 +828,28 @@ class CapabilityExecutor:
             # Crash recovery stages several executions before any of them commits, so the forest
             # was empty when their inputs were resolved at dispatch. The path was still recorded,
             # so resolve it against the forest as it stands now.
-            parent = node_for_path(lineage, requested)
+            parent = node_for_path(
+                lineage, requested, session_dir=self.session.directory
+            )
         head = active_head(lineage)
 
         if not isinstance(matrix_output, str) or not matrix_output:
             # Read-only: no node, no head movement. Its node-scoped evidence still has to be
             # attached to the node it describes, or a later checkout loses it.
-            target = parent or head
+            if requested is not None and parent is None and node_facts:
+                raise CapabilityExecutionError(
+                    "a read-only tool returned node-scoped facts for an untracked matrix; those "
+                    "facts cannot be attached to the active analysis. Adopt the matrix through a "
+                    "transforming tool first, or return only session-scoped provenance."
+                )
+            target = parent if requested is not None else head
+            if target is None and node_facts:
+                raise CapabilityExecutionError(
+                    "a read-only tool returned node-scoped facts before an analysis version "
+                    "existed, so there is no lineage node to attach them to"
+                )
             if target is None:
-                # Nothing tracked yet; the forest cannot hold the patch, so keep prior behaviour.
-                return {}, dict(facts_patch)
+                return {}, dict(session_facts)
             lineage_patch = attach_patch(lineage, target, node_facts) if node_facts else {}
             visible = dict(session_facts)
             # Global facts are the active head's resolved view. A patch on the head, or on any
@@ -754,16 +861,17 @@ class CapabilityExecutor:
             return lineage_patch, visible
 
         # Matrix-producing: a new node whose parent is the artifact actually consumed.
+        node_head_path = f"{artifact_relative}/{matrix_output}"
+        node_facts = with_prepared_path(node_facts, node_head_path)
         inherited = (
             resolve_node_facts(lineage, parent, merge=apply_merge_patch) if parent else {}
         )
         node_view = apply_merge_patch(inherited, node_facts)
-        projected = apply_merge_patch(deepcopy(self.session.store.state.facts), dict(facts_patch))
         node = LineageNode(
             execution_id=execution_id,
             parent_execution_id=parent,
-            head_path=f"{artifact_relative}/{matrix_output}",
-            identity_signature=identity_signature(projected),
+            head_path=node_head_path,
+            identity_signature=identity_signature(node_view),
             requested_input=(
                 str(dispatch["requested_input"])
                 if isinstance(dispatch.get("requested_input"), str)
@@ -771,6 +879,7 @@ class CapabilityExecutor:
             ),
             resolved_input_execution_id=parent,
             branch_intent=branch_intent,
+            adopt_intent=adopt_intent,
             skill_id=str(data.get("skill_id", "")),
             tool_name=str(data.get("tool_name", "")),
             fact_patches=(dict(node_facts),) if node_facts else (),
@@ -791,7 +900,7 @@ class CapabilityExecutor:
                 roots = node_scoped_roots()
                 current_view = {
                     key: value
-                    for key, value in self.session.store.state.facts.items()
+                    for key, value in state.facts.items()
                     if key in roots
                 }
                 visible.update(merge_diff(current_view, node_view))
@@ -808,15 +917,6 @@ class CapabilityExecutor:
             raise CapabilityExecutionError(f"pending capability result not found: {execution_id}")
         data = json.loads(result_path.read_text(encoding="utf-8"))
         artifact_relative = str(final.relative_to(self.session.directory))
-        lineage_patch, visible_facts = self._lineage_state_patch(
-            execution_id, data, artifact_relative
-        )
-        # Checked before the staging directory is moved: rejecting after the move would leave a
-        # committed-looking artifact directory with no lineage node and no state record.
-        self._reject_stale_base(execution_id, data)
-        if pending.is_dir():
-            final.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(pending, final)
         artifact_record = {
             "kind": "capability-result",
             "skill_id": data["skill_id"],
@@ -832,18 +932,36 @@ class CapabilityExecutor:
             "model_media": data.get("model_media", []),
             "lineage": data.get("lineage", {}),
         }
-        state_patch: dict[str, Any] = {
-            "facts": visible_facts,
-            "decisions": data["decisions_patch"],
-            "artifacts": {execution_id: artifact_record},
-        }
-        if lineage_patch:
-            state_patch["lineage"] = lineage_patch
-        self.session.store.record(
-            "capability.result_committed",
-            payload={"execution_id": execution_id, **artifact_record},
-            state_patch=state_patch,
-        )
+        def prepare_commit(state: SessionState) -> Mapping[str, Any]:
+            # The store invokes this after reloading state while holding the session lock. Checking
+            # earlier is racy across two processes: both can observe one head and then commit in
+            # sequence. The filesystem move remains after the check and before the event append.
+            if execution_id in state.artifacts:
+                raise _AlreadyCommitted
+            self._reject_stale_base(execution_id, data, state)
+            lineage_patch, visible_facts = self._lineage_state_patch(
+                execution_id, data, artifact_relative, state
+            )
+            if pending.is_dir():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(pending, final)
+            state_patch: dict[str, Any] = {
+                "facts": visible_facts,
+                "decisions": data["decisions_patch"],
+                "artifacts": {execution_id: artifact_record},
+            }
+            if lineage_patch:
+                state_patch["lineage"] = lineage_patch
+            return state_patch
+
+        try:
+            self.session.store.record(
+                "capability.result_committed",
+                payload={"execution_id": execution_id, **artifact_record},
+                state_patch_factory=prepare_commit,
+            )
+        except _AlreadyCommitted:
+            return False
         self.session.refresh_outputs_best_effort()
         return True
 

@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -27,7 +27,12 @@ from scagent_sdk.errors import (
     SessionIdentityError,
     SessionNotFoundError,
 )
-from scagent_sdk.state.lineage import rebuild_forest
+from scagent_sdk.state.lineage import (
+    FACT_ROOT_SCOPES,
+    active_head,
+    rebuild_forest,
+    resolve_node_facts,
+)
 
 # A session id is used verbatim as a filesystem directory name and as the resume
 # key, so it must be a single safe token: start with an alphanumeric, then only
@@ -317,8 +322,39 @@ class SessionStore:
             if event.kind == "capability.result_committed"
             and isinstance(event.payload.get("execution_id"), str)
         ]
-        forest, warnings = rebuild_forest(committed, merge=apply_merge_patch)
+        forest, warnings = rebuild_forest(
+            committed, merge=apply_merge_patch, session_dir=self.session_dir
+        )
         self.state.lineage = forest
+        nodes = forest.get("nodes")
+        nodes = nodes if isinstance(nodes, Mapping) else {}
+        flat_forest = len(nodes) > 1 and all(
+            not isinstance(node, Mapping) or node.get("parent_execution_id") is None
+            for node in nodes.values()
+        )
+        degraded = bool(warnings) or flat_forest
+        if degraded:
+            # The legacy checkpoint is lossy across branches but it is still the only complete
+            # materialized view when parentage could not be reconstructed. Never replace it with a
+            # partial head view: doing so silently deletes evidence when a session is restored at a
+            # new path or its early events did not record inputs.
+            warnings.append(
+                "preserved legacy global facts because lineage reconstruction was degraded; "
+                "the checkpoint was not narrowed to the reconstructed active head"
+            )
+        else:
+            # A legacy checkpoint merged node-scoped facts globally in event order. Reconcile that
+            # view with a cleanly reconstructed active line so migration cannot leave facts
+            # describing a sibling.
+            session_facts = {
+                key: deepcopy(value)
+                for key, value in self.state.facts.items()
+                if FACT_ROOT_SCOPES.get(key) != "node"
+            }
+            head = active_head(forest)
+            if head is not None:
+                session_facts.update(resolve_node_facts(forest, head, merge=apply_merge_patch))
+            self.state.facts = session_facts
         self.state.schema_version = SESSION_STATE_SCHEMA_VERSION
         _atomic_write_json(self.state_path, self.state.to_dict())
         return warnings
@@ -363,17 +399,25 @@ class SessionStore:
         *,
         payload: Mapping[str, Any] | None = None,
         state_patch: Mapping[str, Any] | None = None,
+        state_patch_factory: Callable[[SessionState], Mapping[str, Any]] | None = None,
         actor: str = "harness",
     ) -> SessionEvent:
+        if state_patch is not None and state_patch_factory is not None:
+            raise ValueError("pass state_patch or state_patch_factory, not both")
         with self._exclusive_lock():
             self._reload_under_lock()
             self._replay_unapplied_events()
+            resolved_state_patch = (
+                dict(state_patch_factory(self.state))
+                if state_patch_factory is not None
+                else dict(state_patch or {})
+            )
             event = SessionEvent(
                 session_id=self.session_id,
                 sequence=self.state.last_event_sequence + 1,
                 kind=kind,
                 payload=dict(payload or {}),
-                state_patch=dict(state_patch or {}),
+                state_patch=resolved_state_patch,
                 actor=actor,
             )
             self._append_event(event)

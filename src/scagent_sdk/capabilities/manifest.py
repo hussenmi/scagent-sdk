@@ -16,6 +16,15 @@ _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ENTRYPOINT = re.compile(r"^(?P<path>[^:]+\.py):(?P<function>[A-Za-z_][A-Za-z0-9_]*)$")
 _LINEAGE_OPERATIONS = frozenset({"checkout"})
+_ADOPT_UNTRACKED_ARGUMENT = "adopt_untracked"
+_ADOPT_UNTRACKED_SCHEMA = {
+    "type": "boolean",
+    "default": False,
+    "description": (
+        "Explicitly replace the active analysis with an untracked matrix. Use only when starting "
+        "a new line of work from a file this analysis did not produce."
+    ),
+}
 
 
 def _mapping(value: Any, *, name: str) -> dict[str, Any]:
@@ -28,6 +37,20 @@ def _nonempty(value: Any, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CapabilityManifestError(f"{name} must be a non-empty string")
     return value.strip()
+
+
+def _with_executor_lineage_controls(
+    schema: dict[str, Any], *, primary_matrix_output: str | None
+) -> dict[str, Any]:
+    """Expose executor-owned controls without duplicating them across every manifest."""
+
+    if primary_matrix_output is None:
+        return schema
+    updated = dict(schema)
+    properties = dict(updated.get("properties") or {})
+    properties.setdefault(_ADOPT_UNTRACKED_ARGUMENT, dict(_ADOPT_UNTRACKED_SCHEMA))
+    updated["properties"] = properties
+    return updated
 
 
 @dataclass(frozen=True)
@@ -119,11 +142,20 @@ class CapabilityTool:
     def from_dict(cls, value: Any) -> CapabilityTool:
         data = _mapping(value, name="tool")
         try:
+            primary_matrix_output = (
+                _nonempty(data["primary_matrix_output"], name="tool.primary_matrix_output")
+                if data.get("primary_matrix_output") is not None
+                else None
+            )
+            input_schema = _with_executor_lineage_controls(
+                _mapping(data["input_schema"], name="tool.input_schema"),
+                primary_matrix_output=primary_matrix_output,
+            )
             return cls(
                 name=_nonempty(data["name"], name="tool.name"),
                 description=_nonempty(data["description"], name="tool.description"),
                 entrypoint=_nonempty(data["entrypoint"], name="tool.entrypoint"),
-                input_schema=_mapping(data["input_schema"], name="tool.input_schema"),
+                input_schema=input_schema,
                 environment=_nonempty(data.get("environment", "current"), name="tool.environment"),
                 activity_label=(
                     _nonempty(data["activity_label"], name="tool.activity_label")
@@ -136,11 +168,7 @@ class CapabilityTool:
                     if data.get("primary_matrix_input") is not None
                     else None
                 ),
-                primary_matrix_output=(
-                    _nonempty(data["primary_matrix_output"], name="tool.primary_matrix_output")
-                    if data.get("primary_matrix_output") is not None
-                    else None
-                ),
+                primary_matrix_output=primary_matrix_output,
                 lineage_operation=(
                     _nonempty(data["lineage_operation"], name="tool.lineage_operation")
                     if data.get("lineage_operation") is not None

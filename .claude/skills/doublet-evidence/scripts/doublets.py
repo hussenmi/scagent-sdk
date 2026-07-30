@@ -488,7 +488,6 @@ def _execute_evidence(arguments: dict[str, Any], context: Any) -> dict[str, Any]
         "evidence": details,
         "dataset_revision_patch": {
             "id": contract["dataset_revision_id"],
-            "prepared_path": final_path,
             "observation_revision_id": _identity(
                 "observation-revision",
                 {"parent": contract["dataset_revision_id"], "doublet_evidence_id": evidence_id},
@@ -735,7 +734,6 @@ def _execute_review(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
                 "dataset_revision": {
                     "id": new_revision_id,
                     "source_path": str(path),
-                    "prepared_path": final_path,
                     "n_cells": int(filtered.n_obs),
                     "n_genes": int(filtered.n_vars),
                 },

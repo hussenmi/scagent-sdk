@@ -8,10 +8,9 @@ departed from the specification, and what remains open.
 
 Branch `main` at `f741291`.
 
-Baseline at HEAD: **610 passed, 0 failed**; `ruff` clean; `mypy` clean (51 files);
-`scagent-sdk capability validate` pass (23 skills, 51 tools).
-One pre-existing failure (`media_capability_test`) exists only in the shared working tree, from
-another worker's uncommitted files; it fails identically at HEAD without our changes.
+Current working-tree validation after the correctness follow-up: **628 passed, 0 failed**;
+`ruff` clean; `mypy` clean (51 files); `scagent-sdk capability validate` pass
+(23 skills, 51 tools, 22 executable). `git diff --check` is clean.
 
 ## Commits
 
@@ -134,12 +133,18 @@ step derived from it.
 - Reconstruction is **more forgiving than a live commit**: an unregistered fact root in
   already-committed history is kept session-wide and named in warnings rather than raising.
 - Sessions that recorded no arguments cannot yield parentage; reported explicitly so a flat set of
-  roots does not read as evidence that the work was unrelated.
-- 15 tests, including two against the reference session (skipped if absent, since it is host state).
+  roots does not read as evidence that the work was unrelated. A degraded reconstruction preserves
+  the legacy fact checkpoint instead of replacing it with a partial active-node view.
+- Historical absolute input paths survive a moved/restored session: canonical matching runs first,
+  followed only during migration by an exact executor-owned
+  `artifacts/capabilities/<execution_id>/...` tail match.
+- 17 migration tests, including a physical moved-session regression and two against the reference
+  session (skipped if absent, since it is host state).
 
-### Verified against all 9 sessions on disk
+### Verified against all 11 sessions on disk
 
-All open, upgrade to state v2, and reconstruct. The reference session
+All reconstruct at their original path and under a synthetic restored path with identical parent
+maps and identical resolved head facts. The reference session
 (`run_20260727T052254Z_58b435`) rebuilds its exact 13-deep chain
 (`final-annotated → celltypist-annotated → scimilarity-annotated → clustered → umap → neighbors →
 pca → hvg-selected → log-normalized → doublet-annotated → qc-assessed → counts-ready →
@@ -177,30 +182,40 @@ caller to record after the lock is released. This would have frozen every sessio
 | 9 | branch commit leaves head **and** active facts unchanged | `lineage_branch_test` |
 | 10 | checkout is atomic across head + facts + `prepared_path` | `lineage_branch_test` |
 | 11 | omitted input reaches the executor and resolves | `lineage_commit_test` + live |
-| 12 | untracked path mid-session rejected without adopt intent | see open question 1 |
+| 12 | untracked path mid-session rejected without adopt intent | `lineage_commit_test` |
 | 13 | unregistered fact root fails closed | contract + commit tests |
 | 14 | finalize blocked after gene conversion | `gene_conversion_identity_test` (7 tests) |
 
-## Open questions we would like judged
+## Correctness follow-up after review
 
-1. **D3's untracked-path rule was narrowed.** The spec rejects an untracked path when the forest is
-   non-empty, absent adopt intent. Applied literally that blocks legitimate work — asking about an
-   unrelated file mid-session hands `describe_dataset` an untracked path. We restricted the policy to
-   tools declaring a `primary_matrix_output`, so read-only inspection is unrestricted, and did **not**
-   implement `adopt_untracked`. A transforming tool given an untracked path currently becomes a new
-   root rather than being refused. Is that acceptable, or does adopt intent still need to exist?
-2. **`prepared_path` was not removed.** The spec says the executor should derive it and the nine
-   skill call sites should be stripped. We left both in place: `investigate_batch`'s read-only
-   assertion is gone (`d4cf013`), but the eight writers still set it and the executor does not own it.
-   It is now redundant rather than authoritative. Worth a follow-up, or leave it?
-3. **Historical matrix outputs are identified by `.h5ad` suffix in the reducer**, since historical
-   events predate the declarations. Safe on measured data (0/61 wrote two), and a multi-matrix event
-   is warned about. Sound?
-4. **`branch_from` is a per-tool schema property**, duplicated across 20 manifests, because the model
-   runtime enforces `additionalProperties: false` and the executor cannot inject an undeclared
-   argument. Is a control argument declared per tool the right shape, or should it be a manifest-level
-   affordance the runtime adds?
-5. **D11 remains deferred**: pruning and column overlays. `reachable_from_heads` exists as the
+The post-implementation reviews found eight material gaps. They are resolved in the current tree:
+
+1. Transforming an untracked matrix in a non-empty forest is rejected unless the call carries the
+   executor-owned `adopt_untracked: true`; adoption creates a provenance-marked new root.
+2. A read-only result cannot attach node-scoped facts from an untracked matrix to the active head.
+   The failure happens before staging; session-scoped inspection facts remain allowed.
+3. The optimistic head comparison now runs inside the same `SessionStore` lock that builds the state
+   patch, moves the artifact, and appends the event. It compares `None` as a real base and is tested
+   through two independently opened stores.
+4. The executor derives `prepared_path` from every node's `head_path`, migration rewrites legacy
+   values, checkout restores it with the selected node, and skill writes fail closed.
+5. `branch_from` accepts an execution ID, unambiguous prefix, or artifact path and always dispatches
+   the canonical absolute matrix path. Branch signatures derive from the parent-resolved fact view.
+6. Migration selects historical primary outputs from a versioned tool/artifact-role table rather
+   than an `.h5ad` suffix guess, covering CellBender `.h5` and multi-H5AD executions.
+7. Migration resolves absolute historical paths after a session move using the complete
+   executor-owned artifact tail. If reconstruction is still degraded or warns, it preserves the
+   legacy fact checkpoint rather than silently dropping node-scoped evidence.
+8. `adopt_untracked` is model-visible without YAML duplication: the manifest loader injects the
+   executor-owned boolean into all 20 tools declaring a primary matrix output before MCP assembly.
+   A registry-wide test pins the exact runtime schemas despite `additionalProperties: false`.
+
+## Remaining open questions
+
+1. **`branch_from` is still a per-tool schema property**, duplicated across 20 manifests, while
+   `adopt_untracked` demonstrates the central runtime-added shape. Should `branch_from` move to the
+   same manifest-loader mechanism? This is cleanup, not a reachability or correctness blocker.
+2. **D11 remains deferred**: pruning and column overlays. `reachable_from_heads` exists as the
    prerequisite; retention still needs the `retained`/`pinned`/`rejected` branch-status vocabulary.
    `sessions/` on this host is 26 GB with no retention policy, and the 19× multiplier is unchanged.
 

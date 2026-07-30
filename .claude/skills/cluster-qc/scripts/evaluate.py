@@ -1388,7 +1388,6 @@ def _cleanup_facts_patch(
             "dataset_revision": {
                 "id": ids["dataset_revision_id"],
                 "source_path": source_path,
-                "prepared_path": final_path,
                 "n_cells": n_obs,
                 "n_genes": n_vars,
             },

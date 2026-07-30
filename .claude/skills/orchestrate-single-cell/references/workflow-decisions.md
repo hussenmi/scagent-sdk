@@ -66,7 +66,8 @@ continuing from one silently discards whatever the intervening steps added.
 That makes the descent above the default shape: cluster, read the evidence, clean up, cluster again
 from the result. When a comparison genuinely needs two clusterings of the *same* embedding side by
 side, pass `branch_from` with the version to fork from; each alternative is recorded without
-changing which version is active. Use `analysis-versions` to list them and to switch to the one the
+changing which version is active. The full or short version ID reported by `analysis-versions` is
+accepted directly. Use `analysis-versions` to list them and to switch to the one the
 evidence supports, and switch before annotating or finalizing, since those run against the active
 version. A branch's cluster QC is bound to that branch and does not become the session's current
 evidence until it is active — so compare from what each run returned, not from session facts.
@@ -78,7 +79,8 @@ continuing from one silently discards whatever the intervening steps added.
 That makes the descent above the default shape: cluster, read the evidence, clean up, cluster again
 from the result. When a comparison genuinely needs two clusterings of the *same* embedding side by
 side, pass `branch_from` with the version to fork from; each alternative is recorded without
-changing which version is active. Use `analysis-versions` to list them and to switch to the one the
+changing which version is active. The full or short version ID reported by `analysis-versions` is
+accepted directly. Use `analysis-versions` to list them and to switch to the one the
 evidence supports, and switch before annotating or finalizing, since those run against the active
 version. A branch's cluster QC is bound to that branch and does not become the session's current
 evidence until it is active — so compare from what each run returned, not from session facts.

@@ -82,7 +82,6 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         history_frame.to_csv(context.staging_dir / "scvi-training-history.csv")
     else:
         (context.staging_dir / "scvi-training-history.csv").write_text("\n", encoding="utf-8")
-    final_path = f"artifacts/capabilities/{context.execution_id}/scvi-latent.h5ad"
     return {
         "summary": (
             f"Trained scVI and saved a {n_latent}-dimensional X_scVI representation "
@@ -98,7 +97,6 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         },
         "facts_patch": {
             "analysis": {
-                "dataset_revision": {"prepared_path": final_path},
                 "representation": {
                     "id": representation_id,
                     "method": "scvi",

@@ -246,7 +246,6 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     )
     adata.uns["scagent_sdk"] = metadata
     output_name = "counts-ready.h5ad"
-    final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
     adata.write_h5ad(
         context.staging_dir / output_name,
         compression=INTERMEDIATE_COMPRESSION,
@@ -292,7 +291,6 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
                 "dataset_revision": {
                     "id": revision_id,
                     "source_path": str(path),
-                    "prepared_path": final_path,
                     "n_cells": int(adata.n_obs),
                     "n_genes": int(adata.n_vars),
                 },
