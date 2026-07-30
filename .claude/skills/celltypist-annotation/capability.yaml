@@ -19,8 +19,9 @@ tools:
         model: {type: string, default: Immune_All_Low.pkl, description: Cached model filename or absolute model path.}
         counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}
         output_key: {type: string, default: celltypist_prediction}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: celltypist-annotated-anndata
   - name: summarize_celltypist_by_cluster
     description: Aggregate existing per-cell CellTypist predictions and confidence over any supplied grouping as an optional step separate from inference.
     entrypoint: scripts/run_celltypist.py:summarize_by_cluster
@@ -33,5 +34,6 @@ tools:
         cluster_key: {type: string}
         prediction_key: {type: string, default: celltypist_prediction}
         confidence_key: {type: string, default: celltypist_prediction_confidence}
-      required: [path, cluster_key]
+      required: [cluster_key]
       additionalProperties: false
+    primary_matrix_input: path

@@ -38,6 +38,15 @@ class CapabilityTool:
     environment: str = "current"
     activity_label: str | None = None
     floors: tuple[str, ...] = ()
+    # Which argument carries the analysis matrix this tool reads. Declared, not inferred: the
+    # executor resolves an omitted value to the active lineage head, and validates a supplied one
+    # against it. Absent means the tool takes no lineage input -- an arbitrary file it merely
+    # inspects is not the analysis matrix.
+    primary_matrix_input: str | None = None
+    # Which declared artifact continues the lineage when this tool writes one. Named rather than
+    # detected by suffix, because CellBender emits three ``.h5`` matrices of which only the
+    # filtered one continues the analysis, and several tools write a matrix only conditionally.
+    primary_matrix_output: str | None = None
 
     def __post_init__(self) -> None:
         if not _TOOL_NAME.fullmatch(self.name):
@@ -58,6 +67,23 @@ class CapabilityTool:
             _nonempty(self.activity_label, name=f"tool {self.name}.activity_label")
         for floor in self.floors:
             _nonempty(floor, name=f"tool {self.name}.floors")
+        if self.primary_matrix_input is not None:
+            _nonempty(self.primary_matrix_input, name=f"tool {self.name}.primary_matrix_input")
+            properties = self.input_schema.get("properties")
+            if isinstance(properties, dict) and self.primary_matrix_input not in properties:
+                raise CapabilityManifestError(
+                    f"tool {self.name}.primary_matrix_input names "
+                    f"{self.primary_matrix_input!r}, which is not an input_schema property"
+                )
+            required = self.input_schema.get("required")
+            if isinstance(required, list) and self.primary_matrix_input in required:
+                raise CapabilityManifestError(
+                    f"tool {self.name}.primary_matrix_input {self.primary_matrix_input!r} must not "
+                    "be in input_schema.required: the executor resolves an omitted value to the "
+                    "active lineage head, and a required argument can never be omitted"
+                )
+        if self.primary_matrix_output is not None:
+            _nonempty(self.primary_matrix_output, name=f"tool {self.name}.primary_matrix_output")
 
     @property
     def entrypoint_parts(self) -> tuple[Path, str]:
@@ -74,6 +100,8 @@ class CapabilityTool:
             "activity_label": self.activity_label,
             "floors": list(self.floors),
             "input_schema": self.input_schema,
+            "primary_matrix_input": self.primary_matrix_input,
+            "primary_matrix_output": self.primary_matrix_output,
         }
 
     @classmethod
@@ -92,6 +120,16 @@ class CapabilityTool:
                     else None
                 ),
                 floors=tuple(str(item) for item in data.get("floors", [])),
+                primary_matrix_input=(
+                    _nonempty(data["primary_matrix_input"], name="tool.primary_matrix_input")
+                    if data.get("primary_matrix_input") is not None
+                    else None
+                ),
+                primary_matrix_output=(
+                    _nonempty(data["primary_matrix_output"], name="tool.primary_matrix_output")
+                    if data.get("primary_matrix_output") is not None
+                    else None
+                ),
             )
         except KeyError as exc:
             raise CapabilityManifestError(f"tool is missing required field: {exc.args[0]}") from exc

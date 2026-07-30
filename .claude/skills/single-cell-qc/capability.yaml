@@ -21,8 +21,9 @@ tools:
         min_genes: {type: [integer, "null"], minimum: 0, default: 200}
         max_genes: {type: [integer, "null"], minimum: 1, default: null}
         max_pct_mito: {type: [number, "null"], minimum: 0, maximum: 100, default: 20}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: qc-anndata
   - name: review_single_cell_qc
     description: Record a visual, evidence-bound QC decision after inspecting every standard QC figure; filtering remains a separate explicit mutation.
     entrypoint: scripts/qc.py:review_qc
@@ -65,8 +66,10 @@ tools:
         max_genes: {type: [integer, "null"], minimum: 1, default: null}
         max_pct_mito: {type: [number, "null"], minimum: 0, maximum: 100, default: 20}
         confirm_filtering: {type: boolean, description: Explicit confirmation that this operation changes the cell set.}
-      required: [path, confirm_filtering]
+      required: [confirm_filtering]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: qc-anndata
   - name: filter_single_cell_genes
     description: Remove genes detected in fewer than the requested number of cells, independently of cell filtering and downstream preprocessing.
     entrypoint: scripts/qc.py:filter_genes
@@ -82,5 +85,7 @@ tools:
           description: "'auto' uses layers['counts'] when present and otherwise validates X; null explicitly uses X."
         min_cells: {type: integer, minimum: 1, default: 3}
         confirm_filtering: {type: boolean, description: Explicit confirmation that this operation changes the feature set.}
-      required: [path, confirm_filtering]
+      required: [confirm_filtering]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: gene-filtered-anndata

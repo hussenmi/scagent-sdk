@@ -15,8 +15,9 @@ tools:
         path: {type: string}
         counts_layer: {type: string, default: counts}
         target_sum: {type: number, exclusiveMinimum: 0, default: 10000}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: log-normalized-anndata
   - name: select_highly_variable_genes
     description: Compute and record a highly-variable-gene mask without subsetting or running dimensionality reduction.
     entrypoint: scripts/preprocess.py:select_hvg
@@ -30,5 +31,6 @@ tools:
         flavor: {type: string, enum: [seurat, cell_ranger, seurat_v3, seurat_v3_paper], default: seurat}
         layer: {type: [string, "null"], default: null, description: Optional matrix layer; null uses X.}
         batch_key: {type: [string, "null"], default: null}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: hvg-anndata

@@ -22,5 +22,6 @@ tools:
           type: [string, "null"]
           default: null
           description: Required when counts_source is layer.
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: count-ready-anndata

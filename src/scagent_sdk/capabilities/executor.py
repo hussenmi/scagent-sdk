@@ -35,6 +35,7 @@ from scagent_sdk.state.lineage import (
     active_head,
     attach_patch,
     classify_input,
+    head_path,
     identity_signature,
     merge_diff,
     node_for_path,
@@ -111,30 +112,43 @@ def _resolve_session_paths(
     return str(session_candidate) if session_candidate.exists() else value
 
 
-def _matrix_input(arguments: Mapping[str, Any]) -> str | None:
-    """The matrix path a tool was asked to read, if any."""
+def _matrix_input(tool: CapabilityTool, arguments: Mapping[str, Any]) -> str | None:
+    """The matrix path this tool was asked to read, per its declaration."""
 
-    value = arguments.get(_MATRIX_INPUT_ARGUMENT)
-    if not isinstance(value, str) or not value.strip():
+    if tool.primary_matrix_input is None:
         return None
-    return value if value.lower().endswith(_MATRIX_SUFFIX) else None
+    value = arguments.get(tool.primary_matrix_input)
+    return value if isinstance(value, str) and value.strip() else None
 
 
-def _matrix_output(files: list[dict[str, Any]]) -> str | None:
-    """The single matrix a result declares, or None. Raises when a result declares two."""
+def _matrix_output(tool: CapabilityTool, files: list[dict[str, Any]]) -> str | None:
+    """The artifact that continues the lineage, per this tool's declaration.
 
-    matrices = [
+    Named rather than detected: CellBender emits three ``.h5`` matrices of which only the filtered
+    one continues the analysis. A tool may declare an output it does not always produce -- cluster
+    QC writes a matrix only when it removes clusters -- so an absent artifact simply means no node.
+    """
+
+    declared = tool.primary_matrix_output
+    if declared is not None:
+        for item in files:
+            if str(item.get("name")) == declared:
+                return str(item["relative_path"])
+        return None
+    # Fail closed on an undeclared AnnData container: silently skipping it would detach the
+    # analysis from its lineage, which is precisely the defect this design removes.
+    stray = sorted(
         str(item["relative_path"])
         for item in files
         if str(item.get("relative_path", "")).lower().endswith(_MATRIX_SUFFIX)
-    ]
-    if len(matrices) > 1:
+    )
+    if stray:
         raise CapabilityExecutionError(
-            "a capability declared more than one matrix artifact "
-            f"({', '.join(sorted(matrices))}); lineage cannot infer which one continues the "
-            "analysis. Declare primary_matrix_output in capability.yaml."
+            f"tool {tool.name} produced {', '.join(stray)} but declares no "
+            "primary_matrix_output, so lineage cannot record what continues the analysis. "
+            "Declare primary_matrix_output in capability.yaml."
         )
-    return matrices[0] if matrices else None
+    return None
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -216,8 +230,8 @@ class CapabilityExecutor:
             state_facts=deepcopy(self.session.store.state.facts),
         )
         resolved_arguments = _resolve_session_paths(arguments, self.session.directory)
-        dispatch = self._dispatch_lineage(resolved_arguments)
         try:
+            dispatch = self._resolve_matrix_input(tool, resolved_arguments)
             failures = FloorEvaluator().failures(self.session.store.state, tool.floors)
             if failures:
                 reason = " ".join(
@@ -298,22 +312,56 @@ class CapabilityExecutor:
             "structuredContent": envelope,
         }
 
-    def _dispatch_lineage(self, resolved_arguments: Mapping[str, Any]) -> dict[str, Any]:
-        """Record, at dispatch, which artifact this execution consumes and from which head.
+    def _resolve_matrix_input(
+        self, tool: CapabilityTool, resolved_arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve this tool's matrix input against the lineage, injecting the head if omitted.
 
-        Both are captured here rather than at commit because both change: the head advances as
-        other executions commit, and deriving a parent from the head at commit time is what
-        recorded three clusterings off one UMAP as a chain.
+        An omitted input is the common case and the safe one: the executor supplies the artifact
+        the analysis is actually on, so the model has no path to get wrong. A supplied input is
+        honoured but validated -- a tracked artifact that is no longer the head is refused for any
+        tool that continues the lineage, because that is exactly how two annotators diverge and one
+        contribution disappears from the delivered file.
+
+        Read-only tools are not restricted. Inspecting some other file mid-analysis is legitimate
+        and creates no node, so it cannot detach anything.
         """
 
         lineage = self.session.store.state.lineage
-        requested = _matrix_input(resolved_arguments)
+        head = active_head(lineage)
+        continues_lineage = tool.primary_matrix_output is not None
+        requested = _matrix_input(tool, resolved_arguments)
+        source = "supplied"
+
+        if tool.primary_matrix_input is not None and requested is None:
+            resolved_head = head_path(lineage)
+            if resolved_head is None:
+                if continues_lineage and head is not None:
+                    raise CapabilityExecutionError(
+                        f"{tool.name} needs a matrix but the lineage has no active artifact; "
+                        f"pass {tool.primary_matrix_input} explicitly."
+                    )
+            else:
+                requested = str((self.session.directory / resolved_head).resolve())
+                resolved_arguments[tool.primary_matrix_input] = requested
+                source = "injected"
+
         resolved_node = node_for_path(lineage, requested) if requested else None
+        relation = classify_input(lineage, resolved_node) if requested else None
+        if continues_lineage and relation in {"ancestor", "sibling"}:
+            current = head_path(lineage) or "(none)"
+            raise CapabilityExecutionError(
+                f"{tool.name} was given {requested}, which is a tracked {relation} of the active "
+                f"artifact rather than the artifact itself. Continuing from it would drop whatever "
+                f"later steps added. Omit {tool.primary_matrix_input} to use the current artifact "
+                f"({current}), or pass that path explicitly."
+            )
         return {
-            "base_head_execution_id": active_head(lineage),
+            "base_head_execution_id": head,
             "requested_input": requested,
             "resolved_input_execution_id": resolved_node,
-            "input_relation": classify_input(lineage, resolved_node) if requested else None,
+            "input_relation": relation,
+            "input_source": source if requested else None,
             # Branch intent arrives with D4; until then every commit continues the active line.
             "branch_intent": False,
         }
@@ -494,7 +542,7 @@ class CapabilityExecutor:
         # Validate here, while the result is still only staged, so a contract breach surfaces as an
         # ordinary tool error the model can act on rather than as a PostToolUse hook failure after
         # the compute has already been reported as successful.
-        dispatch_lineage["matrix_output"] = _matrix_output(files)
+        dispatch_lineage["matrix_output"] = _matrix_output(tool, files)
         partition_facts_patch(result.facts_patch)
         persisted = {
             "schema_version": result.schema_version,
@@ -559,6 +607,17 @@ class CapabilityExecutor:
             "artifact_relative_path": artifact_relative_path if files else None,
             "files": model_files,
             "model_media": persisted["model_media"],
+            # Report which artifact was actually read and why, so an injected input is visible
+            # rather than a silent substitution.
+            "resolved_input": (
+                {
+                    "path": dispatch_lineage["requested_input"],
+                    "relation": dispatch_lineage.get("input_relation"),
+                    "source": dispatch_lineage.get("input_source"),
+                }
+                if dispatch_lineage.get("requested_input")
+                else None
+            ),
         }
 
     def _reject_stale_base(self, execution_id: str, data: Mapping[str, Any]) -> None:

@@ -44,5 +44,7 @@ tools:
         caveats:
           type: array
           items: {type: string}
-      required: [path, labels, rationales, deg_labels, evidence_summaries, confidence, analysis_summary]
+      required: [labels, rationales, deg_labels, evidence_summaries, confidence, analysis_summary]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: final-annotated-anndata

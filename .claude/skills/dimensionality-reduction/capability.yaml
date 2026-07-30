@@ -16,8 +16,9 @@ tools:
         n_components: {type: integer, minimum: 2, maximum: 200, default: 50}
         use_highly_variable: {type: boolean, default: true}
         random_seed: {type: integer, default: 0}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: pca-anndata
   - name: build_single_cell_neighbors
     description: Build a nearest-neighbor graph from an explicitly named representation such as X_pca, X_scVI, or X_scimilarity.
     entrypoint: scripts/reduce.py:build_neighbors
@@ -32,8 +33,9 @@ tools:
         n_neighbors: {type: integer, minimum: 2, default: 15}
         n_pcs: {type: [integer, "null"], minimum: 2, default: null}
         random_seed: {type: integer, default: 0}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: neighbors-anndata
   - name: compute_single_cell_umap
     description: Compute a UMAP visualization from an existing neighbor graph.
     entrypoint: scripts/reduce.py:compute_umap
@@ -48,5 +50,6 @@ tools:
         min_dist: {type: number, minimum: 0, maximum: 1, default: 0.5}
         spread: {type: number, exclusiveMinimum: 0, default: 1.0}
         random_seed: {type: integer, default: 0}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: umap-anndata

@@ -25,8 +25,10 @@ tools:
         knn_k: {type: integer, minimum: 1, maximum: 1000, default: 50, description: Reference neighbors that vote on each cell's label. Larger k smooths noisy per-cell calls; smaller k follows local structure.}
         weighting: {type: boolean, default: false, description: Weight each neighbor's vote by inverse distance instead of counting votes equally.}
         target_celltypes: {type: [array, "null"], default: null, items: {type: string}, description: "Constrained annotation: restrict predictions to these reference labels, which must be exact labels of this model (validated, with near-miss hints). Runs alongside the unconstrained call from the same embeddings and reports how far the two agree. Use when the tissue's expected cell types are known and unconstrained output includes implausible types."}
-      required: [path, organism]
+      required: [organism]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: scimilarity-annotated-anndata
   - name: summarize_scimilarity_by_cluster
     description: Aggregate existing per-cell SCimilarity predictions over any supplied grouping; this optional step is separate from model inference.
     entrypoint: scripts/run_scimilarity.py:summarize_by_cluster
@@ -38,8 +40,9 @@ tools:
         path: {type: string, description: H5AD produced by run_scimilarity_annotation or containing an equivalent prediction column.}
         cluster_key: {type: string}
         prediction_key: {type: string, default: scimilarity_prediction}
-      required: [path, cluster_key]
+      required: [cluster_key]
       additionalProperties: false
+    primary_matrix_input: path
   - name: query_reference_cells
     description: Search the SCimilarity reference cell atlas for the cells most similar to a selected population, returning reference cell-type, tissue, disease, and study composition, neighbor distances, and query coherence. Use to characterize novel or ambiguous populations; needs the model's cell-search index and loads it into memory, so query the groups of interest in one call.
     entrypoint: scripts/query_reference.py:query
@@ -67,5 +70,6 @@ tools:
         model_path: {type: [string, "null"], default: null, description: Local model directory containing cellsearch/; otherwise uses the organism-specific configured path.}
         counts_layer: {type: [string, "null"], default: counts, description: Raw-count layer name; use X or null for adata.X.}
         min_gene_overlap: {type: integer, minimum: 1, default: 5000}
-      required: [path, organism]
+      required: [organism]
       additionalProperties: false
+    primary_matrix_input: path

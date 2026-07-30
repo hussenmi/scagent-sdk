@@ -48,8 +48,9 @@ tools:
           default: 0.2
           description: A convergent removal at or above this fraction is held for review.
         random_seed: {type: integer, default: 0}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: cluster-qc-filtered-raw-counts
   - name: review_cluster_qc
     description: Record visual inspection of every cluster-QC figure and explicitly adjudicate each flagged cluster; non-keep dispositions remain unresolved until the requested mutation or reclustering occurs.
     entrypoint: scripts/evaluate.py:review

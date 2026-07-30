@@ -74,4 +74,5 @@ tools:
           type: boolean
           default: false
           description: Opt-in online Ensembl/Entrez→symbol lookup via mygene.info when no in-file symbol column exists. Fails soft when offline.
-      required: [path]
+    primary_matrix_input: path
+    primary_matrix_output: gene-symbols

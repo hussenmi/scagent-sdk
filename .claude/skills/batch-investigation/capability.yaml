@@ -57,8 +57,9 @@ tools:
         n_neighbors_for_mixing: {type: integer, minimum: 2, maximum: 200, default: 30}
         max_cells_for_mixing: {type: integer, minimum: 100, default: 20000}
         random_seed: {type: integer, default: 0}
-      required: [path, batch_key]
+      required: [batch_key]
       additionalProperties: false
+    primary_matrix_input: path
   - name: decide_batch_handling
     description: Record an explicit batch-handling decision against current batch evidence. Non-integration decisions are always allowed; integration requires an explicit basis and never proceeds silently against the evidence.
     entrypoint: scripts/investigate.py:run_decision

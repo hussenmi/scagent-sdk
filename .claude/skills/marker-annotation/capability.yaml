@@ -29,8 +29,8 @@ tools:
             type: array
             minItems: 1
             items: {type: string, minLength: 1}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
   - name: review_annotation_evidence
     description: Record DEG-primary adjudication after inspecting current DEG and reference evidence, requiring two independent references when available or a documented waiver.
     entrypoint: scripts/markers.py:review_annotation_evidence

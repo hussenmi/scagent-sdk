@@ -17,8 +17,9 @@ tools:
         cluster_key: {type: string, default: leiden}
         resolution: {type: number, exclusiveMinimum: 0, default: 0.8}
         random_seed: {type: integer, default: 0}
-      required: [path]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: clustered-anndata
   - name: rank_single_cell_groups
     description: Rank genes for an existing grouping and save a complete differential-expression table.
     entrypoint: scripts/clustering.py:rank_groups
@@ -33,5 +34,7 @@ tools:
         layer: {type: [string, "null"], default: null}
         use_raw: {type: boolean, default: false}
         reference: {type: string, default: rest}
-      required: [path, group_key]
+      required: [group_key]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: ranked-groups-anndata

@@ -52,8 +52,10 @@ tools:
         overwrite_existing_predictions:
           type: boolean
           default: false
-      required: [path, batch_key]
+      required: [batch_key]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: doublet-annotated-anndata
   - name: review_doublet_evidence
     description: Record a conservative review decision or explicitly remove only current Scrublet predicted_doublet calls, issuing a new raw-count cell-set artifact and invalidating stale downstream evidence.
     entrypoint: scripts/doublets.py:run_review
@@ -80,5 +82,7 @@ tools:
           exclusiveMinimum: 0
           maximum: 0.5
           default: 0.2
-      required: [path, decision, rationale]
+      required: [decision, rationale]
       additionalProperties: false
+    primary_matrix_input: path
+    primary_matrix_output: doublet-filtered-raw-counts

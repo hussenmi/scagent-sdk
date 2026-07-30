@@ -50,6 +50,8 @@ tools:
         path: {type: string}
         clustering: {type: string}
         facts: {type: object}
+    primary_matrix_input: path
+    primary_matrix_output: matrix
   - name: write_evidence
     description: write node-scoped evidence without a matrix
     entrypoint: scripts/run.py:write_evidence
@@ -58,6 +60,7 @@ tools:
       properties:
         path: {type: string}
         facts: {type: object}
+    primary_matrix_input: path
 """,
         encoding="utf-8",
     )
@@ -165,24 +168,27 @@ def test_parent_is_the_artifact_actually_consumed(tmp_path: Path) -> None:
     assert ancestry(harness.lineage, second) == [second, first]
 
 
-def test_three_runs_from_one_parent_are_siblings(tmp_path: Path) -> None:
-    """Acceptance case 1, end to end.
+def test_a_sweep_from_one_parent_now_needs_explicit_branch_intent(tmp_path: Path) -> None:
+    """A resolution sweep used to be expressible by passing the same parent repeatedly.
 
-    Each run explicitly reads the same parent. Parentage must come from that path, not from the
-    head, which advances after every commit.
+    That is indistinguishable from the divergence bug, so it is refused. Deliberate forks get an
+    explicit vocabulary with D4; sibling topology itself is covered in lineage_contract_test.
     """
 
     harness = _Harness(tmp_path, "sweep")
     base = harness.run("make_matrix")
-    children = [
-        harness.run("make_matrix", path=harness.matrix_path(base), clustering=f"clust:{index}")
-        for index in range(3)
-    ]
+    first = harness.run("make_matrix", path=harness.matrix_path(base), clustering="clust:0")
+    assert harness.lineage["nodes"][first]["parent_execution_id"] == base
 
-    for child in children:
-        assert harness.lineage["nodes"][child]["parent_execution_id"] == base
-        assert ancestry(harness.lineage, child) == [child, base]
-    assert children[0] not in ancestry(harness.lineage, children[2])
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package,
+            harness.tools["make_matrix"],
+            {"path": harness.matrix_path(base), "clustering": "clust:1"},
+        )
+    )
+    assert response["is_error"] is True
+    assert "tracked ancestor" in response["error_summary"]
 
 
 def test_untracked_input_starts_a_root_rather_than_inventing_a_parent(tmp_path: Path) -> None:
@@ -300,15 +306,36 @@ def test_evidence_on_a_sibling_branch_stays_out_of_global_facts(tmp_path: Path) 
 
     harness = _Harness(tmp_path, "sibling")
     base = harness.run("make_matrix")
-    sibling = harness.run("make_matrix", path=harness.matrix_path(base), clustering="clust:a")
     head = harness.run("make_matrix", path=harness.matrix_path(base), clustering="clust:b")
+    # Creating a sibling through the executor needs the branch intent that arrives with D4, so the
+    # node is inserted directly to exercise the routing rule that will govern it.
+    sibling = "51b11ac6-0000-4000-8000-000000000000"
+    harness.session.store.record(
+        "test.sibling_node",
+        state_patch={
+            "lineage": {
+                "nodes": {
+                    sibling: {
+                        "parent_execution_id": base,
+                        "head_path": f"artifacts/capabilities/{sibling}/matrix.h5ad",
+                        "identity_signature": "identity:v1:sha256:sibling",
+                        "branch_intent": True,
+                        "fact_patches": [],
+                    }
+                }
+            }
+        },
+    )
 
     assert active_head(harness.lineage) == head
     assert classify_input(harness.lineage, sibling) == "sibling"
 
+    sibling_dir = harness.session.directory / "artifacts" / "capabilities" / sibling
+    sibling_dir.mkdir(parents=True)
+    (sibling_dir / "matrix.h5ad").write_bytes(b"H5AD")
     harness.run(
         "write_evidence",
-        path=harness.matrix_path(sibling),
+        path=str(sibling_dir / "matrix.h5ad"),
         facts={"cluster_qc": {"status": "on-sibling"}},
     )
 
@@ -329,7 +356,7 @@ def test_global_facts_match_the_resolved_view_of_the_active_head(tmp_path: Path)
         "make_matrix", path=harness.matrix_path(first), facts={"cluster_qc": {"step": 3}}
     )
     harness.run("write_evidence", path=harness.matrix_path(second), facts={"batch": {"step": 4}})
-    harness.run("make_matrix", path=harness.matrix_path(first), clustering="clust:x")
+    harness.run("make_matrix", facts={"doublets": {"step": 5}})
 
     active = active_head(harness.lineage)
     assert active is not None
@@ -454,13 +481,12 @@ def test_two_annotators_chained_forward_compose_into_one_head(tmp_path: Path) ->
     }
 
 
-def test_two_annotators_from_one_parent_are_recorded_as_divergent(tmp_path: Path) -> None:
-    """The defect itself, now *visible* instead of silent.
+def test_the_original_defect_is_now_refused(tmp_path: Path) -> None:
+    """The reported incident, prevented rather than merely recorded.
 
-    Both annotators read ``clustered``, so the second's output does not descend from the first and
-    cannot carry its column. Before lineage there was nothing in state that recorded this; the
-    forest now shows two children of one parent, and the head's resolved view is missing the
-    abandoned branch's evidence rather than appearing to include it.
+    Both annotators are handed ``clustered``. Once the first commits, that artifact is an ancestor,
+    so continuing from it would drop the first's column from the delivered file. The executor
+    refuses and names the artifact to use instead.
     """
 
     harness = _Harness(tmp_path, "divergent-annotators")
@@ -470,25 +496,81 @@ def test_two_annotators_from_one_parent_are_recorded_as_divergent(tmp_path: Path
         path=harness.matrix_path(clustered),
         facts={"annotation": {"evidence": {"scimilarity": "complete"}}},
     )
-    second = harness.run(
-        "make_matrix",
-        path=harness.matrix_path(clustered),
-        facts={"annotation": {"evidence": {"celltypist": "complete"}}},
+
+    response = asyncio.run(
+        harness.executor.execute(
+            harness.package,
+            harness.tools["make_matrix"],
+            {
+                "path": harness.matrix_path(clustered),
+                "facts": {"annotation": {"evidence": {"celltypist": "complete"}}},
+            },
+        )
     )
 
-    nodes = harness.lineage["nodes"]
-    assert nodes[first]["parent_execution_id"] == clustered
-    assert nodes[second]["parent_execution_id"] == clustered
-    assert classify_input(harness.lineage, first) == "sibling"
+    assert response["is_error"] is True
+    assert "tracked ancestor" in response["error_summary"]
+    # Nothing was committed, and the first annotator's evidence is intact.
+    assert active_head(harness.lineage) == first
+    assert harness.facts["annotation"]["evidence"] == {"scimilarity": "complete"}
 
-    # The head is the second annotator, and it genuinely does not have the first's evidence --
-    # which is the truth about the delivered artifact, now recorded rather than papered over.
-    resolved = resolve_node_facts(harness.lineage, second, merge=apply_merge_patch)
-    assert resolved["annotation"]["evidence"] == {"celltypist": "complete"}
-    assert harness.facts["annotation"]["evidence"] == {"celltypist": "complete"}
-    assert resolve_node_facts(harness.lineage, first, merge=apply_merge_patch)["annotation"][
-        "evidence"
-    ] == {"scimilarity": "complete"}
+
+def test_omitting_the_path_chains_annotators_automatically(tmp_path: Path) -> None:
+    """Acceptance case 2: the correct outcome with no path named at all.
+
+    This is what makes the defect unrepresentable rather than merely rejected -- with nothing to
+    name, there is nothing to get wrong.
+    """
+
+    harness = _Harness(tmp_path, "injected-chain")
+    clustered = harness.run("make_matrix")
+    first = harness.run(
+        "make_matrix", facts={"annotation": {"evidence": {"scimilarity": "complete"}}}
+    )
+    second = harness.run(
+        "make_matrix", facts={"annotation": {"evidence": {"celltypist": "complete"}}}
+    )
+
+    assert ancestry(harness.lineage, second) == [second, first, clustered]
+    assert harness.facts["annotation"]["evidence"] == {
+        "scimilarity": "complete",
+        "celltypist": "complete",
+    }
+
+
+def test_the_envelope_reports_an_injected_input(tmp_path: Path) -> None:
+    """Resolution must be visible, or a FileNotFound is traded for an invisible wrong input."""
+
+    harness = _Harness(tmp_path, "envelope")
+    first = harness.run("make_matrix")
+
+    response = asyncio.run(
+        harness.executor.execute(harness.package, harness.tools["make_matrix"], {})
+    )
+    resolved = response["structuredContent"]["resolved_input"]
+
+    assert resolved["source"] == "injected"
+    assert resolved["relation"] == "head"
+    assert resolved["path"] == harness.matrix_path(first)
+
+
+def test_supplying_the_current_head_explicitly_is_accepted(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path, "explicit-head")
+    first = harness.run("make_matrix")
+    second = harness.run("make_matrix", path=harness.matrix_path(first))
+
+    assert harness.lineage["nodes"][second]["parent_execution_id"] == first
+
+
+def test_read_only_tools_may_still_read_a_non_head_artifact(tmp_path: Path) -> None:
+    """The carve-out: inspecting an earlier artifact creates no node and detaches nothing."""
+
+    harness = _Harness(tmp_path, "read-only-carve-out")
+    first = harness.run("make_matrix")
+    harness.run("make_matrix")
+
+    execution = harness.run("write_evidence", path=harness.matrix_path(first))
+    assert execution in harness.session.store.state.artifacts
 
 
 def test_recovery_replays_sequenced_results_in_staging_order(tmp_path: Path) -> None:

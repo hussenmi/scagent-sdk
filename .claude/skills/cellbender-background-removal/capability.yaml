@@ -85,3 +85,4 @@ tools:
           description: Inner timeout kept below the broker's six-hour hard limit so failure artifacts can commit.
       required: [path]
       additionalProperties: false
+    primary_matrix_output: cellbender-filtered-output

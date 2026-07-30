@@ -41,7 +41,11 @@ def test_manifest_splits_evidence_and_decision_tools() -> None:
     # Evidence tool records no decision.
     assert "decision" not in evidence.input_schema["properties"]
     assert evidence.entrypoint.endswith(":run_evidence")
-    assert set(evidence.input_schema["required"]) == {"path", "batch_key"}
+    # ``path`` is the declared matrix input, so it is deliberately optional: the executor resolves
+    # an omitted value to the active lineage artifact.
+    assert set(evidence.input_schema["required"]) == {"batch_key"}
+    assert evidence.primary_matrix_input == "path"
+    assert evidence.primary_matrix_output is None  # reads a matrix, writes none
     props = evidence.input_schema["properties"]
     # The misleading diffxpy no-op is gone; Wilcoxon is the declared primary method.
     assert "prefer_diffxpy" not in props

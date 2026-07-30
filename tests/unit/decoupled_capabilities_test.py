@@ -55,8 +55,16 @@ def test_reference_inference_does_not_require_clustering_or_qc() -> None:
     assert celltypist_run.floors == ()
     assert "cluster_key" not in scimilarity_run.input_schema["properties"]
     assert "cluster_key" not in celltypist_run.input_schema["properties"]
-    assert "path" in scimilarity_run.input_schema["required"]
-    assert "path" in celltypist_run.input_schema["required"]
+    # Both consume the analysis matrix and produce a new one, declared so the executor can resolve
+    # an omitted path to the active artifact and chain them without the model naming files.
+    for tool, artifact in (
+        (scimilarity_run, "scimilarity-annotated-anndata"),
+        (celltypist_run, "celltypist-annotated-anndata"),
+    ):
+        assert tool.primary_matrix_input == "path"
+        assert tool.primary_matrix_output == artifact
+        # ``path`` was the only required argument, so the key is gone entirely.
+        assert "path" not in tool.input_schema.get("required", [])
     assert "summarize_scimilarity_by_cluster" in scimilarity
     assert "summarize_celltypist_by_cluster" in celltypist
 

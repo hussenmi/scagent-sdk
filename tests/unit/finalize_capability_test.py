@@ -61,8 +61,11 @@ def test_manifest_is_strict_gpu_routed_and_fully_floored() -> None:
         "current_annotation_evidence",
     }
     assert tool.input_schema["additionalProperties"] is False
+    # ``path`` is the declared matrix input and therefore optional; finalization runs against the
+    # active lineage artifact unless one is named explicitly.
+    assert tool.primary_matrix_input == "path"
+    assert tool.primary_matrix_output == "final-annotated-anndata"
     assert set(tool.input_schema["required"]) == {
-        "path",
         "labels",
         "rationales",
         "deg_labels",
