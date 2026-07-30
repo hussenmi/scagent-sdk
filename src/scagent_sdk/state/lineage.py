@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -386,6 +386,122 @@ def checkout(lineage: Mapping[str, Any], execution_id: str) -> dict[str, Any]:
     if _node(lineage, execution_id) is None:
         raise LineageContractError(f"cannot check out an unknown lineage node: {execution_id}")
     return {"active_execution_id": execution_id, "nodes": dict(lineage.get("nodes") or {})}
+
+
+def rebuild_forest(
+    committed: Sequence[tuple[str, Mapping[str, Any], Mapping[str, Any]]],
+    *,
+    merge: Any,
+) -> tuple[dict[str, Any], list[str]]:
+    """Reconstruct the forest by replaying committed capability events.
+
+    ``committed`` is ``(execution_id, payload, state_patch)`` in event order. Everything needed is
+    already recorded: the arguments carry the path each execution read, ``files`` carries what it
+    wrote, and ``state_patch.facts`` carries the identities and evidence.
+
+    Read-only executions must be replayed too, not only matrix-producing ones. Most of a session's
+    evidence -- cluster QC, annotation -- comes from tools that write no matrix, and walking only
+    parent chains would rebuild a forest whose nodes describe almost nothing.
+
+    Returns the forest and a list of warnings. Reconstruction is deliberately more forgiving than a
+    live commit: an unregistered fact root in already-committed history is preserved as session-wide
+    rather than raising, because refusing to open an existing session is worse than declining to
+    place one root, and the warning says exactly what was skipped.
+    """
+
+    forest = empty_forest()
+    warnings: list[str] = []
+    unknown_roots: set[str] = set()
+    matrices_total = 0
+    matrices_without_parent = 0
+
+    for execution_id, payload, state_patch in committed:
+        files = payload.get("files")
+        files = files if isinstance(files, list) else []
+        artifact_root = payload.get("path")
+        arguments = payload.get("arguments")
+        arguments = arguments if isinstance(arguments, Mapping) else {}
+
+        # Historical events predate the declared matrix roles, so the output is identified by
+        # container suffix. Safe for reconstruction: no recorded execution ever wrote two.
+        matrices = [
+            str(item.get("relative_path"))
+            for item in files
+            if isinstance(item, Mapping)
+            and str(item.get("relative_path", "")).lower().endswith(".h5ad")
+        ]
+        if len(matrices) > 1:
+            warnings.append(
+                f"{execution_id}: declared {len(matrices)} matrix artifacts; used {matrices[0]}"
+            )
+
+        raw_facts = state_patch.get("facts")
+        raw_facts = raw_facts if isinstance(raw_facts, Mapping) else {}
+        node_facts: dict[str, Any] = {}
+        for root, value in raw_facts.items():
+            scope = FACT_ROOT_SCOPES.get(str(root))
+            if scope is None:
+                unknown_roots.add(str(root))
+                continue
+            if scope == "node":
+                node_facts[str(root)] = value
+
+        requested = arguments.get("path")
+        requested = requested if isinstance(requested, str) and requested.strip() else None
+        parent = node_for_path(forest, requested) if requested else None
+
+        if not matrices:
+            # Attach node-scoped evidence to the version it describes: the artifact it read, or the
+            # head at this point in the replay for a review that took no matrix.
+            target = parent or active_head(forest)
+            if target is not None and node_facts:
+                patch = attach_patch(forest, target, node_facts)
+                nodes = dict(forest["nodes"])
+                nodes[target] = {**nodes[target], **patch["nodes"][target]}
+                forest = {"active_execution_id": forest["active_execution_id"], "nodes": nodes}
+            continue
+
+        matrices_total += 1
+        if parent is None:
+            matrices_without_parent += 1
+        head_relative = f"{artifact_root}/{matrices[0]}" if artifact_root else matrices[0]
+        inherited = resolve_node_facts(forest, parent, merge=merge) if parent else {}
+        created = payload.get("tool_name")
+        node = LineageNode(
+            execution_id=execution_id,
+            parent_execution_id=parent,
+            head_path=head_relative,
+            identity_signature=identity_signature(merge(inherited, node_facts)),
+            requested_input=requested,
+            resolved_input_execution_id=parent,
+            # Historical sessions had no branching vocabulary, so every recorded matrix continued
+            # the line of work as it stood.
+            branch_intent=False,
+            skill_id=str(payload.get("skill_id", "")),
+            tool_name=str(created) if isinstance(created, str) else "",
+            fact_patches=(dict(node_facts),) if node_facts else (),
+        )
+        forest = place_node(forest, node)
+
+    if unknown_roots:
+        warnings.append(
+            "kept as session-wide because they are not in FACT_ROOT_SCOPES: "
+            + ", ".join(sorted(unknown_roots))
+        )
+    if matrices_total and matrices_without_parent == matrices_total:
+        # Early sessions committed no arguments, so the path each execution read was never
+        # recorded and parentage is genuinely unrecoverable. Say so: a flat set of roots is the
+        # honest reconstruction, not evidence that the work was unrelated.
+        warnings.append(
+            f"no input path was recorded for any of the {matrices_total} matrix executions, so "
+            "parentage could not be reconstructed; every version is a root"
+        )
+    elif matrices_without_parent > 1:
+        warnings.append(
+            f"{matrices_without_parent} of {matrices_total} matrix executions read an untracked "
+            "path, so they reconstruct as separate roots"
+        )
+    return forest, warnings
 
 
 def reachable_from_heads(lineage: Mapping[str, Any], heads: list[str]) -> set[str]:

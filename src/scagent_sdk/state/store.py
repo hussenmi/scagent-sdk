@@ -16,13 +16,18 @@ from pathlib import Path
 from typing import Any
 
 from scagent_sdk.contracts.events import SessionEvent, utc_now
-from scagent_sdk.contracts.state import SessionMetadata, SessionState
+from scagent_sdk.contracts.state import (
+    SESSION_STATE_SCHEMA_VERSION,
+    SessionMetadata,
+    SessionState,
+)
 from scagent_sdk.errors import (
     EventLogCorruptionError,
     SessionFormatError,
     SessionIdentityError,
     SessionNotFoundError,
 )
+from scagent_sdk.state.lineage import rebuild_forest
 
 # A session id is used verbatim as a filesystem directory name and as the resume
 # key, so it must be a single safe token: start with an alphanumeric, then only
@@ -193,6 +198,19 @@ class SessionStore:
         with store._exclusive_lock():
             store._reload_under_lock()
             store._replay_unapplied_events()
+            warnings = store._migrate_state_schema()
+        # Recorded after the lock is released: ``record`` takes the same exclusive lock on its own
+        # descriptor, and flock does not re-enter, so appending an event while holding it deadlocks.
+        if warnings:
+            store.record(
+                "session.state_migrated",
+                payload={
+                    "from_schema_version": 1,
+                    "to_schema_version": SESSION_STATE_SCHEMA_VERSION,
+                    "lineage_nodes": len(store.state.lineage.get("nodes", {})),
+                    "warnings": warnings,
+                },
+            )
         return store
 
     @classmethod
@@ -277,6 +295,33 @@ class SessionStore:
             changed = True
         if changed:
             _atomic_write_json(self.state_path, self.state.to_dict())
+
+    def _migrate_state_schema(self) -> list[str]:
+        """Bring a v1 state checkpoint up to v2 by reconstructing the artifact lineage.
+
+        A schema default cannot substitute for this: historical events carry no lineage patch, so
+        replaying them leaves the forest empty and every recorded artifact unreachable. The forest
+        is derived rather than new information, so it is materialized into the checkpoint without
+        recording an event -- consistent with ``state.json`` being a replayable view of the log.
+
+        Returns any reconstruction warnings for the caller to record once the lock is released. They
+        are worth an event: a fact root that could not be placed changes what a checkout restores.
+        Must be called with the exclusive lock held and must not append an event itself.
+        """
+
+        if self.state.schema_version >= SESSION_STATE_SCHEMA_VERSION:
+            return []
+        committed = [
+            (str(event.payload["execution_id"]), event.payload, event.state_patch)
+            for event in self.events()
+            if event.kind == "capability.result_committed"
+            and isinstance(event.payload.get("execution_id"), str)
+        ]
+        forest, warnings = rebuild_forest(committed, merge=apply_merge_patch)
+        self.state.lineage = forest
+        self.state.schema_version = SESSION_STATE_SCHEMA_VERSION
+        _atomic_write_json(self.state_path, self.state.to_dict())
+        return warnings
 
     def _apply_event(self, event: SessionEvent) -> None:
         if event.state_patch:

@@ -17,28 +17,54 @@ The project intentionally does not inherit from or run legacy `scagent`. Scienti
 reimplemented in focused packages and checked against legacy code/tests and BioNeMo contributed
 skills only as read-only references.
 
-## Artifact lineage: accepted specification, not implemented (2026-07-27)
+## Artifact lineage: implemented (2026-07-30)
 
-`docs/artifact-lineage-and-head-spec.md` (v2.2) is review-cleared and **implementation-ready but
-unimplemented**. Read it before touching the capability executor, session state, or any skill that
-writes an H5AD.
+`docs/artifact-lineage-and-head-spec.md` (v2.2) is implemented across five staged commits. Read it
+before touching the capability executor, session state, or any skill that writes an H5AD.
 
-The defect it addresses: session facts merge by identity in the executor and always converge, while
-the H5AD chain merges only by whichever `path` the model passed. A column-adding capability can
-therefore derive from a sibling branch carrying identical identities — which **no floor can
-detect** — leaving facts and reports correct but the delivered H5AD missing an `obs` column. The
-head convention already exists as `facts.analysis.dataset_revision.prepared_path`, written
-independently by eight skill scripts.
+| stage | commit | what landed |
+|---|---|---|
+| 1 | `64d8e33` | state contract: split schema versions, `SessionState.lineage`, identity allowlist, fact-scope registry, pure topology helpers |
+| 2 | `df47cd4` | node creation at commit, parentage from the resolved input, fact routing by scope, optimistic head check, recovery quarantine |
+| 3 | `e4457d4` | declared `primary_matrix_input`/`primary_matrix_output`, head-resolved omitted paths, refusal of superseded inputs |
+| 4 | `95f9134` | `branch_from`, `analysis-versions` (list/switch), atomic checkout of head plus node facts |
+| 5 | (this pass) | v1→v2 reducer, migration on open, reference-session reconstruction |
 
-The design: an executor-owned lineage **forest** in session state, nodes keyed by `execution_id`,
-parent taken from the *resolved input* rather than the commit-time active head, identity demoted to
-an indexed signature, branch commits state-isolated by a per-node facts snapshot, and fact scope
-declared in a central versioned registry. Pruning and column-overlay storage are deliberate
-follow-ons; the session measured in that document holds 228 MB of artifacts from a 12 MB input and
-no retention policy exists anywhere in `src/scagent_sdk`.
+**The defect is closed.** Continuing from a superseded artifact is refused, and omitting the dataset
+path — now the normal way to call a tool — makes the divergence unrepresentable. Verified live
+against `sessions/crc_truth_labeled.h5ad` through the real broker at stages 3 and 4.
 
-Three standalone defects the review surfaced were **fixed separately** and do not wait on the
-forest:
+**The bug was real and had already happened.** Reconstructing the nine sessions on disk found it in
+`run_20260728T153108Z_de92e7`: `finalize_analysis` read `clustered.h5ad` rather than the annotated
+output, so its `final-annotated.h5ad` carries neither annotator's per-cell columns. Nothing in the
+old state recorded that; the forest makes it visible.
+
+**Migration status.** All nine sessions open, upgrade to state v2, and reconstruct without failure.
+Three predate argument recording, so no input path was ever stored and every version reconstructs as
+a root — reported as a migration warning rather than implied. Node-scoped facts round-trip exactly
+for every session that recorded its arguments.
+
+**Still deferred (D11):** pruning and column overlays. `reachable_from_heads` is the prerequisite and
+exists; retention policy needs a branch-status vocabulary (`retained`/`pinned`/`rejected`) and is a
+storage concern, not a correctness one. Sessions on disk total 26 GB with no retention policy.
+
+The defect it addressed: session facts merge by identity in the executor and always converge, while
+the H5AD chain merged only by whichever `path` the model passed. A column-adding capability could
+therefore derive from a sibling artifact carrying identical identities — which **no floor can
+detect** — leaving facts and reports correct but the delivered H5AD missing an `obs` column.
+
+Working rules the implementation establishes:
+
+- Omitting the dataset path is normal. The executor injects the current artifact and reports it as
+  `resolved_input`; `path` is no longer in `required` for any tool that consumes the analysis matrix.
+- A tool that transforms the dataset refuses a superseded artifact and names the current one.
+  Read-only inspection of an earlier or unrelated file is unrestricted.
+- `branch_from` forks an alternative without moving the active version; `analysis-versions` lists
+  versions and switches between them. A branch's evidence is not session evidence until it is active.
+- Fact roots are registered as node- or session-scoped and **fail closed**; identity axes likewise.
+  Adding either is a deliberate, reviewed act.
+
+Three standalone defects the review surfaced were fixed separately and did not wait on the forest:
 
 - `convert_gene_ids` did not re-mint `count_representation`/`dataset_revision` after relabelling
   the var axis, even though `_count_matrix_identity` hashes `var_names`. Fixed, with the explicit
