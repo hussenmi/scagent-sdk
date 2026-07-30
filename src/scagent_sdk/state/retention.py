@@ -24,12 +24,32 @@ This module only measures and proposes. Nothing here deletes anything.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from scagent_sdk.state.lineage import active_head, ancestry, reachable_from_heads
+
+
+def read_state_without_opening(session_dir: Path) -> dict[str, Any]:
+    """Read a session's checkpoint without touching it.
+
+    ``SessionStore.open`` is not an inspection path: it takes the session lock, replays unapplied
+    events, rewrites ``state.json``, can run the v1 -> v2 migration and append an event for it, and
+    refreshes the derived output view. That is right for a session about to be worked on and wrong
+    for a report that claims to observe. Reporting therefore reads the checkpoint directly and
+    accepts that it may lag the event log -- visible as ``last_event_sequence`` -- rather than
+    mutating a session in order to describe it.
+    """
+
+    path = Path(session_dir) / "state.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -102,10 +122,10 @@ class PruneProposal:
         }
 
 
-def _files(root: Path) -> list[tuple[Path, tuple[int, int], int]]:
-    """Every regular file under ``root`` with its ``(device, inode)`` and size."""
+def _files(root: Path) -> list[tuple[Path, tuple[int, int], int, int]]:
+    """Every regular file under ``root`` with its ``(device, inode)``, size and link count."""
 
-    out: list[tuple[Path, tuple[int, int], int]] = []
+    out: list[tuple[Path, tuple[int, int], int, int]] = []
     if not root.is_dir():
         return out
     for path in root.rglob("*"):
@@ -115,37 +135,50 @@ def _files(root: Path) -> list[tuple[Path, tuple[int, int], int]]:
             stat = path.stat()
         except OSError:
             continue
-        out.append((path, (stat.st_dev, stat.st_ino), stat.st_size))
+        out.append((path, (stat.st_dev, stat.st_ino), stat.st_size, stat.st_nlink))
     return out
 
 
 def account(
     targets: Iterable[Path], *, retained: Iterable[Path] = ()
 ) -> ByteAccounting:
-    """Measure ``targets``, treating inodes also present under ``retained`` as unreclaimable.
+    """Measure ``targets``, counting as reclaimable only bytes whose last link would go away.
 
-    Deliberately measures by ``(device, inode)`` rather than by summing file sizes: a hard-linked
-    file appears once physically however many directories reference it, and summing apparent sizes
-    would overstate both the cost and the saving.
+    Measures by ``(device, inode)`` rather than by summing file sizes: a hard-linked file occupies
+    its bytes once however many directories reference it, so summing apparent sizes overstates both
+    the cost and the saving.
+
+    Reclaimability is decided by comparing the links observed inside ``targets`` against the file's
+    own ``st_nlink``. Checking only whether the inode also appears under ``retained`` is not enough:
+    a link held anywhere the scan does not cover -- another session, a backup tree, an export --
+    keeps the bytes alive after the candidate is deleted, and would otherwise be reported as freed.
+    ``st_nlink`` is authoritative about that because it counts every link on the filesystem, not
+    just the ones this function was pointed at.
     """
 
-    kept_inodes = {key for path in retained for _, key, _ in _files(Path(path))}
+    kept_inodes = {key for path in retained for _, key, _, _ in _files(Path(path))}
     apparent = 0
-    seen: set[tuple[int, int]] = set()
-    unique = shared = reclaimable = 0
     count = 0
+    sizes: dict[tuple[int, int], int] = {}
+    nlinks: dict[tuple[int, int], int] = {}
+    seen_here: dict[tuple[int, int], int] = {}
     for path in targets:
-        for _, key, size in _files(Path(path)):
+        for _, key, size, nlink in _files(Path(path)):
             apparent += size
             count += 1
-            if key in seen:
-                continue
-            seen.add(key)
-            unique += size
-            if key in kept_inodes:
-                shared += size
-            else:
-                reclaimable += size
+            sizes[key] = size
+            nlinks[key] = nlink
+            seen_here[key] = seen_here.get(key, 0) + 1
+
+    unique = shared = reclaimable = 0
+    for key, size in sizes.items():
+        unique += size
+        # Links this scan can see: the ones inside the candidate set, plus any under retained.
+        outside = nlinks[key] > seen_here[key]
+        if key in kept_inodes or outside:
+            shared += size
+        else:
+            reclaimable += size
     return ByteAccounting(
         apparent_bytes=apparent,
         unique_bytes=unique,
@@ -153,6 +186,73 @@ def account(
         reclaimable_bytes=reclaimable,
         files=count,
     )
+
+
+def topology_defects(lineage: Mapping[str, Any]) -> tuple[str, ...]:
+    """Reasons the recorded forest cannot be trusted to identify abandoned work.
+
+    Reachability is only meaningful over a forest that actually explains how the work connects.
+    Counting parentless versions is not sufficient: a node whose parent id is not in the forest has
+    a parent recorded and still sits on no line of descent, so it would pass a count-only check
+    while making "unreachable" mean nothing. Each condition below independently breaks the
+    reachability argument, so any of them disqualifies the whole session from pruning.
+    """
+
+    nodes = lineage.get("nodes")
+    nodes = nodes if isinstance(nodes, Mapping) else {}
+    if not nodes:
+        return ()
+
+    defects: list[str] = []
+    head = active_head(lineage)
+    if head is None:
+        defects.append(f"no active version is recorded for {len(nodes)} version(s)")
+    elif head not in nodes:
+        defects.append(f"the active version {head[:8]} is not among the recorded versions")
+
+    roots: list[str] = []
+    dangling: list[str] = []
+    for execution_id, node in sorted(nodes.items()):
+        if not isinstance(node, Mapping):
+            defects.append(f"version {str(execution_id)[:8]} is not a record")
+            continue
+        parent = node.get("parent_execution_id")
+        if not isinstance(parent, str):
+            roots.append(str(execution_id))
+        elif parent not in nodes:
+            dangling.append(str(execution_id))
+    if dangling:
+        defects.append(
+            f"{len(dangling)} version(s) name a parent that is not recorded "
+            f"({', '.join(item[:8] for item in sorted(dangling)[:4])})"
+        )
+    if len(roots) > 1:
+        defects.append(f"{len(roots)} of {len(nodes)} versions have no recorded parent")
+
+    # A cycle makes ancestry non-terminating in principle and unreachable in practice; ``ancestry``
+    # guards against hanging, so detect it here rather than inferring it from a truncated walk.
+    cyclic: list[str] = []
+    for execution_id in sorted(nodes):
+        seen: set[str] = set()
+        current: Any = execution_id
+        while isinstance(current, str) and current in nodes and current not in seen:
+            seen.add(current)
+            node = nodes[current]
+            current = node.get("parent_execution_id") if isinstance(node, Mapping) else None
+        if isinstance(current, str) and current in seen:
+            cyclic.append(str(execution_id))
+    if cyclic:
+        defects.append(f"{len(cyclic)} version(s) sit on a parent cycle")
+
+    # Every version must be on some line of descent from a root, or reachability is partial.
+    if head is not None and head in nodes and not defects:
+        connected = set()
+        for execution_id in nodes:
+            connected.update(ancestry(lineage, execution_id))
+        orphans = sorted(set(nodes) - connected)
+        if orphans:
+            defects.append(f"{len(orphans)} version(s) sit on no line of descent")
+    return tuple(defects)
 
 
 def propose_prune(
@@ -177,17 +277,8 @@ def propose_prune(
     live = reachable_from_heads(lineage, [head] if head else [])
     root = Path(session_dir)
 
-    # More than one parentless version means the recorded topology does not explain how the work
-    # connects: either inputs were adopted from outside the analysis, or a migration could not
-    # recover parentage because the arguments were never recorded. Reachability is then close to
-    # meaningless -- a real session shows up as a dozen isolated roots, all but one of which look
-    # prunable while actually being the analysis. Refuse to imply they are spent.
-    roots = sorted(
-        execution_id
-        for execution_id, node in nodes.items()
-        if isinstance(node, Mapping) and not isinstance(node.get("parent_execution_id"), str)
-    )
-    topology_reliable = len(roots) <= 1
+    defects = topology_defects(lineage)
+    topology_reliable = not defects
 
     warnings: list[str] = []
     if not nodes:
@@ -195,15 +286,11 @@ def propose_prune(
             "no lineage versions recorded, so nothing can be judged unreachable; "
             "open the session once to reconstruct the forest before pruning"
         )
-    if head is None and nodes:
-        warnings.append(
-            "lineage has versions but no active head; every version reads as unreachable"
-        )
     if not topology_reliable:
         warnings.append(
-            f"{len(roots)} of {len(nodes)} versions have no recorded parent, so this session's "
-            "topology does not explain how its work connects and reachability cannot identify "
-            "abandoned work; treat every candidate below as unverified and prune nothing here"
+            "this session's recorded topology does not explain how its work connects, so "
+            "reachability cannot identify abandoned work; treat every candidate below as "
+            "unverified and prune nothing here — " + "; ".join(defects)
         )
 
     candidates: list[ArtifactUsage] = []
@@ -275,8 +362,8 @@ def propose_prune(
             "versions_on_active_line": len(live),
             "active_line_depth": len(ancestry(lineage, head)) if head else 0,
             "committed_executions": len(artifacts),
-            "parentless_versions": len(roots),
             # A prune must consult this before acting on ``candidates`` at all.
             "topology_reliable": topology_reliable,
+            "topology_defects": list(defects),
         },
     )

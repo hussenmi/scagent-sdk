@@ -75,6 +75,32 @@ def test_hard_linked_bytes_are_shared_not_reclaimable(tmp_path: Path) -> None:
     assert result.reclaimable_bytes == 500  # only what this version alone holds
 
 
+def test_a_link_outside_the_scan_makes_bytes_unreclaimable(tmp_path: Path) -> None:
+    """``st_nlink`` is authoritative; the scanned paths are not.
+
+    A link held anywhere the scan does not cover -- another session, a backup tree, an export --
+    keeps the bytes alive after the candidate is deleted. Comparing only against ``retained``
+    reported such a file as fully reclaimable and would have promised bytes that never come back.
+    """
+
+    candidate = _artifact(tmp_path, "cand", ("matrix.h5ad", 4096))
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    os.link(candidate / "matrix.h5ad", outside / "kept.h5ad")
+
+    result = account([candidate], retained=[])
+    assert result.apparent_bytes == 4096
+    assert result.shared_bytes == 4096
+    assert result.reclaimable_bytes == 0
+
+
+def test_a_file_with_no_other_link_is_reclaimable(tmp_path: Path) -> None:
+    """The st_nlink rule must not make everything unreclaimable."""
+
+    candidate = _artifact(tmp_path, "cand", ("matrix.h5ad", 4096))
+    assert account([candidate]).reclaimable_bytes == 4096
+
+
 def test_a_file_linked_twice_inside_the_target_counts_once(tmp_path: Path) -> None:
     directory = _artifact(tmp_path, "a", ("matrix.h5ad", 1000))
     os.link(directory / "matrix.h5ad", directory / "alias.h5ad")
@@ -197,7 +223,7 @@ def test_a_forest_of_roots_is_refused_rather_than_reported_as_prunable(tmp_path:
     proposal = propose_prune(tmp_path, session_id="s", lineage=_lineage("v0", nodes), artifacts={})
 
     assert proposal.notes["topology_reliable"] is False
-    assert proposal.notes["parentless_versions"] == 6
+    assert any("no recorded parent" in d for d in proposal.notes["topology_defects"])
     assert any("prune nothing here" in warning for warning in proposal.warnings)
     # The permissive "merely unreachable" wording must not appear: it would imply the candidates
     # are real, which is the mistake.
@@ -221,6 +247,50 @@ def test_a_single_root_with_branches_is_reliable(tmp_path: Path) -> None:
     assert [item.execution_id for item in proposal.candidates] == ["branch"]
 
 
+def test_a_dangling_parent_is_a_topology_defect(tmp_path: Path) -> None:
+    """A node whose parent is not recorded has a parent and still sits on no line of descent.
+
+    A count of parentless versions passes this case, which is why reliability validates the graph
+    rather than tallying one property of it.
+    """
+
+    for name in ("a", "b"):
+        _artifact(tmp_path, name, ("matrix.h5ad", 100))
+    lineage = _lineage(
+        "a",
+        {
+            "a": {**_node("a", parent=None), "parent_execution_id": "ghost1"},
+            "b": {**_node("b", parent=None), "parent_execution_id": "ghost2"},
+        },
+    )
+
+    proposal = propose_prune(tmp_path, session_id="s", lineage=lineage, artifacts={})
+    assert proposal.notes["topology_reliable"] is False
+    assert any("parent that is not recorded" in d for d in proposal.notes["topology_defects"])
+
+
+def test_an_absent_active_head_is_a_topology_defect(tmp_path: Path) -> None:
+    _artifact(tmp_path, "a", ("matrix.h5ad", 100))
+    proposal = propose_prune(
+        tmp_path,
+        session_id="s",
+        lineage=_lineage("not-a-version", {"a": _node("a", parent=None)}),
+        artifacts={},
+    )
+    assert proposal.notes["topology_reliable"] is False
+    assert any("not among the recorded versions" in d for d in proposal.notes["topology_defects"])
+
+
+def test_a_parent_cycle_is_a_topology_defect(tmp_path: Path) -> None:
+    for name in ("a", "b"):
+        _artifact(tmp_path, name, ("matrix.h5ad", 100))
+    lineage = _lineage("a", {"a": _node("a", parent="b"), "b": _node("b", parent="a")})
+
+    proposal = propose_prune(tmp_path, session_id="s", lineage=lineage, artifacts={})
+    assert proposal.notes["topology_reliable"] is False
+    assert any("cycle" in d for d in proposal.notes["topology_defects"])
+
+
 def test_an_empty_forest_reports_that_nothing_can_be_judged(tmp_path: Path) -> None:
     proposal = propose_prune(tmp_path, session_id="s", lineage=_lineage(None, {}), artifacts={})
     assert proposal.candidates == ()
@@ -235,7 +305,8 @@ def test_versions_without_a_head_are_not_silently_all_prunable(tmp_path: Path) -
         lineage=_lineage(None, {"orphan": _node("orphan", parent=None)}),
         artifacts={},
     )
-    assert any("no active head" in warning for warning in proposal.warnings)
+    assert proposal.notes["topology_reliable"] is False
+    assert any("no active version is recorded" in d for d in proposal.notes["topology_defects"])
 
 
 def test_session_total_covers_every_committed_execution(tmp_path: Path) -> None:
@@ -253,6 +324,44 @@ def test_session_total_covers_every_committed_execution(tmp_path: Path) -> None:
     )
     assert proposal.total.unique_bytes == 1400
     assert proposal.notes["committed_executions"] == 2
+
+
+def test_reading_a_checkpoint_does_not_touch_the_session(tmp_path: Path) -> None:
+    """Reporting must observe. ``SessionStore.open`` replays, rewrites, migrates and can log.
+
+    Pinned by mtime and by the absence of the lock file the store would create, so a future
+    refactor cannot quietly route the report back through a mutating loader.
+    """
+
+    from scagent_sdk.session import AnalysisSession
+    from scagent_sdk.state.retention import read_state_without_opening
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="observed")
+    directory = session.directory
+    state_path = directory / "state.json"
+    events_path = directory / "events.jsonl"
+    before = (state_path.stat().st_mtime_ns, events_path.stat().st_mtime_ns)
+    lock = directory / ".session.lock"
+    lock.unlink(missing_ok=True)
+
+    state = read_state_without_opening(directory)
+    propose_prune(
+        directory,
+        session_id=session.session_id,
+        lineage=state.get("lineage") or {},
+        artifacts=state.get("artifacts") or {},
+    )
+
+    assert (state_path.stat().st_mtime_ns, events_path.stat().st_mtime_ns) == before
+    assert not lock.exists()
+
+
+def test_reading_a_missing_or_corrupt_checkpoint_yields_nothing(tmp_path: Path) -> None:
+    from scagent_sdk.state.retention import read_state_without_opening
+
+    assert read_state_without_opening(tmp_path / "absent") == {}
+    (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
+    assert read_state_without_opening(tmp_path) == {}
 
 
 def test_a_proposal_deletes_nothing(tmp_path: Path) -> None:

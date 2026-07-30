@@ -29,7 +29,7 @@ from scagent_sdk.runtime.interrupts import TurnInterrupter
 from scagent_sdk.runtime.resume import ResumePreference
 from scagent_sdk.runtime.service import AgentRuntimeService
 from scagent_sdk.session import AnalysisSession
-from scagent_sdk.state.retention import propose_prune
+from scagent_sdk.state.retention import propose_prune, read_state_without_opening
 from scagent_sdk.state.store import SessionStore
 
 
@@ -131,40 +131,60 @@ def _cmd_session_show(args: argparse.Namespace) -> int:
 def _cmd_session_storage(args: argparse.Namespace) -> int:
     """Report artifact storage and what an unreachable-version prune would actually reclaim.
 
-    Read-only by construction: there is no deletion path here. ``reclaimable_bytes`` is the only
-    figure a future prune may promise, because apparent size and reclaimable size diverge once
-    versions can share bytes.
+    Observes without mutating: the checkpoint is read directly rather than through
+    ``AnalysisSession.resume``, which would take the session lock, replay events, rewrite
+    ``state.json``, possibly migrate and append an event, and refresh the derived output view.
+
+    Totals are segregated by whether a session's topology can be trusted. Summing every candidate
+    would put an unverified figure in the most prominent position, which is how a report that warns
+    correctly still misleads.
     """
 
-    roots = (
+    root = _sessions_root(args)
+    session_ids = (
         [args.session_id]
         if args.session_id
-        else [item.session_id for item in SessionStore.list_sessions(_sessions_root(args))]
+        else [item.session_id for item in SessionStore.list_sessions(root)]
     )
     reports = []
-    for session_id in roots:
-        session = AnalysisSession.resume(_sessions_root(args), session_id)
+    for session_id in session_ids:
+        state = read_state_without_opening(root.expanduser() / session_id)
         reports.append(
             propose_prune(
-                session.directory,
+                root.expanduser() / session_id,
                 session_id=session_id,
-                lineage=session.store.state.lineage,
-                artifacts=session.store.state.artifacts,
+                lineage=state.get("lineage") or {},
+                artifacts=state.get("artifacts") or {},
             ).to_dict()
         )
     if args.session_id:
         _print_json(reports[0])
         return 0
+
+    def _sum(rows: list[dict[str, Any]], block: str, *keys: str) -> dict[str, int]:
+        return {key: sum(row[block][key] for row in rows) for key in keys}
+
+    trusted = [row for row in reports if row["notes"].get("topology_reliable")]
+    untrusted = [row for row in reports if not row["notes"].get("topology_reliable")]
     _print_json(
         {
             "sessions": reports,
-            "totals": {
-                key: sum(report["session_total"][key] for report in reports)
-                for key in ("apparent_bytes", "unique_bytes", "reclaimable_bytes", "files")
-            },
-            "candidate_totals": {
-                key: sum(report["candidate_total"][key] for report in reports)
-                for key in ("apparent_bytes", "unique_bytes", "shared_bytes", "reclaimable_bytes")
+            "totals": _sum(
+                reports, "session_total", "apparent_bytes", "unique_bytes", "files"
+            ),
+            # The only figure a prune may act on.
+            "verified_reclaimable": _sum(
+                trusted, "candidate_total", "apparent_bytes", "shared_bytes", "reclaimable_bytes"
+            )
+            | {"sessions": len(trusted)},
+            # Reported separately and never added to the above: these sessions' topology cannot
+            # identify abandoned work, so their candidates are not evidence of anything.
+            "unverified_excluded": _sum(
+                untrusted, "candidate_total", "apparent_bytes", "reclaimable_bytes"
+            )
+            | {
+                "sessions": len(untrusted),
+                "session_ids": [row["session_id"] for row in untrusted],
             },
         }
     )
