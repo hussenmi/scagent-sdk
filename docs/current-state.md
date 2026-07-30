@@ -1,8 +1,150 @@
 # Current project state
 
-Status date: 2026-07-27  
+Status date: 2026-07-29  
 Authority: this is the concise source of truth for what exists now, what was actually verified,
 and what should happen next. Historical detail remains in `docs/handoff.md`.
+
+## `materialize_count_matrix` cost halved (2026-07-29)
+
+The step felt slow because it was, and almost none of it was science. Profiled on
+`combined_truly_raw_annotated.h5ad` (36,419 cells, 100M stored values): read 10.8 s, the
+count-source validation scan 2.1 s, matrix copies 1.0 s, full-matrix sha256 0.6 s — and
+`write_h5ad` **82.7 s, 85% of the total**. Two compounding causes, both fixed:
+
+- **Duplicated payload.** The artifact carried the counts in `X` *and* `layers["counts"]`, plus the
+  original source layer and `.raw` — four copies of the same values, making the count-ready
+  artifact (0.96 GB) *larger than its 0.73 GB input*. `_redundant_payload` now drops only what the
+  tool itself duplicated: `.raw`, and the source layer when a layer was selected. Unrelated layers
+  (spliced/unspliced, velocity) survive, and the input is immutable and recorded in
+  `dataset_revision.source_path`. `doublet-evidence` (`doublets.py:656`) and `cluster-qc`
+  (`evaluate.py:1459`) already null `.raw` this way. `details.dropped_payload` reports it.
+- **h5py's default gzip level 4.** A level sweep on the identical trimmed payload: lzf 34.6 s /
+  1.09 GB, gzip-1 41.8 s / 0.52 GB, gzip-2 37.7 s / 0.51 GB, gzip-4 55.4 s / 0.50 GB. Level 2 costs
+  ~2% size for ~32% less time and matches lzf's speed at half its size. lzf was rejected despite
+  being fastest: it is an h5py filter, not part of every HDF5 distribution, so R readers may not
+  open the artifact. The third redundant matrix copy was also removed (three copies → two).
+
+Measured A/B, old and new alternating in one process over three reps to control filesystem drift:
+**100.2 s → 52.9 s (1.89×) and 0.96 GB → 0.51 GB (1.87×)**, with the new path varying by under a
+second across reps. Verified against the real entrypoint: `X` and `layers["counts"]` both equal the
+selected source and are integer-valued, `.raw` and the source layer are gone, all 24 obs and 14 var
+columns survive, and `uns` identities match the emitted facts.
+
+Not addressed: **16 other `write_h5ad` sites still use default gzip** (`expression-preprocessing`,
+`dimensionality-reduction`, `single-cell-clustering`, `cluster-qc`, `doublet-evidence`,
+`scvi-integration`, the annotation skills). The same level-2 change applies to each and is the
+obvious next efficiency pass. `finalize-analysis` should deliberately keep the default for the
+published artifact, where interop matters more than speed.
+
+## Clustering resolutions are now an iterative ladder, not a parallel sweep (2026-07-29)
+
+The comprehensive-analysis pass had turned the 2.0/1.5/1.0 resolutions into a **beauty contest**:
+three clusterings of the same cells on the same embedding, written to distinct `obs` keys, judged
+side by side, one selected. Legacy `scagent` never did that. There the resolutions are three
+**phases with different jobs**, and each runs on different data than the last:
+
+- 2.0 is the first clustering of a run and exists to expose small low-quality populations while
+  they are still separable (`agent/prompts.py:220`);
+- confirmed junk is removed, and the cleaned cells are re-embedded — including a **fresh HVG
+  selection**, because subsetting cells changes the variance landscape (`agent/prompts.py:203`);
+- 1.5 is the working granularity on that new embedding, repeating until nothing is flagged
+  (`agent/prompts.py:221`);
+- 1.0 is the annotation granularity that `prepare_annotation` binds to (`agent/prompts.py:222`).
+
+No number of distinct `obs` keys on one unchanged object can reproduce that, because the cleanup
+and re-embedding between rounds are the point. The corrective change is **guidance only**, by
+explicit decision: the ladder is described as a loop in `orchestrate-single-cell/SKILL.md`,
+`orchestrate-single-cell/references/workflow-decisions.md`, and `cluster-qc/SKILL.md`, with 1.0 as
+the default annotation resolution overridable for a stated scientific reason. Observed model
+behavior already follows 2.0 → 1.5 → 1.0, so legacy's harness-level refusal of off-ladder and
+upward resolutions (`agent/tools.py:5114-5175`) was deliberately **not** ported; if drift appears,
+that enforcement plus durable ladder history in facts is the next step.
+
+The mutation machinery required no change and already forces the loop: applying a removal through
+`evaluate_cluster_qc(auto_remove_convergent=true)` mints fresh dataset/cell-set/count identities and
+nulls `representation`, `clustering`, `cell_qc`, and `doublets`
+(`cluster-qc/scripts/evaluate.py:1368-1417`), so the next round cannot begin on a stale embedding.
+That consequence is now stated in the guidance instead of being left for the model to discover from
+a floor failure.
+
+Validation level: deterministic tests and capability validation only. This is a model-instruction
+change, so it is **not** evidence that the model executes the loop correctly; that needs a live
+end-to-end run.
+
+## Figure inspection: adopted the legacy immediate-interpretation model (2026-07-28)
+
+Figures were being generated, passed over, and attested to much later when a review floor blocked
+the turn — a review written from recall rather than from pixels. Two causes, both fixed by adopting
+what legacy `scagent` did:
+
+- **Nothing obliged the model to read an attached figure.** `model_media` already arrives as inline
+  base64 in the same tool result (`executor.py:_model_content`), so the pixels were never the
+  problem; the model was simply free to chain into the next tool without comment. Legacy appended
+  the figures as their own **user turn** carrying an interpretive prompt (`agent/agent.py:4869`,
+  `_build_image_message`), which had to be answered before anything else. `CapabilityExecutor` now
+  appends an equivalent directive as the **last content block** of any result carrying media: name
+  what each figure shows, what it implies, what needs acting on, before the next tool call, and
+  report legibility failures instead of falling back to the table. It is deliberately generic —
+  what a figure *means* stays in the skill; the runtime package holds no biology. This covers every
+  skill, including `plot_embedding`, markers, and composition, which previously had no figure
+  enforcement of any kind.
+- **`MODEL_MEDIA_LIMIT = 8` made the cluster-QC floor unsatisfiable.** `required_visual_artifacts`
+  lists every per-cluster correlation heatmap (default `max_heatmaps: null`; 20–28 typical), but
+  only 3 overview figures + 5 heatmaps were attached, so ~15–23 required figures were never shown
+  and had to be reopened one at a time. Legacy had **no cap at all**: it auto-encoded every
+  `artifacts_created` entry whose path ended in `.png` and injected all of them. The cap dates to
+  the initial commit with a rationale covering only the byte budgets, not the count. Raised to 64;
+  `cluster-qc` now attaches its whole heatmap set.
+
+Measured, not assumed: the legacy 28-heatmap set is 2.8 MiB raw / ~3.8 MiB base64 — already inside
+our existing 8 MiB `MODEL_MEDIA_TOTAL_BYTES`. Our own heatmaps are 22–33 KiB at 691x608 (a third of
+legacy's 1197px), so a 60-cluster set is ~2 MiB / ~34k image tokens. **Worst-case transport is
+unchanged** by the count increase: the payload ceiling was and remains `min(count x 2 MiB, 8 MiB)`
+= 8 MiB, so the byte budget was always the binding constraint. Beyond 64 figures `cluster-qc`
+degrades visibly — it names the un-attached heatmaps in the summary and `details.figures_not_attached`
+and tells the model to open them with `inspect-media`, rather than failing an expensive pass.
+
+Review schemas were deliberately **left alone**. Legacy carried no per-figure attestation and
+worked; the fix targeted immediacy, not stricter ceremony. `visual_findings` remains a flat list,
+so a terse attestation is still structurally possible — revisit only if immediacy proves
+insufficient in practice.
+
+## Figure comprehensiveness pass (implemented 2026-07-28)
+
+Comparison against legacy run `/data1/peerd/ibrahih3/cs_agent/run_2026_07_22_115023` found the SDK
+figure set at or below legacy coverage in three places, against a product goal of exceeding it.
+Fixed across `visualize-single-cell` (0.3.0), `single-cell-qc`, and `cluster-qc`:
+
+- **Log scaling.** Library size and detected genes are now drawn on log axes with **log-spaced bin
+  edges**. Linear bins under `set_xscale("log")` — what both the legacy run and the SDK did —
+  render the leftmost bar hundreds of times wider than the rightmost and compress the low tail into
+  two or three blocks. Log tick labels use a 1/2/5-per-decade locator with compact text (`2k`,
+  `50k`); the default mantissa labels collided into an unreadable smear in the legacy figures.
+  Per-group and per-cluster boxplots are log-scaled on the same two metrics.
+- **Violins.** Replaced the bare `violinplot` with the legacy shape: violin body plus the per-cell
+  points jittered over it (legacy used `sc.pl.violin(..., jitter=0.2, multi_panel=True)`), over
+  `log1p_total_counts`, `log1p_n_genes_by_counts`, `pct_counts_mt`, `pct_counts_ribo`, with white
+  IQR/median markers added. Jitter is capped at 20,000 deterministically sampled cells.
+- **Coverage.** `plot_qc_distributions` now returns a *set* — knee, log-scaled size histograms,
+  MT and ribosomal percent, jittered violins, joint scatters (genes-vs-counts log-log,
+  MT-vs-counts, ribo-vs-MT), doublet violin+histogram when the artifact carries scores, and
+  four-metric per-group boxplots. `single-cell-qc` gained the doublet figure and a ribosomal panel.
+- **Highlight grids.** `plot_embedding`, `plot_qc_embedding`, and `cluster-qc` now emit a
+  per-category grid alongside every categorical overlay — one panel per category, that category
+  colored and the rest grey, count in the title, shared axis limits, colors matched to the overlay.
+  This is the legacy `_generate_cluster_highlight_grid`, which the SDK lacked. Bounded to 2–150
+  categories and 4 companion grids per call; skips are reported in `highlight_grids_skipped`.
+- **Metric source.** MT/ribo percent now prefers a recorded `pct_counts_mt` / `pct_counts_ribo`
+  over recomputing from the matrix, reporting which was used. Found live: recomputing on an
+  annotated artifact whose RPS/RPL genes had been filtered out reported **0% ribosomal** where the
+  recorded column held the correct 21%.
+- **Display order.** Categories are selected by size but drawn in natural order (2 before 10), so a
+  cluster can be found by name and two figures of one clustering do not shuffle when counts move.
+
+Validation level: deterministic tests for every new pure helper, plus **live rendering** of all
+figures against `run_2026_07_22_115023/machete_data_annotated.h5ad` (21,506 cells, 20 Leiden
+clusters, 15 cell types) with each image visually inspected. Not yet exercised through a full
+`scagent start` session, and not tested on a >150-category clustering or a >1M-cell dataset.
 
 ## Product direction
 
@@ -96,6 +238,8 @@ end-to-end **skill default**, not a hardcoded DAG:
 - The orchestration skill defaults comprehensive runs to user-overridable Leiden comparisons at
   2.0, 1.5, and 1.0. Every resolution receives cluster metric boxplots, a cluster/QC UMAP, all
   eligible covariance heatmaps, three-axis evidence, and `review_cluster_qc`.
+  **Superseded 2026-07-29:** the parallel comparison framing was wrong; those resolutions are now
+  an iterative ladder. See the 2026-07-29 section at the top.
 - Annotation review is explicitly DEG-primary. It expects CellTypist plus SCimilarity when both are
   suitable, requires a specific waiver when only one reference can run, records agreement
   findings, and blocks finalization while any cluster remains unresolved. Cytopus 1.3.4 is locked
@@ -248,13 +392,69 @@ Ruff checks and strict mypy are clean.
   only object-graph-escape dunders so routine introspection runs; and saved custom Python is
   mirrored into the session `code/` directory alongside its provenance-bearing artifact copy.
 - Committed artifacts now also project into a human-browsable session view: descriptive relative
-  symlinks under `code/`, `figures/`, `reports/`, `tables/`, and `data/`, plus readable
+  symlinks under `code/`, `shell/`, `figures/`, `reports/`, `tables/`, and `data/`, plus readable
   `outputs.md` and machine-readable `outputs.json` indexes. Finalization receives stable final-data,
   report, and label aliases. The UUID capability tree remains authoritative; the view is rebuilt
   after every commit and resume, adds no duplicate H5AD storage, and never exposes staged or failed
   executions. Nested output groups stay grouped, byte-identical legacy code copies migrate safely
   to links, edited/user files are preserved, and a view I/O failure cannot invalidate a committed
   result.
+- `run_shell_command` executions now project too, closing a gap where every shell command a session
+  ran was committed under `artifacts/capabilities/<uuid>/` but had no browsable surface at all: the
+  `shell/` directory existed only because session creation made it. Because a command is
+  uninterpretable without its output, shell runs project as one **bundle directory per execution**
+  rather than as loose files — `shell/002-tail-5-events-jsonl-f513a638/{command.sh, stdout.txt,
+  stderr.txt, run.json}`. The name carries an ordinal so a name-sorted listing preserves run order,
+  and a label read from the committed `shell-run.json` (the only place the command text is
+  recorded), with absolute paths reduced to basenames so the label says what was acted on. Files a
+  shell record produces that are not part of the run itself still classify into their own category.
+  `outputs.md` gains a **Shell commands** section listing command, duration, and per-member links;
+  `outputs.json` shell entries carry `bundle_path`, `command`, `cwd`, `exit_code`, and
+  `duration_seconds`. The index schema is version 2; existing sessions reuse their current links on
+  the first refresh rather than duplicating them. Note that a nonzero exit raises inside the
+  entrypoint, so no artifact is committed — projected shell runs are always successful ones.
+- `analysis-recipe.py` was 6 lines holding one 39.6 KB `repr()` of the call list — a machine replay
+  record that had been doing duty as the human deliverable. It is now readable Python (953 lines
+  for the reference session, one commented call per entry, still importable and exactly
+  round-tripping) rendered with `pprint` rather than `json.dumps`, because JSON emits
+  `true`/`false`/`null` which Python cannot parse, and non-finite floats become explicit
+  `float("inf")` calls for the same reason. It stays beside finalization in
+  `finalize-analysis/scripts/recipe.py`.
+- The reading surface is a **new requestable capability**, `analysis-notebook`
+  (`build_analysis_notebook`, `environment: current`, no floors, no required arguments, 22 skills /
+  49 tools). It was first built inside `finalize_analysis` and that was wrong: it inherited
+  finalization's floors, so a walkthrough was impossible until the analysis was already
+  finalizable, it could only ever be produced once, and it implicitly treated annotation as the end
+  of the analysis. It is now requestable at any point, states plainly when an analysis is still in
+  progress, advertises only the deliverables that actually exist, and is **rebuilt from committed
+  provenance on every request** rather than appended to — so a later build covers the steps added
+  since, and cannot drift, duplicate, or go stale. Nothing is overwritten: each build commits its
+  own immutable artifact and the `reports/analysis-notebook.ipynb` alias resolves to the newest.
+  Shape and cluster count come from `facts.analysis.dataset_revision` / `facts.analysis.clustering`
+  and labels from the committed `final-labels.csv` parsed with the `csv` module, so the whole
+  capability runs in the control plane with no compute runtime. The notebook carries the readability
+  work:
+  **inputs resolve to their producer** (`path='counts-ready.h5ad'  # output of step 2 ·
+  materialize_count_matrix`) instead of showing session-absolute UUID paths, decisions are promoted
+  to headings with **untruncated** rationales, steps stay in true chronological order with phase
+  headings marked `(continued)` when an analysis iterates, and each step's overview figures are
+  embedded while nested per-item diagnostic series are linked. Code cells are an honest record of
+  capability calls, not runnable scanpy; a `call` stub raises an explanatory `NotImplementedError`
+  so shift-enter explains itself instead of raising `NameError`. `.ipynb` classifies into
+  `reports/` with an `analysis-notebook.ipynb` alias. The renderer is stdlib-only
+  (`finalize-analysis/scripts/notebook.py`) so it is unit-testable from the control plane.
+- Pass 2 for the notebook is **not** done and is a deliberate follow-up: making code cells
+  genuinely runnable needs a per-skill reproduction-snippet contract so each capability declares
+  its own standard-library equivalent. Synthesizing that centrally would assert an equivalence the
+  generator cannot verify. Judgment steps (`review_cluster_qc`, `decide_batch_handling`,
+  `review_annotation_evidence`) have no code equivalent and stay documented decisions.
+- `run_shell_command`'s result summary now identifies the command instead of reporting only a
+  duration: `Shell command completed in 2.77s: tail -5 …/current-state.md`, collapsed to one line
+  and bounded at 120 characters so an inline `python3 -c` block stays readable in a transcript and
+  in `state.json` on resume. Failures name the command too, on a line above the captured output so
+  the terminal's concise one-line extraction still lands on the actual error. The projector's
+  summary fallback drops the leading boilerplate clause at `:`, mirroring `_code_label`, so a
+  degraded label reads `ls-la-skills` rather than `shell-command-completed-in-2-79s-ls`.
 
 **Output-view acceptance:** the 7.4 GiB session `run_20260726T181314Z_2adcda` now exposes 114
 relative links (6 code, 36 figures, 29 reports plus a final-report alias, 25 tables plus a
@@ -262,6 +462,35 @@ final-label alias, and 15 datasets plus a final-data alias), with zero broken li
 physical payload copies in the review directories. The final deterministic baseline is **426 tests
 passed**; full Ruff and strict mypy are clean; capability validation passes at 21/20/44
 skills/executable/tools; and all six Iris environment profiles are healthy.
+
+**Shell-projection acceptance:** replayed against a copy of the real session
+`run_20260729T205323Z_2a1c40`, whose 8 committed `run_shell_command` executions previously had no
+browsable surface. All 8 now project as named bundles (`001-cat-state-json-python3-c-import-sys-json-b3516d16`
+through `008-grep-i-resolution-res-leiden-res-cluster-7a3d322e`) carrying 32 links; every link
+resolves to a file, repeated refreshes reproduce a byte-identical index, and no `--view-N`
+collision names appear. `tests/unit/output_view_test.py` covers this at 28 tests (bundle shape and
+member order, ordinal-follows-commit-order with reverse-sorting ids, absolute-path and
+trailing-separator label compression, URLs and relative paths left intact, unreadable-report and
+non-finite-number fallbacks, mixed shell/figure records, markdown escaping, stale-bundle pruning
+that spares category roots, and refresh idempotency), with the summary format and its bounded
+multi-line and failure cases covered in `tests/unit/sandbox_and_error_test.py`. The summary change
+was confirmed by executing the real entrypoint on Iris, not only through fixtures.
+
+**Notebook acceptance:** driven through the real registered capability handler against the real
+session `run_20260729T205323Z_2a1c40` — 113 cells, 8.25 MB, 44 committed steps, 26 embedded overview
+figures with the 70 per-cluster cluster-QC panels linked. The same session with its `finalization`
+fact removed produces the in-progress variant, which drops the Final labels section and stops
+advertising `data/final-annotated.h5ad`. Validated with `nbformat.validate` under
+`warnings.simplefilter("error")`, which is what surfaced the missing cell `id` fields that nbformat
+4.5 requires and will later hard-fail on; ids are assigned positionally so regenerating a session's
+notebook diffs cleanly. `tests/unit/analysis_notebook_test.py` covers this at 30 tests, including a
+real defect the tests caught (`pprint` renders `inf`/`nan` as bare names, which made the recipe
+un-importable) and a path-escape guard on the state-supplied labels path. Adding the skill required
+updating three inventory assertions (registry ids, CLI counts) and naming it in
+`configs/models/prompts/base.md`, which the capability-self-knowledge contract test enforces.
+
+Full Ruff, strict mypy, and capability validation (22 skills / 49 tools) are clean, as are all tests
+across the touched areas.
 
 ### Environments
 

@@ -3,11 +3,16 @@
 Capability artifacts remain authoritative under ``artifacts/capabilities/<execution-id>``.
 This module builds a disposable review surface from those records using relative symlinks, so
 large scientific files are never copied merely to make a session easier to navigate.
+
+Most categories project one file to one link. Shell runs instead project as a bundle directory
+per execution -- ``shell/003-tail-5-events-jsonl-f513a638/{command,stdout,stderr,run}`` -- because
+a command is only interpretable together with the output it produced.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -17,8 +22,8 @@ from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
-OUTPUT_VIEW_SCHEMA_VERSION = 1
-OUTPUT_DIRECTORIES = ("code", "figures", "reports", "tables", "data")
+OUTPUT_VIEW_SCHEMA_VERSION = 2
+OUTPUT_DIRECTORIES = ("code", "shell", "figures", "reports", "tables", "data")
 _GENERATOR = "scagent-sdk"
 _INDEX_JSON = "outputs.json"
 _INDEX_MARKDOWN = "outputs.md"
@@ -27,7 +32,10 @@ _TABLE_SUFFIXES = frozenset({".csv", ".tsv", ".parquet", ".feather", ".xlsx", ".
 _DATA_SUFFIXES = frozenset(
     {".h5ad", ".h5", ".hdf5", ".loom", ".zarr", ".npz", ".npy", ".mtx"}
 )
-_REPORT_SUFFIXES = frozenset({".md", ".pdf", ".html", ".htm"})
+# A notebook is a document to read, so it belongs with the reports rather than with the code the
+# analysis ran; it is classified before code so its JSON body is never mistaken for a script.
+_REPORT_SUFFIXES = frozenset({".md", ".pdf", ".html", ".htm", ".ipynb"})
+_NOTEBOOK_MEDIA_TYPES = frozenset({"application/x-ipynb+json", "application/ipynb+json"})
 _IMAGE_MEDIA_PREFIX = "image/"
 _TABLE_MEDIA_TYPES = frozenset(
     {
@@ -55,6 +63,17 @@ _REPORT_MEDIA_TYPES = frozenset(
         "text/html",
     }
 )
+_SHELL_MEDIA_TYPES = frozenset({"text/x-shellscript", "application/x-sh"})
+_SHELL_SUFFIXES = frozenset({".sh", ".bash"})
+_JSON_MEDIA_TYPES = frozenset({"application/json", "text/json"})
+# A shell run report is a handful of scalars; anything larger is not the report this expects.
+_SHELL_REPORT_MAX_BYTES = 256 * 1024
+_SHELL_LABEL_MAXLEN = 40
+_SHELL_COMMAND_CELL_MAXLEN = 120
+# Reading order within a bundle: what ran, what it printed, then how it ran.
+_SHELL_MEMBER_ORDER = ("command", "stdout", "stderr", "run")
+_PROTECTED_DIRECTORIES = frozenset({"data/intermediates"})
+_ABSOLUTE_PATH = re.compile(r"(?<![:/\w.])/(?:[\w.@%+=~-]+/)+([\w.@%+=~-]+)?")
 
 
 def _slugify(text: str, *, maxlen: int = 64) -> str:
@@ -75,10 +94,137 @@ def _code_label(summary: str, fallback: str) -> str:
     return _slugify(text, maxlen=48) or _slugify(fallback, maxlen=48) or "analysis"
 
 
+def _finite_int(value: Any) -> int | None:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _finite_float(value: Any) -> float | None:
+    """Keep the index strictly JSON-serializable; ``json.loads`` accepts NaN and Infinity."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _is_shell_script(relative_path: str, media_type: str) -> bool:
+    media_type = media_type.lower().split(";", 1)[0].strip()
+    return (
+        media_type in _SHELL_MEDIA_TYPES or Path(relative_path).suffix.lower() in _SHELL_SUFFIXES
+    )
+
+
+def _compress_command_paths(command: str) -> str:
+    """Reduce absolute paths to their basename so a command reads as what it acted on.
+
+    ``tail -5 /home/user/sessions/run_.../events.jsonl`` becomes ``tail -5 events.jsonl``, which
+    is what makes a generated name recognizable at a glance. Only the path substring is replaced,
+    so surrounding syntax such as ``open('...')`` survives. Relative paths and URLs are left
+    alone: the lookbehind refuses a match that follows a word character, ``.``, ``:`` or ``/``.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        # A trailing separator must not swallow the basename: ``/a/b/c/`` still names ``c``.
+        return match.group(1) or match.group(0).rstrip("/").rsplit("/", 1)[-1]
+
+    return _ABSOLUTE_PATH.sub(replace, command)
+
+
+def _shell_label(command: str, fallback: str) -> str:
+    """Name a shell run after the command itself, collapsed onto one readable line.
+
+    Only the fallback drops a leading clause at ``:``, because a summary carries boilerplate that
+    would otherwise consume the whole label budget ("Shell command completed in 2.83s: ls"). A
+    command is used verbatim -- its own colons are part of what ran.
+    """
+
+    for candidate, strip_prefix in ((command, False), (fallback, True)):
+        text = candidate.split(":", 1)[1] if strip_prefix and ":" in candidate else candidate
+        collapsed = " ".join(text.split())
+        if not collapsed:
+            continue
+        label = _slugify(
+            _compress_command_paths(collapsed), maxlen=_SHELL_LABEL_MAXLEN
+        ) or _slugify(collapsed, maxlen=_SHELL_LABEL_MAXLEN)
+        if label:
+            return label
+    return "command"
+
+
+def _shell_member(artifact_name: str, relative_path: str, media_type: str) -> str | None:
+    """Name one file inside a shell bundle, or return None to classify it normally.
+
+    The bundle directory already says the record is a shell run, so members drop the redundant
+    ``shell`` prefix and become ``command.sh``, ``stdout.txt``, ``stderr.txt``, ``run.json``.
+    Files that are not part of the run itself -- a figure a command happened to write -- fall
+    through so they still appear in their own category.
+    """
+
+    normalized = media_type.lower().split(";", 1)[0].strip()
+    suffix = Path(relative_path).suffix.lower()
+    is_member = (
+        _is_shell_script(relative_path, media_type)
+        or normalized == "text/plain"
+        or suffix == ".txt"
+        or normalized in _JSON_MEDIA_TYPES
+        or suffix == ".json"
+    )
+    if not is_member:
+        return None
+    stem = _slugify(artifact_name) or _slugify(Path(relative_path).stem)
+    for prefix in ("shell-", "shell"):
+        if stem.startswith(prefix) and len(stem) > len(prefix):
+            stem = stem[len(prefix) :].strip("-")
+            break
+    return f"{stem or 'output'}{suffix}"
+
+
+def _shell_member_rank(view_path: str) -> int:
+    stem = Path(view_path).stem.lower()
+    try:
+        return _SHELL_MEMBER_ORDER.index(stem)
+    except ValueError:
+        return len(_SHELL_MEMBER_ORDER)
+
+
+def _read_shell_report(
+    session_dir: Path, artifact_path: str, files: list[Any]
+) -> dict[str, Any] | None:
+    """Load the run report a shell execution commits beside its script.
+
+    The command text lives only in this file, never in the artifact record, so the projection
+    reads it to build a descriptive name and a browsable command table.
+    """
+
+    for raw_file in files:
+        if not isinstance(raw_file, Mapping):
+            continue
+        relative_path = raw_file.get("relative_path")
+        if not isinstance(relative_path, str):
+            continue
+        media_type = str(raw_file.get("media_type", "")).lower().split(";", 1)[0].strip()
+        if media_type not in _JSON_MEDIA_TYPES and Path(relative_path).suffix.lower() != ".json":
+            continue
+        source = _safe_source(session_dir, artifact_path, relative_path)
+        if source is None:
+            continue
+        try:
+            if source.stat().st_size > _SHELL_REPORT_MAX_BYTES:
+                continue
+            value = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(value, dict) and isinstance(value.get("command"), str):
+            return value
+    return None
+
+
 def _classify(relative_path: str, media_type: str) -> str | None:
     suffix = Path(relative_path).suffix.lower()
     media_type = media_type.lower().split(";", 1)[0].strip()
     name = Path(relative_path).name.lower()
+    if media_type in _NOTEBOOK_MEDIA_TYPES or suffix == ".ipynb":
+        return "reports"
     if media_type == "text/x-python" or suffix == ".py":
         return "code"
     if media_type.startswith(_IMAGE_MEDIA_PREFIX) or suffix in _IMAGE_SUFFIXES:
@@ -285,6 +431,28 @@ def _cleanup_old_links(
             continue
         if target.is_symlink():
             target.unlink()
+            _prune_empty_group(session_dir, target.parent)
+
+
+def _prune_empty_group(session_dir: Path, directory: Path) -> None:
+    """Drop grouping directories a removed link leaves behind, never a category root.
+
+    Shell bundles and nested figure groups are generated names; once empty they are noise. The
+    category roots and ``data/intermediates`` are part of the promised layout and always stay.
+    """
+
+    while directory != session_dir:
+        try:
+            relative = directory.relative_to(session_dir)
+        except ValueError:
+            return
+        if len(relative.parts) < 2 or str(relative) in _PROTECTED_DIRECTORIES:
+            return
+        try:
+            directory.rmdir()
+        except OSError:
+            return
+        directory = directory.parent
 
 
 def _markdown_link(path: str) -> str:
@@ -293,6 +461,45 @@ def _markdown_link(path: str) -> str:
 
 def _markdown_cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _command_cell(command: str) -> str:
+    # Session paths are long enough to push the distinctive part of a command past the truncation
+    # limit, so the table shows the same basename form the bundle name uses.
+    collapsed = _compress_command_paths(" ".join(command.split()))
+    if len(collapsed) > _SHELL_COMMAND_CELL_MAXLEN:
+        collapsed = collapsed[: _SHELL_COMMAND_CELL_MAXLEN - 1].rstrip() + "…"
+    # Backticks would end the code span; the exact text stays one click away in command.sh.
+    return _markdown_cell(collapsed).replace("`", "'") or "(empty)"
+
+
+def _render_shell_section(entries: list[Mapping[str, Any]]) -> list[str]:
+    """Render one row per shell run rather than per file, since a run is the unit of interest."""
+
+    bundles: dict[str, list[Mapping[str, Any]]] = {}
+    for entry in entries:
+        bundle = str(entry.get("bundle_path") or Path(str(entry["view_path"])).parent)
+        bundles.setdefault(bundle, []).append(entry)
+    lines = [
+        "_Commands are abbreviated to basenames; `command.sh` holds the exact text that ran._",
+        "",
+        "| Run | Command | Duration | Files |",
+        "|---|---|---|---|",
+    ]
+    for bundle, members in bundles.items():
+        first = members[0]
+        duration = first.get("duration_seconds")
+        elapsed = f"{float(duration):.2f}s" if isinstance(duration, (int, float)) else "—"
+        files = " · ".join(
+            f"[{Path(str(member['view_path'])).name}]({_markdown_link(str(member['view_path']))})"
+            for member in members
+        )
+        lines.append(
+            f"| [{Path(bundle).name}]({_markdown_link(bundle)}) | "
+            f"`{_command_cell(str(first.get('command', '')))}` | {elapsed} | {files} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _render_markdown(index: Mapping[str, Any]) -> str:
@@ -313,6 +520,7 @@ def _render_markdown(index: Mapping[str, Any]) -> str:
         lines.append("")
     labels = {
         "code": "Code",
+        "shell": "Shell commands",
         "figures": "Figures",
         "reports": "Reports",
         "tables": "Tables",
@@ -323,6 +531,9 @@ def _render_markdown(index: Mapping[str, Any]) -> str:
         lines.extend([f"## {labels[category]}", ""])
         if not entries:
             lines.extend(["_No committed outputs yet._", ""])
+            continue
+        if category == "shell":
+            lines.extend(_render_shell_section(entries))
             continue
         lines.extend(["| Output | Produced by | Summary |", "|---|---|---|"])
         for entry in entries:
@@ -363,6 +574,7 @@ def refresh_output_view(
         artifacts.items(),
         key=lambda item: (sequences.get(item[0], 0), item[0]),
     )
+    shell_ordinal = 0
     for execution_id, raw_record in ordered_artifacts:
         if not isinstance(raw_record, Mapping):
             continue
@@ -384,6 +596,26 @@ def refresh_output_view(
             )
             == "code"
         )
+        is_shell_run = any(
+            isinstance(raw_file, Mapping)
+            and isinstance(raw_file.get("relative_path"), str)
+            and _is_shell_script(
+                str(raw_file["relative_path"]),
+                str(raw_file.get("media_type", "application/octet-stream")),
+            )
+            for raw_file in files
+        )
+        shell_report: dict[str, Any] | None = None
+        shell_bundle: str | None = None
+        if is_shell_run:
+            shell_ordinal += 1
+            shell_report = _read_shell_report(session_dir, artifact_path, files)
+            command = str(shell_report.get("command", "")) if shell_report else ""
+            label = _shell_label(command, summary or tool_name)
+            short_id = _slugify(execution_id, maxlen=8) or "unknown"
+            # An ordinal prefix keeps a shell listing in the order the commands actually ran,
+            # which a name-sorted directory otherwise destroys.
+            shell_bundle = f"shell/{shell_ordinal:03d}-{label}-{short_id}"
         for raw_file in files:
             if not isinstance(raw_file, Mapping):
                 continue
@@ -391,29 +623,39 @@ def refresh_output_view(
             if not isinstance(relative_path, str):
                 continue
             media_type = str(raw_file.get("media_type", "application/octet-stream"))
-            category = _classify(relative_path, media_type)
+            artifact_name = str(raw_file.get("name", Path(relative_path).stem))
+            shell_member = (
+                _shell_member(artifact_name, relative_path, media_type)
+                if shell_bundle is not None
+                else None
+            )
+            category = "shell" if shell_member is not None else _classify(relative_path, media_type)
             if category is None:
                 continue
             source = _safe_source(session_dir, artifact_path, relative_path)
             if source is None:
                 continue
-            artifact_name = str(raw_file.get("name", Path(relative_path).stem))
-            filename = _projected_name(
-                category=category,
-                execution_id=execution_id,
-                tool_name=tool_name,
-                summary=summary,
-                artifact_name=artifact_name,
-                relative_path=relative_path,
-                disambiguate=code_files > 1,
-            )
-            final_data = _is_final_data(artifact_name, relative_path, tool_name)
-            directory = _projected_directory(
-                session_dir,
-                category=category,
-                relative_path=relative_path,
-                final_data=final_data,
-            )
+            if shell_member is not None and shell_bundle is not None:
+                filename = shell_member
+                directory = session_dir / shell_bundle
+                final_data = False
+            else:
+                filename = _projected_name(
+                    category=category,
+                    execution_id=execution_id,
+                    tool_name=tool_name,
+                    summary=summary,
+                    artifact_name=artifact_name,
+                    relative_path=relative_path,
+                    disambiguate=code_files > 1,
+                )
+                final_data = _is_final_data(artifact_name, relative_path, tool_name)
+                directory = _projected_directory(
+                    session_dir,
+                    category=category,
+                    relative_path=relative_path,
+                    final_data=final_data,
+                )
             if category == "code":
                 _remove_identical_legacy_code_copy(directory / filename, source)
             target = _ensure_relative_link(
@@ -434,12 +676,21 @@ def refresh_output_view(
                 "canonical_path": canonical_path,
                 "commit_sequence": sequence,
             }
+            if category == "shell" and shell_bundle is not None:
+                report = shell_report or {}
+                entry["bundle_path"] = shell_bundle
+                entry["command"] = str(report.get("command", ""))
+                entry["cwd"] = str(report.get("cwd", ""))
+                entry["exit_code"] = _finite_int(report.get("exit_code"))
+                entry["duration_seconds"] = _finite_float(report.get("duration_seconds"))
             entries.append({"category": category, **entry})
 
             normalized = f"{artifact_name} {relative_path}".lower().replace("_", "-")
             alias_path: str | None = None
             if category == "data" and final_data:
                 alias_path = f"data/final-annotated{Path(relative_path).suffix.lower()}"
+            elif category == "reports" and "analysis-notebook" in normalized:
+                alias_path = f"reports/analysis-notebook{Path(relative_path).suffix.lower()}"
             elif category == "reports" and "analysis-report" in normalized:
                 alias_path = f"reports/final-analysis-report{Path(relative_path).suffix.lower()}"
             elif category == "tables" and "final-labels" in normalized:
@@ -460,7 +711,17 @@ def refresh_output_view(
     for item in entries:
         category = item.pop("category")
         categories[category].append(item)
-    for category_entries in categories.values():
+    for category, category_entries in categories.items():
+        if category == "shell":
+            category_entries.sort(
+                key=lambda entry: (
+                    entry["commit_sequence"],
+                    _natural_key(str(entry.get("bundle_path", ""))),
+                    _shell_member_rank(entry["view_path"]),
+                    entry["view_path"],
+                )
+            )
+            continue
         category_entries.sort(
             key=lambda entry: (
                 entry["commit_sequence"],

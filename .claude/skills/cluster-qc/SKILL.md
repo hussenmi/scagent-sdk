@@ -29,16 +29,24 @@ clusters, and Scrublet enrichment. Doublet enrichment nominates review; it never
 or proves a coherent state is artifactual. `attested` means the checks ran for the current
 identities — not that every cluster is biologically valid.
 
-The capability saves a per-cluster metric boxplot, a cluster/QC UMAP, and one covariance heatmap
-for every eligible cluster. Inspect all of them, including heatmaps not attached inline, then call
-`review_cluster_qc`. The review must cover every returned visual artifact and every cluster marked
+The capability saves a per-cluster metric boxplot (library size and genes per cell on log axes,
+metric-flagged clusters in red), a cluster/QC UMAP, a per-cluster highlight grid, and one
+covariance heatmap for every eligible cluster. Inspect all of them, including heatmaps not
+attached inline, then call `review_cluster_qc`. The highlight grid is where a per-cluster
+judgement is actually made: the overlaid UMAP cannot separate thirty-plus colors, so use the grid
+to see whether a flagged cluster is one coherent region or debris scattered across the embedding. The review must cover every returned visual artifact and every cluster marked
 for review. A `keep` rationale resolves a warning; remove/merge/split/recluster/defer remains an
 open action and blocks final publication until a new current clustering is evaluated.
 
-For a comprehensive end-to-end run, evaluate resolutions 2.0, 1.5, and 1.0 by default, using
-distinct cluster keys and the full compute-plus-review cycle at each resolution. This is guidance,
-not hardcoding: users and data can change the grid. Select the final resolution from stability,
-coherence, identity DEGs, separation, and interpretability.
+For a comprehensive end-to-end run, work down resolutions 2.0, 1.5, and 1.0 **iteratively, not side
+by side**. Each resolution is the next phase on the cells the previous round left behind, not a
+competing candidate on the same cells: evaluate and review at 2.0, apply any confirmed removal,
+re-prepare the retained cells (normalize, re-select HVGs, PCA, neighbors, UMAP), then cluster and
+evaluate again at the next resolution with a distinct cluster key. The high resolution exists to
+expose small low-quality populations while they are still separable; 1.0 is the default annotation
+granularity. End the cleanup loop when a round flags nothing requiring removal, then descend to the
+annotation resolution and judge it on stability, coherence, identity DEGs, separation, and
+interpretability. This is guidance, not hardcoding: users and data can change the ladder.
 
 When a removal is applied, the capability issues fresh dataset/cell-set/count identities from
 preserved raw counts and invalidates downstream evidence: re-prepare, recluster, and re-run this

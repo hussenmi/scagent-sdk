@@ -10,7 +10,9 @@ The workspace is an escape hatch, not a workflow gate.
 - `list_workspace` and `read_text_file` provide bounded inspection.
 - `run_shell_command` runs ordinary Bash on Iris, including pipes, redirects, environment
   expansion, and installed commands. It captures the command, stdout, stderr, exit code, working
-  directory, and duration. Only catastrophic broad-host destructive patterns are refused.
+  directory, and duration. Only catastrophic broad-host destructive patterns are refused. Each
+  successful run also becomes a browsable bundle in the session's `shell/` directory, named for the
+  command and listed in `outputs.md`, so point the user there when asked what commands ran.
 - `run_analysis_code` executes saved Python in the scientific environment. Normal imports,
   filesystem access, subprocesses, introspection, and package APIs are available. Code, stdout,
   stderr, purpose, environment provenance, and registered outputs remain inspectable.

@@ -1,0 +1,33 @@
+schema_version: 1
+
+skill:
+  id: analysis-notebook
+  version: "0.1.0"
+  description: Render committed session provenance as a readable step-by-step analysis notebook.
+
+tools:
+  - name: build_analysis_notebook
+    description: Build a human-readable Jupyter notebook walkthrough of everything the session has committed so far, with each step's resolved arguments, result, decision rationale, and figures. Requestable at any point, not only after finalization, and rebuilt from provenance so a later build covers newly added steps.
+    entrypoint: scripts/build.py:build_analysis_notebook
+    environment: current
+    activity_label: Building analysis notebook
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          description: Optional notebook title. Defaults to the dataset name.
+        caveats:
+          type: array
+          items: {type: string, maxLength: 2000}
+          maxItems: 20
+          description: Optional limitations to record at the end of the notebook. Finalized sessions already carry caveats in the analysis report.
+        max_embedded_megabytes:
+          type: number
+          minimum: 0.5
+          maximum: 64
+          default: 6
+          description: Budget for inline figures, counted against source image bytes. Overview figures embed until it is spent; per-item diagnostic series are always linked instead.
+      required: []

@@ -7,10 +7,52 @@ import json
 from pathlib import Path
 from typing import Any
 
+# h5py defaults gzip to level 4, which dominated this capability's runtime. Nearly all of the
+# ratio is available for far less CPU. Measured on one 36,419-cell input (100M stored values),
+# writing the identical trimmed payload:
+#
+#     lzf            34.6 s   1.09 GB
+#     gzip level 1   41.8 s   0.52 GB
+#     gzip level 2   37.7 s   0.51 GB
+#     gzip level 4   55.4 s   0.50 GB   <- the previous default
+#
+# Level 2 costs ~2% size against level 4 for ~32% less time, matches lzf's speed at half its
+# size, and stays gzip, whose filter ships with every HDF5 distribution — lzf is an h5py filter
+# that other readers (R's rhdf5) may not have.
+INTERMEDIATE_COMPRESSION = "gzip"
+INTERMEDIATE_COMPRESSION_OPTS = 2
+
 
 def _identity(kind: str, value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return f"{kind}:sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _redundant_payload(
+    selected: str, *, layer_names: list[str], raw_present: bool
+) -> list[str]:
+    """Payload this tool is about to duplicate, and can therefore drop from its own artifact.
+
+    The output carries the selected counts in both ``X`` and ``layers['counts']``. An aligned
+    ``.raw`` and the source layer are then a third and fourth copy of the same values, which
+    made the count-ready artifact larger than the input it came from. Only what this tool
+    duplicated is dropped: unrelated layers (spliced/unspliced, velocity) are preserved, and
+    the immutable input keeps everything regardless. `doublet-evidence` and `cluster-qc`
+    already clear ``.raw`` the same way when they emit a filtered artifact.
+
+    ``.raw`` is dropped whether or not it aligned to ``var_names``. An unaligned ``.raw`` is not
+    strictly a duplicate, but no capability in this project reads ``.raw``, this artifact's
+    contract is one validated count representation, and the source file is immutable and
+    recorded in ``dataset_revision.source_path``, so nothing becomes unrecoverable.
+    """
+    dropped = []
+    if raw_present:
+        dropped.append("raw")
+    if selected.startswith("layer:"):
+        source_layer = selected.split(":", 1)[1]
+        if source_layer != "counts" and source_layer in layer_names:
+            dropped.append(selected)
+    return dropped
 
 
 def _count_matrix_identity(matrix: Any, obs_names: Any, var_names: Any) -> str:
@@ -164,9 +206,21 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     selected, reason = _choose_count_source(
         inspections, counts_source=source, counts_layer=layer
     )
+    # One copy out of the candidate (which may be a view into `.raw` or a layer dropped below),
+    # then one more so X and the counts layer stay independent objects. The third copy the
+    # previous version made was pure overhead.
     counts = candidates[selected].copy()
-    adata.X = counts.copy()
+    adata.X = counts
     adata.layers["counts"] = counts.copy()
+
+    dropped_payload = _redundant_payload(
+        selected, layer_names=list(adata.layers.keys()), raw_present=raw_present
+    )
+    for item in dropped_payload:
+        if item == "raw":
+            adata.raw = None
+        else:
+            del adata.layers[item.split(":", 1)[1]]
 
     cell_set_id = _identity("cells", sorted(map(str, adata.obs_names)))
     matrix_id = _count_matrix_identity(counts, adata.obs_names, adata.var_names)
@@ -193,7 +247,11 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     adata.uns["scagent_sdk"] = metadata
     output_name = "counts-ready.h5ad"
     final_path = f"artifacts/capabilities/{context.execution_id}/{output_name}"
-    adata.write_h5ad(context.staging_dir / output_name, compression="gzip")
+    adata.write_h5ad(
+        context.staging_dir / output_name,
+        compression=INTERMEDIATE_COMPRESSION,
+        compression_opts=INTERMEDIATE_COMPRESSION_OPTS,
+    )
 
     report = {
         "requested_source": source,
@@ -202,6 +260,8 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "selection_reason": reason,
         "raw_present": raw_present,
         "raw_usable": raw_usable,
+        "dropped_payload": dropped_payload,
+        "compression": f"{INTERMEDIATE_COMPRESSION}:{INTERMEDIATE_COMPRESSION_OPTS}",
         "inspections": inspections,
         "n_cells": int(adata.n_obs),
         "n_genes": int(adata.n_vars),
@@ -219,6 +279,12 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "summary": (
             f"Materialized {selected} as raw counts for "
             f"{adata.n_obs:,} cells × {adata.n_vars:,} genes."
+            + (
+                f" Dropped redundant {', '.join(dropped_payload)} from the artifact; "
+                "the source file retains them."
+                if dropped_payload
+                else ""
+            )
         ),
         "details": report,
         "facts_patch": {

@@ -178,3 +178,46 @@ def test_explicit_raw_rejects_absent_raw() -> None:
 def test_unknown_counts_source_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown counts_source"):
         _choose()({"X": _COUNTS}, counts_source="bogus", counts_layer=None)
+
+
+# --- artifact payload trimming ----------------------------------------------
+
+
+def _redundant() -> Any:
+    return _handler().__globals__["_redundant_payload"]
+
+
+def test_intermediate_artifact_uses_a_cheap_gzip_level() -> None:
+    # gzip keeps the artifact readable by any HDF5 reader; level 2 buys back most of the time
+    # h5py's default level 4 spent for ~2% size. Both parts of the pair matter.
+    globals_ = _handler().__globals__
+    assert globals_["INTERMEDIATE_COMPRESSION"] == "gzip"
+    assert globals_["INTERMEDIATE_COMPRESSION_OPTS"] == 2
+
+
+def test_aligned_raw_is_dropped_once_counts_are_materialized() -> None:
+    assert _redundant()("X", layer_names=["counts"], raw_present=True) == ["raw"]
+
+
+def test_absent_raw_drops_nothing() -> None:
+    assert _redundant()("X", layer_names=["counts"], raw_present=False) == []
+
+
+def test_source_layer_is_dropped_after_being_copied_into_counts() -> None:
+    dropped = _redundant()(
+        "layer:raw_counts", layer_names=["counts", "raw_counts"], raw_present=True
+    )
+    assert dropped == ["raw", "layer:raw_counts"]
+
+
+def test_counts_layer_is_never_dropped_as_its_own_source() -> None:
+    assert _redundant()("layer:counts", layer_names=["counts"], raw_present=False) == []
+
+
+def test_unrelated_layers_are_preserved() -> None:
+    dropped = _redundant()(
+        "layer:raw_counts",
+        layer_names=["counts", "raw_counts", "spliced", "unspliced"],
+        raw_present=False,
+    )
+    assert dropped == ["layer:raw_counts"]

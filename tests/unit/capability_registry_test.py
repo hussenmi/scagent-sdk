@@ -16,6 +16,7 @@ def test_registry_discovers_and_loads_executable_project_skill() -> None:
 
     package_by_id = {package.manifest.skill_id: package for package in packages}
     assert set(package_by_id) == {
+        "analysis-notebook",
         "analysis-versions",
         "analysis-workspace",
         "batch-investigation",
@@ -43,7 +44,7 @@ def test_registry_discovers_and_loads_executable_project_skill() -> None:
     assert tool.name == "inspect_dataset"
     assert callable(package.load_handler(tool))
     skills = CapabilityRegistry(root).skills()
-    assert len(skills) == 22
+    assert len(skills) == 23
     assert {skill.name for skill in skills if not skill.executable} == {"orchestrate-single-cell"}
 
 

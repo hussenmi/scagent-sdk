@@ -36,7 +36,9 @@ def test_image_preview_is_attached_but_base64_is_not_persisted(tmp_path: Path) -
     response = asyncio.run(executor.execute(package, tool, {"path": str(source)}))
 
     assert response.get("is_error") is not True
-    assert [item["type"] for item in response["content"]] == ["text", "image"]
+    # Envelope, the pixels, then the directive that obliges the model to actually read them.
+    assert [item["type"] for item in response["content"]] == ["text", "image", "text"]
+    assert "Read them now, before your next tool call" in response["content"][2]["text"]
     attached = base64.b64decode(response["content"][1]["data"])
     assert attached.startswith(b"\x89PNG")
     envelope = response["structuredContent"]
@@ -154,3 +156,70 @@ def test_dense_figure_preview_is_downscaled_and_reencoded_when_png_is_wasteful(
     with Image.open(preview_path) as normalized:
         assert max(normalized.size) == 1568
     assert len(attached) < 2 * 1024 * 1024
+
+
+# --- figure directive ---------------------------------------------------------
+
+
+def test_directive_names_every_attached_figure_and_forbids_deferring_the_reading() -> None:
+    from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
+    from scagent_sdk.capabilities.results import CapabilityResult, ModelMedia
+
+    result = CapabilityResult(
+        summary="two figures",
+        model_media=(
+            ModelMedia(name="qc-violins", relative_path="qc-violins.png", media_type="image/png"),
+            ModelMedia(name="qc-scatter", relative_path="qc-scatter.png", media_type="image/png"),
+        ),
+    )
+
+    directive = Executor._figure_directive(result)
+
+    assert "2 figures are attached" in directive
+    assert "qc-violins" in directive and "qc-scatter" in directive
+    # The failure this exists to prevent: seeing a figure, moving on, and attesting to it later
+    # from recall when a review floor blocks the turn.
+    assert "before your next tool call" in directive
+    assert "do not defer it to a later review call" in directive
+    # Legibility failures must be reported, not worked around by reading the table instead.
+    assert "treat the visual review as incomplete" in directive
+
+
+def test_directive_is_singular_for_one_figure() -> None:
+    from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
+    from scagent_sdk.capabilities.results import CapabilityResult, ModelMedia
+
+    result = CapabilityResult(
+        summary="one figure",
+        model_media=(
+            ModelMedia(name="embedding", relative_path="embedding.png", media_type="image/png"),
+        ),
+    )
+
+    assert "1 figure is attached" in Executor._figure_directive(result)
+
+
+def test_no_directive_is_emitted_when_a_result_carries_no_pixels(tmp_path: Path) -> None:
+    from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
+    from scagent_sdk.capabilities.results import CapabilityContext, CapabilityResult
+
+    context = CapabilityContext(
+        scientific_session_id="s",
+        session_dir=tmp_path,
+        staging_dir=tmp_path,
+        skill_id="k",
+        tool_name="t",
+        execution_id="e",
+        state_revision=0,
+        state_facts={},
+    )
+
+    assert Executor._model_content(context, CapabilityResult(summary="no figures")) == []
+
+
+def test_media_ceiling_admits_a_full_per_cluster_heatmap_set() -> None:
+    from scagent_sdk.capabilities.results import MODEL_MEDIA_LIMIT
+
+    # A cluster-QC pass renders one heatmap per cluster plus three overview figures. The old
+    # ceiling of 8 made the review floor unsatisfiable from what the model had been shown.
+    assert MODEL_MEDIA_LIMIT >= 3 + 28

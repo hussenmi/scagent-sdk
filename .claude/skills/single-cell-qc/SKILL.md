@@ -18,10 +18,16 @@ artifact stale; historical artifacts remain intact.
 
 Use `counts_layer="auto"` by default: it selects `layers["counts"]` when present and otherwise
 validates `X`. Use `null` only to explicitly force `X`, and name a layer only when it is known to
-exist. The calculation emits the standard QC suite: combined distributions/UMI knee, violins,
-count/gene histograms, mitochondrial histogram, count/gene/mitochondrial scatters, and
-ribosomal-versus-mitochondrial scatter. Inspect every returned figure before review. After UMAP,
-also call `plot_qc_embedding` to localize these signals.
+exist. The calculation emits the standard QC suite: combined distributions/UMI knee, per-metric
+violins with the cells jittered over them, log-scaled count/gene histograms, mitochondrial
+histogram, count/gene/mitochondrial scatters, ribosomal-versus-mitochondrial scatter, and — when
+the artifact already carries doublet scores — a doublet violin and histogram. Inspect every
+returned figure before review. After UMAP, also call `plot_qc_embedding` to localize these
+signals, and use `visualize-single-cell` for anything this suite does not cover: per-sample QC
+splits are the usual next step, since a pooled distribution hides the one failing library.
+
+Library size and detected genes are drawn on log axes with log-spaced bins. Read thresholds off
+those; a linear axis compresses the low tail into a few bars and hides the shape you are judging.
 
 Thresholds are dataset- and assay-dependent. A PBMC default is not automatically appropriate for
 nuclei, tumors, low-depth libraries, or large metabolically active cells. Prefer calculating and

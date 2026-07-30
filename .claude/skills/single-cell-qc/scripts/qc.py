@@ -84,6 +84,120 @@ def _symbols(adata: Any) -> list[str]:
     return original
 
 
+HISTOGRAM_BINS = 60
+# Per-cell points drawn over a violin body; past this the strip is solid ink and the extra
+# points only cost render time.
+VIOLIN_JITTER_CELLS = 20000
+VIOLIN_JITTER_WIDTH = 0.2
+
+
+def positive_span(values: list[float]) -> tuple[float, float, int]:
+    """Smallest and largest strictly positive value, and how many were not positive.
+
+    The dropped count is returned rather than discarded: a log axis cannot draw a zero, and
+    "1,204 cells have zero counts" is QC evidence, not a rendering detail.
+    """
+
+    positive = [float(value) for value in values if float(value) > 0.0]
+    dropped = len(values) - len(positive)
+    if not positive:
+        raise ValueError("no positive values to plot on a log scale")
+    return min(positive), max(positive), dropped
+
+
+def log_spaced_bins(minimum: float, maximum: float, count: int = HISTOGRAM_BINS) -> list[float]:
+    """Bin edges uniform in log space, for a metric drawn on a log axis.
+
+    Linear bins under `set_xscale("log")` draw the leftmost bar hundreds of times wider than the
+    rightmost, which compresses the low end of a library-size distribution into two or three
+    blocks and hides the shape a threshold is chosen from.
+    """
+
+    import math
+
+    if count < 1:
+        raise ValueError("count must be at least 1")
+    if minimum <= 0.0:
+        raise ValueError("log-spaced bins need a positive minimum; drop non-positive values first")
+    if maximum <= minimum:
+        maximum = minimum * 10.0
+    low, high = math.log10(minimum), math.log10(maximum)
+    step = (high - low) / count
+    return [10.0 ** (low + step * index) for index in range(count + 1)]
+
+
+def compact_tick(value: float) -> str:
+    """Short axis-tick text for count-scale numbers.
+
+    Spelled-out thousands ("10,000", "20,000", "50,000") overrun each other on a multi-panel row,
+    which reintroduces the collision the 1/2/5 locator was chosen to avoid.
+    """
+
+    magnitude = abs(float(value))
+    if magnitude >= 1_000_000:
+        return f"{float(value) / 1_000_000:g}M"
+    if magnitude >= 1_000:
+        return f"{float(value) / 1_000:g}k"
+    return f"{float(value):g}"
+
+
+def _plain_log_ticks(axis: Any, which: str = "x") -> None:
+    """Label a log axis with plain numbers at 1/2/5 per decade instead of mantissa notation.
+
+    Over a two-decade range matplotlib labels the minor ticks as "2 x 10^2", "3 x 10^2", ...,
+    which run together into an unreadable smear on the genes-per-cell panel. Decade-only labels
+    are legible but too sparse to read a threshold off, so 1/2/5 per decade is used.
+    """
+
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+    target = axis.xaxis if which == "x" else axis.yaxis
+    target.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+    target.set_major_formatter(FuncFormatter(lambda value, _: compact_tick(value)))
+    target.set_minor_formatter(NullFormatter())
+
+
+def _violin_panel(axis: Any, values: Any, label: str, rng: Any) -> int:
+    """Violin body with the per-cell points jittered over it; returns the points drawn.
+
+    The body alone is a smoothed density that looks identical over forty cells and forty
+    thousand. Overlaying the cells is what the original scagent QC violins did
+    (`sc.pl.violin(..., jitter=0.2)`) and it is what makes the sample size legible.
+    """
+
+    import numpy as np
+
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    axis.set_xticks([])
+    axis.set_title(label, fontsize=10)
+    axis.set_ylabel("value")
+    if finite.size == 0:
+        axis.text(0.5, 0.5, "no finite values", ha="center", va="center", transform=axis.transAxes)
+        return 0
+    parts = axis.violinplot(finite, showextrema=False, widths=0.85)
+    for body in parts["bodies"]:
+        body.set_facecolor("#3b75af")
+        body.set_edgecolor("#1f3f5f")
+        body.set_linewidth(0.8)
+        body.set_alpha(0.9)
+    shown = min(int(finite.size), VIOLIN_JITTER_CELLS)
+    sample = finite if shown == finite.size else rng.choice(finite, size=shown, replace=False)
+    axis.scatter(
+        1.0 + rng.uniform(-VIOLIN_JITTER_WIDTH, VIOLIN_JITTER_WIDTH, size=sample.size),
+        sample,
+        s=0.8,
+        color="#111111",
+        alpha=0.35,
+        linewidths=0,
+        rasterized=True,
+    )
+    lower, median, upper = (float(item) for item in np.percentile(finite, [25.0, 50.0, 75.0]))
+    axis.vlines(1.0, lower, upper, color="#ffffff", linewidth=3.0, zorder=3)
+    axis.plot([1.0], [median], marker="o", markersize=3.5, color="#ffffff", zorder=4)
+    return shown
+
+
 def _add_metrics(
     adata: Any,
     *,
@@ -165,16 +279,28 @@ def _render_qc_figures(
     mito = values("pct_counts_mt")
     ribo = values("pct_counts_ribo")
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+    rng = np.random.default_rng(0)
+
+    def log_histogram(axis: Any, series: Any, label: str) -> None:
+        """Histogram on a log axis with bins that are uniform *on that axis*."""
+
+        low, high, dropped = positive_span([float(item) for item in series.tolist()])
+        axis.hist(
+            series[series > 0], bins=log_spaced_bins(low, high), edgecolor="black", linewidth=0.3
+        )
+        axis.set_xscale("log")
+        _plain_log_ticks(axis)
+        axis.set(xlabel=f"{label} (log scale)", ylabel="Cells")
+        axis.set_title(label if not dropped else f"{label} ({dropped:,} zero-count omitted)")
+
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4.5))
     ranked = np.sort(total)[::-1]
     axes[0].plot(np.arange(1, ranked.size + 1), ranked)
     axes[0].set(xscale="log", yscale="log", xlabel="Cell rank", ylabel="Total counts")
     axes[0].set_title("UMI rank (knee)")
-    axes[1].hist(total, bins=60)
-    axes[1].set(xlabel="Total counts", ylabel="Cells", title="Library size")
-    axes[2].hist(genes, bins=60)
-    axes[2].set(xlabel="Genes detected", ylabel="Cells", title="Genes per cell")
-    axes[3].hist(mito, bins=60)
+    log_histogram(axes[1], total, "Library size")
+    log_histogram(axes[2], genes, "Genes per cell")
+    axes[3].hist(mito, bins=HISTOGRAM_BINS, edgecolor="black", linewidth=0.3)
     if thresholds["max_pct_mito"] is not None:
         axes[3].axvline(
             float(thresholds["max_pct_mito"]),
@@ -184,32 +310,28 @@ def _render_qc_figures(
         )
         axes[3].legend()
     axes[3].set(xlabel="Mitochondrial percent", ylabel="Cells", title="Mitochondrial content")
+    axes[4].hist(ribo, bins=HISTOGRAM_BINS, edgecolor="black", linewidth=0.3)
+    axes[4].set(xlabel="Ribosomal percent", ylabel="Cells", title="Ribosomal content")
     fig.suptitle(f"Single-cell QC distributions ({adata.n_obs:,} cells)")
     fig.tight_layout()
     figures.append(save(fig, "qc_distributions.png"))
 
     violin_columns = [
-        ("log1p_total_counts", "log1p total counts"),
-        ("log1p_n_genes_by_counts", "log1p genes"),
-        ("pct_counts_mt", "mitochondrial %"),
-        ("pct_counts_ribo", "ribosomal %"),
+        ("log1p_total_counts", "log1p_total_counts"),
+        ("log1p_n_genes_by_counts", "log1p_n_genes_by_counts"),
+        ("pct_counts_mt", "pct_counts_mt"),
+        ("pct_counts_ribo", "pct_counts_ribo"),
     ]
-    fig, axes = plt.subplots(1, len(violin_columns), figsize=(16, 4.5))
+    fig, axes = plt.subplots(1, len(violin_columns), figsize=(4.2 * len(violin_columns), 4.6))
     for axis, (column, label) in zip(axes, violin_columns, strict=True):
-        axis.violinplot(values(column), showmeans=True, showextrema=True)
-        axis.set_xticks([])
-        axis.set_ylabel(label)
-    fig.suptitle("QC metric distributions")
+        _violin_panel(axis, values(column), label, rng)
+    fig.suptitle(f"QC metric distributions ({adata.n_obs:,} cells)")
     fig.tight_layout()
     figures.append(save(fig, "qc_violin_metrics.png"))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    axes[0].hist(total, bins=100)
-    axes[0].set_xscale("log")
-    axes[0].set(xlabel="Total counts (log scale)", ylabel="Cells", title="Library size")
-    axes[1].hist(genes, bins=100)
-    axes[1].set_xscale("log")
-    axes[1].set(xlabel="Genes detected (log scale)", ylabel="Cells", title="Genes per cell")
+    log_histogram(axes[0], total, "Library size")
+    log_histogram(axes[1], genes, "Genes per cell")
     fig.tight_layout()
     figures.append(save(fig, "qc_histograms.png"))
 
@@ -230,9 +352,12 @@ def _render_qc_figures(
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     axes[0].scatter(total, genes, s=8, alpha=0.55)
     axes[0].set(xscale="log", yscale="log", xlabel="Total counts", ylabel="Genes detected")
+    _plain_log_ticks(axes[0], "x")
+    _plain_log_ticks(axes[0], "y")
     axes[0].set_title("Genes versus counts")
     axes[1].scatter(total, mito, s=8, alpha=0.55)
     axes[1].set(xscale="log", xlabel="Total counts", ylabel="Mitochondrial percent")
+    _plain_log_ticks(axes[1], "x")
     if thresholds["max_pct_mito"] is not None:
         axes[1].axhline(float(thresholds["max_pct_mito"]), color="crimson", linestyle="--")
     axes[1].set_title("Mitochondrial percent versus counts")
@@ -250,6 +375,21 @@ def _render_qc_figures(
     )
     fig.tight_layout()
     figures.append(save(fig, "qc_ribo_vs_mt.png"))
+
+    # Doublet scores are plotted only when another skill has already computed them; this tool
+    # neither runs Scrublet nor invents a cutoff, so no reference line is drawn.
+    doublet_column = next(
+        (name for name in ("doublet_score", "scrublet_score") if name in adata.obs), None
+    )
+    if doublet_column is not None:
+        scores = values(doublet_column)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+        _violin_panel(axes[0], scores, doublet_column, rng)
+        axes[1].hist(scores, bins=HISTOGRAM_BINS, edgecolor="black", linewidth=0.3)
+        axes[1].set(xlabel=doublet_column, ylabel="Cells", title="Doublet score histogram")
+        fig.suptitle("Doublet evidence already present on this artifact")
+        fig.tight_layout()
+        figures.append(save(fig, "qc_doublet_scores.png"))
     return figures
 
 

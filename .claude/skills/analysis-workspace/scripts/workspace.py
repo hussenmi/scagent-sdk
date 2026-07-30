@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+_SUMMARY_COMMAND_MAXLEN = 120
 _DESTRUCTIVE_PATTERNS = (
     "rm -rf /",
     "rm -rf ~",
@@ -16,6 +17,19 @@ _DESTRUCTIVE_PATTERNS = (
     "reboot",
     ":(){:|:&};:",
 )
+
+
+def _command_excerpt(command: str) -> str:
+    """Collapse a command onto one bounded line so it can identify a run in a summary.
+
+    An inline heredoc or ``python3 -c`` block is multi-line and arbitrarily long; a summary that
+    carried it verbatim would be unreadable in a transcript and unusable as a name.
+    """
+
+    collapsed = " ".join(command.split())
+    if len(collapsed) > _SUMMARY_COMMAND_MAXLEN:
+        collapsed = collapsed[: _SUMMARY_COMMAND_MAXLEN - 1].rstrip() + "…"
+    return collapsed
 
 
 def list_workspace(arguments: dict[str, Any], _context: Any) -> dict[str, Any]:
@@ -111,11 +125,14 @@ def run_shell_command(arguments: dict[str, Any], context: Any) -> dict[str, Any]
     (context.staging_dir / "shell-run.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    excerpt = _command_excerpt(command)
     if completed.returncode != 0:
         tail = (completed.stderr or completed.stdout)[-8000:]
-        raise RuntimeError(f"shell command exited {completed.returncode}: {tail}")
+        # The command goes on its own line so the terminal's concise one-line extraction still
+        # lands on the actual error at the end of the captured output.
+        raise RuntimeError(f"shell command exited {completed.returncode}: {excerpt}\n{tail}")
     return {
-        "summary": f"Shell command completed in {duration:.2f}s.",
+        "summary": f"Shell command completed in {duration:.2f}s: {excerpt}",
         "details": {
             **report,
             "stdout": completed.stdout[-40000:],

@@ -55,6 +55,45 @@ def _commit_artifact(
     return artifact_path
 
 
+def _shell_files(
+    command: str,
+    *,
+    exit_code: int = 0,
+    duration: float = 1.5,
+    stdout: bytes = b"stdout text\n",
+    stderr: bytes = b"",
+    report: bytes | None = None,
+) -> list[tuple[str, str, str, bytes]]:
+    """The exact artifact shape ``run_shell_command`` commits."""
+
+    if report is None:
+        report = (
+            json.dumps(
+                {
+                    "command": command,
+                    "cwd": "/work",
+                    "timeout_seconds": 600,
+                    "exit_code": exit_code,
+                    "duration_seconds": duration,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+    return [
+        (
+            "shell-command",
+            "shell-command.sh",
+            "text/x-shellscript",
+            b"#!/usr/bin/env bash\nset -o pipefail\n" + command.encode() + b"\n",
+        ),
+        ("shell-stdout", "shell.stdout.txt", "text/plain", stdout),
+        ("shell-stderr", "shell.stderr.txt", "text/plain", stderr),
+        ("shell-run", "shell-run.json", "application/json", report),
+    ]
+
+
 def test_new_session_has_empty_browsable_output_surface(tmp_path: Path) -> None:
     session = AnalysisSession.create(tmp_path / "sessions", title="new")
 
@@ -405,6 +444,360 @@ def test_byte_identical_legacy_code_copy_is_migrated_but_edited_code_is_preserve
     alternate = next((session.directory / "code").glob("*--view-2.py"))
     assert alternate.is_symlink()
     assert alternate.read_bytes() == b"print('canonical')\n"
+
+
+def test_a_notebook_projects_as_a_report_with_a_stable_alias(tmp_path: Path) -> None:
+    """The notebook is the headline reading surface, so it is a report, not code."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="notebook")
+    artifact_path = _commit_artifact(
+        session,
+        execution_id="fe7aeed8-cf0e-46b2-b068-81426c7ca1a5",
+        tool_name="finalize_analysis",
+        summary="Finalized 29 cluster labels",
+        files=[
+            (
+                "analysis-notebook",
+                "analysis-notebook.ipynb",
+                "application/x-ipynb+json",
+                b'{"cells": [], "nbformat": 4, "nbformat_minor": 5}\n',
+            ),
+            ("analysis-recipe", "analysis-recipe.py", "text/x-python", b"CAPABILITY_CALLS = []\n"),
+        ],
+    )
+
+    projected = next((session.directory / "reports").glob("*--fe7aeed8.ipynb"))
+    assert projected.resolve() == artifact_path / "analysis-notebook.ipynb"
+    assert (
+        session.directory / "reports" / "analysis-notebook.ipynb"
+    ).resolve() == artifact_path / "analysis-notebook.ipynb"
+    # Its JSON body must not be mistaken for a script, and the recipe still lands in code/.
+    assert not list((session.directory / "code").glob("*.ipynb"))
+    assert (
+        session.directory / "code" / "analysis-recipe.py"
+    ).resolve() == artifact_path / "analysis-recipe.py"
+    index = json.loads((session.directory / "outputs.json").read_text())
+    assert "reports/analysis-notebook.ipynb" in {
+        entry["view_path"] for entry in index["aliases"]
+    }
+
+
+def test_shell_runs_project_as_named_bundles_with_their_output(tmp_path: Path) -> None:
+    """A command is only interpretable with its output, so the bundle is the unit of review."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell")
+    artifact_path = _commit_artifact(
+        session,
+        execution_id="f513a638-fc33-4b52-8304-83bd52429563",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.97s.",
+        files=_shell_files(
+            "tail -5 /home/user/projects/scagent-sdk/sessions/run_2026/events.jsonl",
+            duration=2.97,
+        ),
+    )
+
+    # The long absolute path collapses to its basename, which is what makes the name readable.
+    bundle = session.directory / "shell" / "001-tail-5-events-jsonl-f513a638"
+    assert bundle.is_dir()
+    assert sorted(path.name for path in bundle.iterdir()) == [
+        "command.sh",
+        "run.json",
+        "stderr.txt",
+        "stdout.txt",
+    ]
+    assert all(path.is_symlink() for path in bundle.iterdir())
+    assert (bundle / "command.sh").resolve() == artifact_path / "shell-command.sh"
+    assert (bundle / "stdout.txt").resolve() == artifact_path / "shell.stdout.txt"
+    assert (bundle / "stderr.txt").resolve() == artifact_path / "shell.stderr.txt"
+    assert (bundle / "run.json").resolve() == artifact_path / "shell-run.json"
+    assert (bundle / "stdout.txt").read_bytes() == b"stdout text\n"
+    assert not (bundle / "command.sh").readlink().is_absolute()
+
+
+def test_shell_index_entries_carry_run_facts_in_reading_order(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell facts")
+    _commit_artifact(
+        session,
+        execution_id="470aee80-fa70-4fe4-924f-e5768d49972b",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.83s.",
+        files=_shell_files("wc -l notes.txt", duration=2.83),
+    )
+
+    index = json.loads((session.directory / "outputs.json").read_text())
+    entries = index["categories"]["shell"]
+    assert [Path(entry["view_path"]).name for entry in entries] == [
+        "command.sh",
+        "stdout.txt",
+        "stderr.txt",
+        "run.json",
+    ]
+    assert {entry["bundle_path"] for entry in entries} == {"shell/001-wc-l-notes-txt-470aee80"}
+    assert entries[0]["command"] == "wc -l notes.txt"
+    assert entries[0]["exit_code"] == 0
+    assert entries[0]["duration_seconds"] == pytest.approx(2.83)
+    assert entries[0]["canonical_path"].endswith("/shell-command.sh")
+
+
+def test_shell_bundles_are_numbered_by_run_order_not_by_name(tmp_path: Path) -> None:
+    """A name-sorted directory destroys run order; the ordinal prefix restores it."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell order")
+    # Execution ids deliberately reverse-sort against commit order, so an ordinal taken from the
+    # id rather than from the commit sequence would number these backwards.
+    for execution_id, command in (
+        ("cccccccc-0000-0000-0000-000000000000", "zcat archive.gz"),
+        ("bbbbbbbb-0000-0000-0000-000000000000", "awk NR==1 table.csv"),
+        ("aaaaaaaa-0000-0000-0000-000000000000", "md5sum matrix.h5ad"),
+    ):
+        _commit_artifact(
+            session,
+            execution_id=execution_id,
+            tool_name="run_shell_command",
+            summary="Shell command completed.",
+            files=_shell_files(command),
+        )
+
+    assert sorted(path.name for path in (session.directory / "shell").iterdir()) == [
+        "001-zcat-archive-gz-cccccccc",
+        "002-awk-nr-1-table-csv-bbbbbbbb",
+        "003-md5sum-matrix-h5ad-aaaaaaaa",
+    ]
+
+
+def test_multiline_inline_script_still_yields_a_recognizable_bundle_name(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="inline python")
+    command = (
+        'python3 -c "\nimport json\n'
+        "with open('/home/user/sessions/run_2026/state.json') as handle:\n"
+        '    state = json.load(handle)\n" 2>&1'
+    )
+    _commit_artifact(
+        session,
+        execution_id="b3516d16-80a2-4815-87fe-fbb28b96eac6",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.67s.",
+        files=_shell_files(command),
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert bundle.name.startswith("001-python3-c-import-json")
+    assert bundle.name.endswith("-b3516d16")
+    assert "home-user-sessions" not in bundle.name
+
+    # Only the path substring is abbreviated, so the surrounding call still reads as code.
+    row = next(
+        line
+        for line in (session.directory / "outputs.md").read_text().splitlines()
+        if "b3516d16" in line
+    )
+    assert "open('state.json')" in row
+
+
+def test_urls_and_relative_paths_are_left_intact_in_the_command_table(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="urls")
+    _commit_artifact(
+        session,
+        execution_id="0ddba11c-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files("curl -s https://example.com/a/b > ./out/data.json"),
+    )
+
+    row = next(
+        line
+        for line in (session.directory / "outputs.md").read_text().splitlines()
+        if "0ddba11c" in line
+    )
+    assert "https://example.com/a/b" in row
+    assert "./out/data.json" in row
+
+
+def test_a_trailing_separator_does_not_swallow_the_directory_name(tmp_path: Path) -> None:
+    """``ls -la /long/path/to/target/`` must be named for target, not for the path prefix."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="trailing slash")
+    _commit_artifact(
+        session,
+        execution_id="e7834fb1-bda3-4698-b4e0-c180b5bedfc4",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.98s.",
+        files=_shell_files("ls -la /home/user/projects/scagent-sdk/sessions/run_2026/figures/"),
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert bundle.name == "001-ls-la-figures-e7834fb1"
+
+
+def test_shell_run_without_a_readable_report_falls_back_to_the_summary(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="no report")
+    files = _shell_files("ls", report=b"{ this is not json")
+    _commit_artifact(
+        session,
+        execution_id="dddddddd-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Inspected the staging directory",
+        files=files,
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert bundle.name == "001-inspected-the-staging-directory-dddddddd"
+    assert (bundle / "command.sh").is_symlink()
+    index = json.loads((session.directory / "outputs.json").read_text())
+    entry = index["categories"]["shell"][0]
+    assert entry["command"] == ""
+    assert entry["exit_code"] is None
+    assert entry["duration_seconds"] is None
+
+
+def test_the_summary_fallback_drops_its_boilerplate_clause(tmp_path: Path) -> None:
+    """``run_shell_command`` now names the command in its summary; the prefix is not a label."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="summary fallback")
+    _commit_artifact(
+        session,
+        execution_id="feedface-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.83s: ls -la /home/user/sessions/run_2026/figures",
+        files=_shell_files("ls", report=b"not json at all"),
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert bundle.name == "001-ls-la-figures-feedface"
+
+
+def test_non_finite_report_numbers_keep_the_index_serializable(tmp_path: Path) -> None:
+    """``json.loads`` accepts NaN, but the index is written with ``allow_nan=False``."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="nan duration")
+    _commit_artifact(
+        session,
+        execution_id="eeeeeeee-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files(
+            "true",
+            report=b'{"command": "true", "duration_seconds": NaN, "exit_code": 0}\n',
+        ),
+    )
+
+    index = json.loads((session.directory / "outputs.json").read_text())
+    entry = index["categories"]["shell"][0]
+    assert entry["duration_seconds"] is None
+    assert entry["command"] == "true"
+
+
+def test_other_outputs_of_a_shell_record_keep_their_own_category(tmp_path: Path) -> None:
+    """A figure a command happens to write belongs in figures/, not buried in the bundle."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="mixed shell")
+    artifact_path = _commit_artifact(
+        session,
+        execution_id="99999999-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=[
+            *_shell_files("gnuplot plot.gp"),
+            ("plot", "plot.png", "image/png", b"PNG"),
+        ],
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert sorted(path.name for path in bundle.iterdir()) == [
+        "command.sh",
+        "run.json",
+        "stderr.txt",
+        "stdout.txt",
+    ]
+    figure = next((session.directory / "figures").glob("*.png"))
+    assert figure.resolve() == artifact_path / "plot.png"
+
+
+def test_shell_section_of_the_markdown_index_is_browsable(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell markdown")
+    _commit_artifact(
+        session,
+        execution_id="7a3d322e-b4f6-4c49-9a62-3e948d33feb2",
+        tool_name="run_shell_command",
+        summary="Shell command completed in 2.81s.",
+        files=_shell_files("grep -c finalize /work/events.jsonl", duration=2.81),
+    )
+
+    markdown = (session.directory / "outputs.md").read_text()
+    assert "## Shell commands" in markdown
+    # Abbreviated in the table for readability; the note points at the exact text.
+    assert "`grep -c finalize events.jsonl`" in markdown
+    assert "`command.sh` holds the exact text that ran" in markdown
+    assert "2.81s" in markdown
+    assert "shell/001-grep-c-finalize-events-jsonl-7a3d322e" in markdown
+    assert "[stdout.txt](shell/001-grep-c-finalize-events-jsonl-7a3d322e/stdout.txt)" in markdown
+
+
+def test_a_backtick_command_cannot_break_the_markdown_table(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="backticks")
+    _commit_artifact(
+        session,
+        execution_id="cafecafe-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files("echo `date` | tee out.txt"),
+    )
+
+    row = next(
+        line
+        for line in (session.directory / "outputs.md").read_text().splitlines()
+        if "cafecafe" in line
+    )
+    assert row.count("`") == 2
+    assert "\\|" in row
+
+
+def test_an_empty_shell_surface_is_reported_rather_than_omitted(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="empty shell")
+
+    index = json.loads((session.directory / "outputs.json").read_text())
+    assert index["categories"]["shell"] == []
+    markdown = (session.directory / "outputs.md").read_text()
+    assert "## Shell commands\n\n_No committed outputs yet._" in markdown
+
+
+def test_stale_shell_bundles_are_pruned_but_the_category_root_remains(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell cleanup")
+    _commit_artifact(
+        session,
+        execution_id="bd8e764e-b746-4b64-9a40-d208817875f8",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files("du -sh data"),
+    )
+    bundle = next((session.directory / "shell").iterdir())
+
+    refresh_output_view(session.directory, {})
+
+    assert not bundle.exists()
+    assert (session.directory / "shell").is_dir()
+    assert (session.directory / "data" / "intermediates").is_dir()
+
+
+def test_repeated_refresh_reuses_shell_bundles_without_duplicating_them(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="shell idempotent")
+    _commit_artifact(
+        session,
+        execution_id="efea735b-a19f-4bf2-8876-8f02e40d14b4",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files("nproc"),
+    )
+
+    first = json.loads((session.directory / "outputs.json").read_text())
+    session.refresh_outputs()
+    session.refresh_outputs()
+    second = json.loads((session.directory / "outputs.json").read_text())
+
+    assert first == second
+    assert len(list((session.directory / "shell").iterdir())) == 1
+    assert not list((session.directory / "shell").rglob("*--view-*"))
 
 
 def test_refresh_removes_only_stale_generated_links(tmp_path: Path) -> None:

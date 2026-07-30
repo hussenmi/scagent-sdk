@@ -315,3 +315,30 @@ def test_cleanup_facts_patch_invalidates_all_downstream() -> None:
     for key in ("doublet_handling", "batch_handling", "integration", "final_labels"):
         assert decisions[key] is None, key
     assert decisions["cluster_cleanup"]["removed_clusters"] == ["3"]
+
+
+# --- cluster highlight grid --------------------------------------------------
+
+
+def test_cluster_grid_widens_as_the_partition_gets_finer() -> None:
+    layout = _g("_cluster_grid_layout")
+
+    assert layout(4) == (1, 4)
+    assert layout(20) == (4, 5)
+    # The resolutions this skill adjudicates routinely exceed thirty clusters; a five-wide
+    # grid would become a very tall strip.
+    assert layout(60) == (10, 6)
+    for count in range(1, 151):
+        rows, columns = layout(count)
+        assert rows * columns >= count
+
+
+def test_cluster_grid_points_stay_visible_at_every_dataset_size() -> None:
+    sizes = _g("_cluster_grid_point_sizes")
+
+    small_background, small_foreground = sizes(1_000)
+    large_background, large_foreground = sizes(1_000_000)
+
+    assert small_foreground > small_background
+    assert large_foreground > large_background
+    assert large_background >= 0.4 and large_foreground >= 0.8

@@ -30,6 +30,10 @@ CLUSTER_QC_EVIDENCE_SCHEMA = 3
 
 # --- versioned gene classification -------------------------------------------
 GENE_CLASS_VERSION = "cluster-qc-gene-class-v1"
+# Mirrors scagent_sdk.capabilities.results.MODEL_MEDIA_LIMIT. Skills cannot import the runtime
+# package, so the ceiling is restated here; exceeding it would fail the whole pass, and this
+# pass is expensive.
+MAX_ATTACHED_FIGURES = 64
 
 _NUISANCE_PATTERNS = tuple(
     re.compile(pattern)
@@ -825,13 +829,22 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
             "media_type": "application/json",
         },
         *([metric_figure] if metric_figure else []),
-        *([umap_media] if umap_media else []),
+        *umap_media,
         *heatmap_artifacts,
     ]
-    overview_media = ([metric_figure] if metric_figure else []) + (
-        [umap_media] if umap_media else []
-    )
-    model_media = overview_media + heatmap_artifacts[: max(0, 8 - len(overview_media))]
+    # Every figure this pass requires a review of is attached, including all per-cluster
+    # heatmaps. Truncating here made the review floor unsatisfiable from what the model had
+    # actually seen: it required all of them but was shown at most a handful, so it reopened
+    # the rest one by one after being blocked. The coherent clusters are not padding — they
+    # are the negative controls that make an unstructured mixture obvious by contrast.
+    # At ~30 KiB each the whole set is around 2 MiB, well inside the transport budget.
+    overview_media = ([metric_figure] if metric_figure else []) + umap_media
+    attachable = max(0, MAX_ATTACHED_FIGURES - len(overview_media))
+    model_media = overview_media + heatmap_artifacts[:attachable]
+    # A clustering fine enough to exceed the transport ceiling degrades visibly rather than
+    # failing the pass: the model is told exactly which heatmaps it has not been shown, so it
+    # can open them with `inspect-media` instead of silently reviewing from their absence.
+    unattached = [item["relative_path"] for item in heatmap_artifacts[attachable:]]
 
     if cleanup["applied"]:
         return _apply_cleanup(
@@ -862,9 +875,17 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
         "summary": (
             f"Attested three-axis QC for {sizes.size} clusters; "
             f"{len(cleanup['confirmed_junk'])} convergent-junk, "
-            f"{len(review_clusters)} for review; {len(warnings)} warning(s)."
+            f"{len(review_clusters)} for review; {len(warnings)} warning(s). "
+            f"{len(model_media)} figure(s) attached for review."
+            + (
+                f" {len(unattached)} heatmap(s) exceeded the attachment ceiling and were NOT "
+                "shown; open each with `inspect-media` before `review_cluster_qc`: "
+                + ", ".join(unattached)
+                if unattached
+                else ""
+            )
         ),
-        "details": common_details,
+        "details": {**common_details, "figures_not_attached": unattached},
         "facts_patch": {
             "cluster_qc": {
                 "status": "attested",
@@ -883,7 +904,7 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
                     f"artifacts/capabilities/{context.execution_id}/{item['relative_path']}"
                     for item in (
                         ([metric_figure] if metric_figure else [])
-                        + ([umap_media] if umap_media else [])
+                        + umap_media
                         + heatmap_artifacts
                     )
                 ],
@@ -986,6 +1007,17 @@ def _render_metric_boxplots(
             box.set_alpha(0.85)
         if log_scale and all((group > 0).all() for group in grouped if group.size):
             axis.set_yscale("log")
+            # Default log labels over a two-decade range collide into "2 x 10^3 3 x 10^3 ...";
+            # plain numbers at 1/2/5 per decade stay readable at this panel height.
+            from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+            axis.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+            axis.yaxis.set_major_formatter(
+                FuncFormatter(
+                    lambda value, _: f"{value / 1000:g}k" if value >= 1000 else f"{value:g}"
+                )
+            )
+            axis.yaxis.set_minor_formatter(NullFormatter())
         axis.set_ylabel(title)
         axis.grid(axis="y", alpha=0.2)
     axes[-1, 0].set_xlabel(cluster_key)
@@ -1013,6 +1045,102 @@ def _natural_cluster_key(value: str) -> tuple[tuple[int, Any], ...]:
     )
 
 
+def _cluster_grid_layout(n_clusters: int) -> tuple[int, int]:
+    """Rows and columns for a one-panel-per-cluster highlight grid."""
+
+    if n_clusters < 1:
+        raise ValueError("a cluster grid needs at least one cluster")
+    columns = 6 if n_clusters > 30 else min(5, n_clusters)
+    return -(-n_clusters // columns), columns
+
+
+def _cluster_grid_point_sizes(n_cells: int) -> tuple[float, float]:
+    """Background and foreground marker areas for a small grid panel."""
+
+    if n_cells < 1:
+        raise ValueError("point sizes need at least one cell")
+    return max(0.4, min(4.0, 80_000.0 / n_cells)), max(0.8, min(7.0, 120_000.0 / n_cells))
+
+
+def _render_cluster_grid(
+    adata: Any,
+    cluster_key: str,
+    context: Any,
+    output_prefix: str,
+    plt: Any,
+) -> dict[str, str] | None:
+    """One small UMAP panel per cluster, that cluster colored and the rest grey.
+
+    Cluster QC is a per-cluster judgement, but the overlaid UMAP is the one figure where a
+    per-cluster judgement cannot be made: at the resolutions this skill adjudicates, thirty-plus
+    colors compete for the same pixels and a flagged cluster of 200 cells is unfindable. The grid
+    gives each cluster its own panel, so "where is cluster 24 and is it one blob or scattered
+    debris" is answerable by looking.
+    """
+
+    import numpy as np
+
+    if "X_umap" not in adata.obsm:
+        return None
+    labels = adata.obs[cluster_key].astype(str).to_numpy()
+    clusters = sorted(set(labels.tolist()), key=_natural_cluster_key)
+    if not 2 <= len(clusters) <= 150:
+        return None
+    coordinates = np.asarray(adata.obsm["X_umap"])[:, :2]
+    rows, columns = _cluster_grid_layout(len(clusters))
+    background_size, foreground_size = _cluster_grid_point_sizes(int(adata.n_obs))
+    palettes = [plt.get_cmap(name) for name in ("tab20", "tab20b", "tab20c")]
+    fig, axes = plt.subplots(rows, columns, figsize=(2.6 * columns, 2.75 * rows), squeeze=False)
+    # Shared limits: autoscaling each panel would silently rescale one whose cluster sits in a
+    # corner, so panels would no longer be comparable.
+    x_low, x_high = float(coordinates[:, 0].min()), float(coordinates[:, 0].max())
+    y_low, y_high = float(coordinates[:, 1].min()), float(coordinates[:, 1].max())
+    x_pad = max((x_high - x_low) * 0.03, 1e-6)
+    y_pad = max((y_high - y_low) * 0.03, 1e-6)
+    for index, cluster in enumerate(clusters):
+        axis = axes[index // columns][index % columns]
+        selected = labels == cluster
+        other = ~selected
+        if other.any():
+            axis.scatter(
+                coordinates[other, 0],
+                coordinates[other, 1],
+                c="#cccccc",
+                s=background_size,
+                alpha=0.25,
+                linewidths=0,
+                rasterized=True,
+            )
+        color = palettes[(index // 20) % 3]((index % 20) / 20.0)
+        axis.scatter(
+            coordinates[selected, 0],
+            coordinates[selected, 1],
+            c=[color],
+            s=foreground_size,
+            alpha=0.9,
+            linewidths=0,
+            rasterized=True,
+        )
+        axis.set_title(f"{cluster_key} {cluster}  ({int(selected.sum()):,})", fontsize=8, pad=3)
+        axis.set_xlim(x_low - x_pad, x_high + x_pad)
+        axis.set_ylim(y_low - y_pad, y_high + y_pad)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_axis_off()
+    for index in range(len(clusters), rows * columns):
+        axes[index // columns][index % columns].set_visible(False)
+    fig.suptitle(f"{cluster_key} — one panel per cluster ({len(clusters)} clusters)", fontsize=11)
+    fig.subplots_adjust(hspace=0.28, wspace=0.04)
+    relative = f"{output_prefix}/cluster-qc-umap-grid.png"
+    (context.staging_dir / output_prefix).mkdir(parents=True, exist_ok=True)
+    fig.savefig(context.staging_dir / relative, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return {
+        "name": "cluster-qc-umap-grid",
+        "relative_path": relative,
+        "media_type": "image/png",
+    }
+
+
 def _render_umap(
     adata: Any,
     cluster_key: str,
@@ -1020,7 +1148,7 @@ def _render_umap(
     output_prefix: str,
     plt: Any,
     sc: Any,
-) -> dict[str, str] | None:
+) -> list[dict[str, str]]:
     umap_key = "X_umap" if "X_umap" in adata.obsm else None
     if umap_key is None:
         declared = adata.uns.get("scagent_sdk", {}).get("umap_key")
@@ -1029,7 +1157,7 @@ def _render_umap(
     if umap_key is None and "umap" in adata.obsm:
         umap_key = "umap"
     if umap_key is None:
-        return None
+        return []
     if umap_key != "X_umap":
         adata = adata.copy()
         adata.obsm["X_umap"] = adata.obsm[umap_key]
@@ -1051,11 +1179,17 @@ def _render_umap(
     (context.staging_dir / output_prefix).mkdir(parents=True, exist_ok=True)
     plt.savefig(context.staging_dir / relative, dpi=160, bbox_inches="tight")
     plt.close("all")
-    return {
-        "name": "cluster-qc-umap",
-        "relative_path": relative,
-        "media_type": "image/png",
-    }
+    media = [
+        {
+            "name": "cluster-qc-umap",
+            "relative_path": relative,
+            "media_type": "image/png",
+        }
+    ]
+    grid = _render_cluster_grid(adata, cluster_key, context, output_prefix, plt)
+    if grid is not None:
+        media.append(grid)
+    return media
 
 
 def _write_report(path: Path, details: dict[str, Any], decisions: list[dict[str, Any]]) -> None:

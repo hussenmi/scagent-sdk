@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import recipe  # noqa: E402  (sibling module; path inserted above)
 
 
 def _exact_mapping(mapping: dict[str, str], clusters: set[str], name: str) -> None:
@@ -353,6 +358,9 @@ def _render_report(
             f"- Source artifact used for finalization: `{path}`",
             f"- Clustering identity: `{clustering_id}`",
             "- Exact committed capability calls are saved in `code/analysis-recipe.py`.",
+            "- For a step-by-step reading version, with each step's arguments, decision "
+            "rationale, and figures inline, ask for an analysis notebook; it can be rebuilt at "
+            "any time and will include any work done after this report.",
             "- Human-facing figures, reports, tables, and datasets are projected into their "
             "named session folders; canonical provenance remains under `artifacts/capabilities/`.",
         ]
@@ -466,16 +474,9 @@ def _execute_finalization(arguments: dict[str, Any], context: Any) -> dict[str, 
             "arguments": arguments,
         }
     )
-    recipe = (
-        '"""Exact capability-call recipe generated from committed session provenance.\n\n'
-        "This records the ordered calls and parameters. Replay them through the scagent-sdk "
-        "capability runtime so scientific floors and artifact commits are preserved.\n"
-        '"""\n\n'
-        "CAPABILITY_CALLS = "
-        + repr(recipe_calls)
-        + "\n"
+    (context.staging_dir / "analysis-recipe.py").write_text(
+        recipe.render_capability_recipe(recipe_calls), encoding="utf-8"
     )
-    (context.staging_dir / "analysis-recipe.py").write_text(recipe, encoding="utf-8")
     report = _render_report(
         summary=summary,
         facts=context.state_facts,

@@ -18,5 +18,11 @@ The output records count, cell-set, and dataset-revision identities derived from
 matrix and names. Those identities describe the artifact; they are not proof that another tool
 ran first.
 
+The selected counts are written to both `X` and `layers["counts"]`. Because that duplicates them,
+the artifact drops what it just copied: an `.raw`, and the source layer when a layer was selected.
+Unrelated layers are preserved, and the input file is immutable and recorded in
+`dataset_revision.source_path`, so nothing is lost. `details.dropped_payload` names exactly what
+was omitted — report it rather than describing the artifact as a faithful copy of the input.
+
 Read [references/count-contract.md](references/count-contract.md) for source-selection and
 lineage details.

@@ -34,6 +34,9 @@ Focused skills, grouped by purpose (each surfaces its full guidance when you inv
 - **Visualize** — `visualize-single-cell` (QC distributions, embedding panels, group composition,
   label-agreement heatmaps, marker dot plots). Use it for any figure it covers; each tool returns
   the figure for you to inspect. Write plotting code only for a figure no tool provides.
+- **Report** — `analysis-notebook` builds a readable step-by-step walkthrough of the work committed
+  so far, figures inline. Offer it when a user asks what was done or wants something to share; it is
+  requestable at any point, not only after finalization, and rebuilding it picks up later work.
 - **Support** — `analysis-workspace` (auditable custom Python for gaps, never to bypass floors),
   `inspect-media` (images/PDFs), `research-web`/`research-literature` (external evidence, cited).
 - `orchestrate-single-cell` coordinates a multi-step analysis when you need to plan the next step.

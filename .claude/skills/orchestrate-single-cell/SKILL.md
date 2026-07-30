@@ -22,16 +22,35 @@ from an already processed artifact, and the observed data may require replanning
 3. Normalize, select HVGs, compute PCA, inspect the PCA variance figure, build neighbors, compute
    UMAP, and call `plot_qc_embedding`. Explain where quality signals localize; distributions alone
    do not show whether a signal is a coherent population.
-4. Unless the user specifies another grid, compare Leiden resolutions **2.0, 1.5, and 1.0** using
-   distinct keys such as `leiden_res_2_0`. At each resolution, run `evaluate_cluster_qc`, inspect
-   its per-cluster metric boxplots, cluster/QC UMAP, and every per-cluster covariance heatmap, then
-   call `review_cluster_qc`. Do not carry an unresolved remove/merge/split/recluster disposition
-   into annotation. These resolutions are overridable defaults, not hardcoded requirements; add or
-   change them when cluster sizes, stability, or biology justify it.
-5. Select the final resolution from stability, DEG identity, covariance coherence, separation, and
-   interpretability—not because it was run last. Make that selected clustering the current
-   clustering, then investigate batch structure when meaningful batch metadata exists and record
-   an explicit decision. Record `not_applicable` when no defensible batch unit exists.
+4. Cluster **iteratively, not in parallel**. Unless the user specifies another ladder, descend
+   Leiden **2.0 → 1.5 → 1.0**, one round at a time, each round running on the cells the previous
+   round left behind. A later resolution is not a competing candidate on the same cells; it is the
+   next phase on cleaner cells. Per round:
+   1. Cluster at that round's resolution into a distinct key such as `leiden_res_2_0`.
+   2. Run `evaluate_cluster_qc` in its default report-only mode, inspect its per-cluster metric
+      boxplots, cluster/QC UMAP, per-cluster highlight grid, and every covariance heatmap, then
+      call `review_cluster_qc`.
+   3. If the review confirms removal, apply it by re-running `evaluate_cluster_qc` with
+      `auto_remove_convergent=true`. That issues fresh cell-set and count identities and clears the
+      representation, clustering, cell-QC, and doublet evidence.
+   4. Re-prepare the retained cells before the next round: normalize, **re-select HVGs**, PCA,
+      neighbors, UMAP, and re-run cell QC with its review. Removing cells changes the variance
+      landscape, so HVG selection must be recomputed rather than carried across a cleanup.
+   5. Step down to the next resolution and repeat.
+
+   The high resolution exists to expose small low-quality populations for removal; the lower ones
+   are the working and annotation granularities on progressively cleaner cells. End the cleanup
+   loop when a round flags nothing that requires removal, but still descend to the annotation
+   resolution. Do not carry an unresolved remove/merge/split/recluster disposition into annotation.
+   The ladder is an overridable default, not a hardcoded requirement; change it when cluster sizes,
+   stability, or biology justify it.
+5. Annotate the clustering at the bottom of the ladder—**1.0 by default**. Deviate only for a
+   stated scientific reason, such as DEG identity, covariance coherence, or separation showing
+   genuine over- or under-splitting; never merely because a finer clustering was run more recently.
+   Compute DEGs only once you are on the clustering you intend to annotate, since a DEG pass at a
+   QC resolution is discarded when you later step down. Make that clustering current, then
+   investigate batch structure when meaningful batch metadata exists and record an explicit
+   decision. Record `not_applicable` when no defensible batch unit exists.
 6. For annotation, use SCimilarity early when it helps establish broad tissue/context, inspect the
    complete readiness inventory of cached CellTypist models, and choose the closest organism/tissue
    model rather than a generic immune default. When both are suitable, run and summarize both and
@@ -45,6 +64,13 @@ from an already processed artifact, and the observed data may require replanning
 
 For a targeted question—one plot, one reference query, an already finalized object—use only the
 capabilities needed for that question. Do not force the comprehensive playbook onto unrelated work.
+
+Finalization is not necessarily the end of the work, and no step automatically produces a
+walkthrough. When a user asks what was done, wants something to hand a collaborator, or continues
+working after a report, offer `build_analysis_notebook`. It is requestable at any point, states
+plainly that an unfinished analysis is in progress, and is rebuilt from provenance so a later build
+covers whatever has been added since. Offer it rather than assuming it, and rebuild rather than
+describing an earlier notebook as stale.
 
 ## Operating loop
 

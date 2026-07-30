@@ -20,6 +20,15 @@ the workflow/parameters, QC and cluster-review decisions, batch evidence, annota
 per-cluster labels, automatically surfaced caveats, and artifact guidance. It also writes an exact
 ordered capability-call recipe into the session `code/` view.
 
+Finalization emits two surfaces over the same provenance: `reports/final-analysis-report.md` is the
+narrative findings and caveats, and `code/analysis-recipe.py` is the machine replay list.
+
+It deliberately does **not** emit a notebook. A readable step-by-step walkthrough is the separate
+`analysis-notebook` capability, requestable at any point and rebuildable as the analysis grows —
+finalization is not necessarily the end of the work, and a user may want a walkthrough before it or
+long after. Offer it here rather than assuming it, and point a user who asks *what was done* at that
+notebook rather than at the recipe.
+
 Provide `deg_labels` written independently from the DEG/marker evidence, `evidence_summaries`,
 per-cluster `confidence`, and an override justification for every cluster whose final label differs
 from its DEG label. Keep confidence honest: when evidence conflicts, choose `medium`/`low` and

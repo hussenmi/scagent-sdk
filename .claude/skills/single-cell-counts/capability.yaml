@@ -1,7 +1,7 @@
 schema_version: 1
 skill:
   id: single-cell-counts
-  version: "0.1.0"
+  version: "0.2.0"
   description: Independent raw-count source resolution and materialization.
 tools:
   - name: materialize_count_matrix

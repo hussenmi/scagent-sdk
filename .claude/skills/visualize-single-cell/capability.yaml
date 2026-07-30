@@ -1,11 +1,11 @@
 schema_version: 1
 skill:
   id: visualize-single-cell
-  version: "0.2.0"
-  description: Deterministic single-cell figures for QC, embeddings, composition, label agreement, and markers.
+  version: "0.3.0"
+  description: Deterministic single-cell figure sets for QC, embeddings, composition, label agreement, and markers, with log-scaled heavy-tailed metrics and per-category highlight grids.
 tools:
   - name: plot_qc_distributions
-    description: Plot per-cell library size, detected genes, mitochondrial percent, and the UMI-rank knee from a count matrix, optionally split by a grouping.
+    description: Plot the full standard QC set from a count matrix — UMI-rank knee, log-scaled library size and detected-gene histograms, mitochondrial and ribosomal percent, jittered per-metric violins, joint scatters, and doublet scores when present — optionally split by a grouping.
     entrypoint: scripts/plots.py:plot_qc_distributions
     environment: gpu-singlecell
     activity_label: Plotting QC distributions
@@ -20,7 +20,7 @@ tools:
       additionalProperties: false
     primary_matrix_input: path
   - name: plot_embedding
-    description: Scatter an existing embedding with one panel per obs column or gene; requires an embedding to already exist.
+    description: Scatter an existing embedding with one panel per obs column or gene, plus an automatic per-category highlight grid for each categorical panel; requires an embedding to already exist.
     entrypoint: scripts/plots.py:plot_embedding
     environment: gpu-singlecell
     activity_label: Plotting embedding
@@ -38,6 +38,7 @@ tools:
         expression_layer: {type: [string, "null"], default: null, description: Layer for gene panels; raw counts are normalized internally for display.}
         point_size: {type: number, minimum: 0, default: 0, description: Zero chooses a size from the cell count.}
         max_categories: {type: integer, minimum: 1, maximum: 60, default: 30}
+        include_highlight_grids: {type: boolean, default: true, description: Also return a one-panel-per-category grid for each categorical panel; leave enabled unless the overlay is already unambiguous.}
         random_seed: {type: integer, default: 0}
       required: [color_keys]
       additionalProperties: false
@@ -54,6 +55,7 @@ tools:
         embedding_key: {type: [string, "null"], default: null}
         point_size: {type: number, minimum: 0, default: 0}
         max_categories: {type: integer, minimum: 1, maximum: 60, default: 30}
+        include_highlight_grids: {type: boolean, default: true, description: Also return a grid locating each flag category; a rare qc_flag_ True is nearly invisible in the overlaid panel.}
         random_seed: {type: integer, default: 0}
       additionalProperties: false
     primary_matrix_input: path
