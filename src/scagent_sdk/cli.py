@@ -29,6 +29,7 @@ from scagent_sdk.runtime.interrupts import TurnInterrupter
 from scagent_sdk.runtime.resume import ResumePreference
 from scagent_sdk.runtime.service import AgentRuntimeService
 from scagent_sdk.session import AnalysisSession
+from scagent_sdk.state.retention import propose_prune
 from scagent_sdk.state.store import SessionStore
 
 
@@ -124,6 +125,49 @@ def _cmd_session_show(args: argparse.Namespace) -> int:
     value = session.summary()
     value["events"] = [event.to_dict() for event in session.store.events()]
     _print_json(value)
+    return 0
+
+
+def _cmd_session_storage(args: argparse.Namespace) -> int:
+    """Report artifact storage and what an unreachable-version prune would actually reclaim.
+
+    Read-only by construction: there is no deletion path here. ``reclaimable_bytes`` is the only
+    figure a future prune may promise, because apparent size and reclaimable size diverge once
+    versions can share bytes.
+    """
+
+    roots = (
+        [args.session_id]
+        if args.session_id
+        else [item.session_id for item in SessionStore.list_sessions(_sessions_root(args))]
+    )
+    reports = []
+    for session_id in roots:
+        session = AnalysisSession.resume(_sessions_root(args), session_id)
+        reports.append(
+            propose_prune(
+                session.directory,
+                session_id=session_id,
+                lineage=session.store.state.lineage,
+                artifacts=session.store.state.artifacts,
+            ).to_dict()
+        )
+    if args.session_id:
+        _print_json(reports[0])
+        return 0
+    _print_json(
+        {
+            "sessions": reports,
+            "totals": {
+                key: sum(report["session_total"][key] for report in reports)
+                for key in ("apparent_bytes", "unique_bytes", "reclaimable_bytes", "files")
+            },
+            "candidate_totals": {
+                key: sum(report["candidate_total"][key] for report in reports)
+                for key in ("apparent_bytes", "unique_bytes", "shared_bytes", "reclaimable_bytes")
+            },
+        }
+    )
     return 0
 
 
@@ -587,6 +631,15 @@ def _parser() -> argparse.ArgumentParser:
     show.add_argument("session_id")
     _add_sessions_root(show)
     show.set_defaults(handler=_cmd_session_show)
+
+    storage = actions.add_parser(
+        "storage", help="report artifact storage and what a prune would reclaim (read-only)"
+    )
+    storage.add_argument(
+        "session_id", nargs="?", help="one session; omit to report every session"
+    )
+    _add_sessions_root(storage)
+    storage.set_defaults(handler=_cmd_session_storage)
 
     resume = actions.add_parser("resume", help="plan exact or reconstructed continuation")
     resume.add_argument("session_id")
