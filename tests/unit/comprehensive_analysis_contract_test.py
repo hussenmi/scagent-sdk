@@ -23,7 +23,7 @@ def _handler(skill: str, tool_name: str) -> Any:
 def test_qc_defaults_to_auto_and_exposes_review_tool() -> None:
     package = _packages()["single-cell-qc"]
     tools = {tool.name: tool for tool in package.manifest.tools}
-    assert package.manifest.version == "0.2.0"
+    assert package.manifest.version == "0.5.0"
     assert tools["calculate_single_cell_qc"].input_schema["properties"]["counts_layer"][
         "default"
     ] == "auto"

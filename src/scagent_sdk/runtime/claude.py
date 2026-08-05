@@ -11,6 +11,7 @@ from typing import Any
 
 from scagent_sdk.errors import ContextRolloverRequired, RuntimeExecutionError
 from scagent_sdk.runtime.claude_store import ScientificSessionTranscriptStore
+from scagent_sdk.runtime.model_text import split_model_text
 from scagent_sdk.runtime.observer import NullRuntimeObserver, RuntimeObserver
 from scagent_sdk.runtime.protocol import (
     RuntimeMessage,
@@ -25,6 +26,23 @@ from scagent_sdk.runtime.protocol import (
 MAX_RUNTIME_MESSAGE_BYTES = 64 * 1024 * 1024
 DEFAULT_OUTPUT_RESERVE_TOKENS = 32_000
 MIN_CONTEXT_SAFETY_MARGIN_TOKENS = 4_096
+AUTO_COMPACT_CONTEXT_FRACTION = 0.70
+MAX_TEXTUAL_TOOL_CALL_RECOVERY_ATTEMPTS = 1
+_TEXTUAL_TOOL_CALL_RECOVERY_PROMPT = (
+    "Your previous response printed a tool call as text, so no tool was executed. Continue the "
+    "same task from the current scientific state. If a tool is needed, invoke it through the "
+    "native tool interface; never print <tool_call>, <tools>, or function protocol markup. Do "
+    "not repeat work that durable state already records as complete."
+)
+_CONTEXT_ERROR_MARKERS = (
+    "contextwindowexceeded",
+    "context window exceeded",
+    "maximum context length",
+    "maximum context window",
+    "prompt is too long",
+    "too many input tokens",
+    "input length",
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +112,15 @@ class ClaudeAgentSDKBackend:
         system_prompt = profile.read_system_prompt()
         if extensions.system_prompt_suffix.strip():
             system_prompt = f"{system_prompt}\n\n{extensions.system_prompt_suffix.strip()}"
+        runtime_env = profile.runtime_environment()
+        if request.context_window_tokens:
+            # Claude Code's own autocompaction is the only guard between tool iterations inside
+            # one SDK query. Trigger it conservatively because a local fallback tokenizer may
+            # undercount the provider's actual Qwen prompt.
+            runtime_env.setdefault(
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                str(int(request.context_window_tokens * AUTO_COMPACT_CONTEXT_FRACTION)),
+            )
         values: dict[str, Any] = {
             "model": profile.model,
             "system_prompt": system_prompt,
@@ -113,7 +140,7 @@ class ClaudeAgentSDKBackend:
             "hooks": dict(extensions.hooks) or None,
             "plugins": [dict(plugin) for plugin in extensions.plugins],
             "include_hook_events": extensions.include_hook_events,
-            "env": profile.runtime_environment(),
+            "env": runtime_env,
             "resume": request.resume_session_id,
             "fork_session": request.fork_session,
             "session_store": ScientificSessionTranscriptStore(request.scientific_session_dir),
@@ -134,7 +161,20 @@ class ClaudeAgentSDKBackend:
         output: list[RuntimeMessage] = []
         for block in message.content:
             if isinstance(block, sdk.TextBlock):
-                output.append(RuntimeMessage("text", block.text))
+                visible, reasoning, textual_tools = split_model_text(block.text)
+                output.extend(RuntimeMessage("thinking", item) for item in reasoning)
+                if visible:
+                    output.append(RuntimeMessage("text", visible))
+                if textual_tools:
+                    output.append(
+                        RuntimeMessage(
+                            "textual_tool_call",
+                            {
+                                "count": len(textual_tools),
+                                "status": "not_executed",
+                            },
+                        )
+                    )
             elif isinstance(block, sdk.ThinkingBlock):
                 output.append(RuntimeMessage("thinking", block.thinking))
             elif isinstance(block, sdk.ToolUseBlock):
@@ -181,6 +221,13 @@ class ClaudeAgentSDKBackend:
         if isinstance(session_id, str) and session_id:
             self.last_runtime_session_id = session_id
 
+    @staticmethod
+    def _is_context_error_result(response: RuntimeResponse) -> bool:
+        if not response.is_error:
+            return False
+        text = f"{response.subtype}\n{response.final_text}".casefold().replace("_", " ")
+        return any(marker in text for marker in _CONTEXT_ERROR_MARKERS)
+
     def _interrupted_response(
         self, messages: list[RuntimeMessage], result: Any | None
     ) -> RuntimeResponse:
@@ -207,10 +254,11 @@ class ClaudeAgentSDKBackend:
     async def _preflight_context(client: Any, request: RuntimeRequest) -> None:
         """Refuse an exact query before the provider rejects its overfull transcript.
 
-        The deployment's advertised limit wins. When endpoint discovery is unavailable,
-        Claude Agent SDK's runtime-reported raw maximum provides a provider-neutral fallback.
-        A failed usage probe is non-fatal because the service also recognizes an actual
-        provider context error and can roll over safely.
+        Use the most conservative live boundary. The deployment may advertise a larger physical
+        window than Claude Code's effective/autocompact ceiling, and crossing that lower ceiling
+        is unsafe when the gateway's count-tokens endpoint falls back to an approximate local
+        tokenizer. A failed usage probe is non-fatal because the service also recognizes an
+        actual provider context error and can roll over safely.
         """
 
         if not request.resume_session_id or not hasattr(client, "get_context_usage"):
@@ -224,19 +272,22 @@ class ClaudeAgentSDKBackend:
         total = usage.get("totalTokens")
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             return
-        runtime_limit = usage.get("rawMaxTokens") or usage.get("maxTokens")
-        if not isinstance(runtime_limit, int) or isinstance(runtime_limit, bool):
-            runtime_limit = None
-        limit = request.context_window_tokens or runtime_limit
-        if limit is None or limit < 1:
+        limit_candidates: list[tuple[int, str]] = []
+        for value, source in (
+            (request.context_window_tokens, request.context_limit_source or "model-discovery"),
+            (usage.get("rawMaxTokens"), "claude-agent-sdk:rawMaxTokens"),
+            (usage.get("maxTokens"), "claude-agent-sdk:maxTokens"),
+            (usage.get("autoCompactThreshold"), "claude-agent-sdk:autoCompactThreshold"),
+        ):
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                limit_candidates.append((value, source))
+        if not limit_candidates:
             return
+        limit, source = min(limit_candidates, key=lambda item: item[0])
         output_reserve = request.max_output_tokens or DEFAULT_OUTPUT_RESERVE_TOKENS
         safety_margin = max(MIN_CONTEXT_SAFETY_MARGIN_TOKENS, int(limit * 0.03))
         if total + output_reserve + safety_margin < limit:
             return
-        source = request.context_limit_source or (
-            "claude-agent-sdk:rawMaxTokens" if runtime_limit else "runtime:unknown"
-        )
         raise ContextRolloverRequired(
             "the exact model conversation needs a context rollover before another turn "
             f"({total:,} used + {output_reserve:,} output reserve + "
@@ -291,6 +342,7 @@ class ClaudeAgentSDKBackend:
             "percentage": percentage,
             "model": usage.get("model"),
             "auto_compact_enabled": usage.get("isAutoCompactEnabled"),
+            "auto_compact_threshold_tokens": usage.get("autoCompactThreshold"),
             "source": "claude-agent-sdk:get_context_usage",
             "context_window_source": (
                 request.context_limit_source
@@ -304,6 +356,7 @@ class ClaudeAgentSDKBackend:
         options = self._options(request, sdk)
         messages: list[RuntimeMessage] = []
         result: Any | None = None
+        final_attempt_start = 0
         context_usage: dict[str, Any] = {}
         self._interrupt_requested = False
         self.last_runtime_session_id = request.resume_session_id
@@ -312,16 +365,44 @@ class ClaudeAgentSDKBackend:
             async with sdk.ClaudeSDKClient(options=options) as client:
                 self._client = client
                 await self._preflight_context(client, request)
-                await client.query(request.prompt)
-                async for message in client.receive_response():
-                    self._note_session_id(message)
-                    if isinstance(message, sdk.AssistantMessage):
-                        blocks = self._assistant_blocks(message, sdk)
-                        messages.extend(blocks)
-                        for block in blocks:
-                            self.observer.on_message(block)
-                    elif isinstance(message, sdk.ResultMessage):
-                        result = message
+                query_prompt = request.prompt
+                for recovery_attempt in range(MAX_TEXTUAL_TOOL_CALL_RECOVERY_ATTEMPTS + 1):
+                    attempt_start = len(messages)
+                    attempt_result: Any | None = None
+                    await client.query(query_prompt)
+                    async for message in client.receive_response():
+                        self._note_session_id(message)
+                        if isinstance(message, sdk.AssistantMessage):
+                            blocks = self._assistant_blocks(message, sdk)
+                            messages.extend(blocks)
+                            for block in blocks:
+                                self.observer.on_message(block)
+                        elif isinstance(message, sdk.ResultMessage):
+                            attempt_result = message
+                    if attempt_result is None:
+                        if self._interrupt_requested:
+                            break
+                        raise RuntimeExecutionError(
+                            "Claude Agent SDK ended without a ResultMessage"
+                        )
+                    result = attempt_result
+                    raw_result = str(getattr(result, "result", None) or "")
+                    _, _, result_tool_calls = split_model_text(raw_result)
+                    emitted_tool_call = any(
+                        item.kind == "textual_tool_call" for item in messages[attempt_start:]
+                    )
+                    if not emitted_tool_call and not result_tool_calls:
+                        final_attempt_start = attempt_start
+                        break
+                    if bool(getattr(result, "is_error", False)):
+                        final_attempt_start = attempt_start
+                        break
+                    if recovery_attempt >= MAX_TEXTUAL_TOOL_CALL_RECOVERY_ATTEMPTS:
+                        raise RuntimeExecutionError(
+                            "the model repeatedly emitted a textual tool call that was not "
+                            "executed; refusing to report the incomplete turn as successful"
+                        )
+                    query_prompt = _TEXTUAL_TOOL_CALL_RECOVERY_PROMPT
                 context_usage = await self._current_context_usage(client, request)
         except asyncio.CancelledError:
             self.observer.on_runtime_interrupted(forced=True)
@@ -348,10 +429,15 @@ class ClaudeAgentSDKBackend:
             raise RuntimeExecutionError("Claude Agent SDK returned no resumable session ID")
         text_blocks = [
             str(message.content)
-            for message in messages
+            for message in messages[final_attempt_start:]
             if message.kind == "text" and str(message.content).strip()
         ]
-        final_text = result.result or "\n".join(text_blocks)
+        clean_result, _, result_tool_calls = split_model_text(str(result.result or ""))
+        if result_tool_calls:
+            raise RuntimeExecutionError(
+                "the model ended with an unexecuted textual tool call"
+            )
+        final_text = clean_result or "\n".join(text_blocks)
         response = RuntimeResponse(
             runtime_session_id=result.session_id,
             messages=tuple(messages),
@@ -364,5 +450,8 @@ class ClaudeAgentSDKBackend:
             context_usage=context_usage,
             total_cost_usd=result.total_cost_usd,
         )
-        self.observer.on_runtime_finished(response)
+        # The service can recover a context rejection by rebuilding from durable state. Do not
+        # print the provider's transient 400 as a final answer before that recovery decision.
+        if not self._is_context_error_result(response):
+            self.observer.on_runtime_finished(response)
         return response

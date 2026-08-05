@@ -1,11 +1,11 @@
 schema_version: 1
 skill:
   id: scvi-integration
-  version: "0.3.0"
-  description: Standalone count-aware scVI latent-model training.
+  version: "0.5.0"
+  description: Standalone count-aware scVI latent-model training with a cell-count epoch cap, early stopping, and convergence diagnostics.
 tools:
   - name: train_scvi_latent
-    description: Train scVI from raw counts with an explicit batch covariate and save the model plus X_scVI latent representation; do not build neighbors, UMAP, or clusters.
+    description: Train scVI from raw counts with an explicit batch covariate and save the model, convergence diagnostics, and X_scVI latent representation; do not build neighbors, UMAP, or clusters.
     entrypoint: scripts/integrate.py:run
     environment: scvi
     activity_label: Training scVI latent model
@@ -17,7 +17,8 @@ tools:
         batch_key: {type: string}
         n_latent: {type: integer, minimum: 2, maximum: 100, default: 30}
         n_layers: {type: integer, minimum: 1, maximum: 5, default: 2}
-        max_epochs: {type: integer, minimum: 1, default: 200}
+        max_epochs: {type: integer, minimum: 1, description: "Upper bound on training epochs. Leave unset so scVI's cell-count heuristic sets it: epochs scale inversely with cell count (400 for <=20k cells, ~40 for ~200k), because more cells means more gradient steps per epoch. Early stopping normally halts training sooner. Set a small value only for a deliberate quick test."}
+        early_stopping: {type: boolean, default: true, description: "Stop when the validation ELBO stops improving instead of always running the full cap. Disable only to inspect the complete loss curve."}
         random_seed: {type: integer, default: 0}
       required: [batch_key]
       additionalProperties: false

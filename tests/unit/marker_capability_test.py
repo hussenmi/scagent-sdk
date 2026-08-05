@@ -73,3 +73,16 @@ def test_isolated_gzmb_cannot_call_pdc_or_plasma() -> None:
     scores = _score({"GZMB"})
     assert scores["Plasmacytoid dendritic cell"]["support"] == "insufficient"
     assert scores["Plasma cell"]["overlap_count"] == 0
+
+
+def test_skill_requires_complete_per_cluster_evidence_to_decision_explanations() -> None:
+    instructions = " ".join(
+        (Path(__file__).parents[2] / ".claude/skills/marker-annotation/SKILL.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "each cluster is compared against the other cells" in instructions
+    assert "complete cluster-by-cluster evidence-to-decision account" in instructions
+    assert "never omit a cluster" in instructions
+    assert "trace every proposed label back to its DEG comparison" in instructions

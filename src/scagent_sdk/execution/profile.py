@@ -27,6 +27,9 @@ _SAFE_INHERIT = (
     "XDG_CACHE_HOME",
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
+    # Lets a runtime-routed capability find the control-plane uv binary (the overlay installer
+    # prefers uv, pixi's own PyPI resolver, and falls back to pip when it is absent).
+    "SCAGENT_SDK_UV",
     "CUDA_VISIBLE_DEVICES",
     "SLURM_JOB_ID",
     "SLURM_STEP_ID",

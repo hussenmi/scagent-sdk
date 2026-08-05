@@ -15,6 +15,14 @@ class ToolActivity:
     skill_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ToolOutput:
+    name: str
+    path: str
+    media_type: str
+    description: str | None = None
+
+
 class RuntimeObserver(Protocol):
     def on_runtime_started(self, request: RuntimeRequest) -> None: ...
 
@@ -30,11 +38,23 @@ class RuntimeObserver(Protocol):
 
     def on_tool_started(self, activity: ToolActivity) -> None: ...
 
+    def on_tool_progress(self, activity: ToolActivity, progress: dict[str, object]) -> None: ...
+
     def on_tool_finished(self, activity: ToolActivity, summary: str | None) -> None: ...
+
+    def on_tool_outputs(
+        self,
+        activity: ToolActivity,
+        outputs: tuple[ToolOutput, ...],
+        *,
+        index_path: str,
+    ) -> None: ...
 
     def on_tool_failed(self, activity: ToolActivity, error: str) -> None: ...
 
     def on_runtime_finished(self, response: RuntimeResponse) -> None: ...
+
+    def on_runtime_consistency_warning(self, warnings: tuple[str, ...]) -> None: ...
 
     def on_runtime_failed(self, error: str) -> None: ...
 
@@ -60,13 +80,28 @@ class NullRuntimeObserver:
     def on_tool_started(self, activity: ToolActivity) -> None:
         pass
 
+    def on_tool_progress(self, activity: ToolActivity, progress: dict[str, object]) -> None:
+        pass
+
     def on_tool_finished(self, activity: ToolActivity, summary: str | None) -> None:
+        pass
+
+    def on_tool_outputs(
+        self,
+        activity: ToolActivity,
+        outputs: tuple[ToolOutput, ...],
+        *,
+        index_path: str,
+    ) -> None:
         pass
 
     def on_tool_failed(self, activity: ToolActivity, error: str) -> None:
         pass
 
     def on_runtime_finished(self, response: RuntimeResponse) -> None:
+        pass
+
+    def on_runtime_consistency_warning(self, warnings: tuple[str, ...]) -> None:
         pass
 
     def on_runtime_failed(self, error: str) -> None:

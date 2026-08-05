@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from scagent_sdk.capabilities.executor import CapabilityExecutor
+from scagent_sdk.capabilities.executor import CapabilityExecutor, _read_progress
 from scagent_sdk.capabilities.registry import CapabilityRegistry
 from scagent_sdk.execution import (
     EnvironmentBroker,
@@ -45,6 +45,26 @@ def test_environment_broker_executes_handler_in_declared_python(tmp_path: Path) 
     assert artifact["environment"]["fingerprint"].startswith("sha256:")
     assert artifact["environment"]["runtime"] == "test-runtime"
     assert artifact["environment"]["environment_isolated"] is True
+
+
+def test_worker_progress_snapshot_is_read_defensively(tmp_path: Path) -> None:
+    progress = tmp_path / ".capability-progress.jsonl"
+    assert _read_progress(progress) is None
+    progress.write_text('{"message":"epoch 3/20","current":3,"total":20}\n', encoding="utf-8")
+    assert _read_progress(progress) == {
+        "message": "epoch 3/20",
+        "current": 3,
+        "total": 20,
+    }
+    progress.write_text(
+        '{"message":"epoch 1/20","current":1,"total":20}\n{"message":',
+        encoding="utf-8",
+    )
+    assert _read_progress(progress) == {
+        "message": "epoch 1/20",
+        "current": 1,
+        "total": 20,
+    }
 
 
 def test_runtime_environment_is_scrubbed_and_prefix_is_explicit(tmp_path: Path) -> None:

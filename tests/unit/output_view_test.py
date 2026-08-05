@@ -6,7 +6,11 @@ from typing import Any
 
 import pytest
 
-from scagent_sdk.output_view import OUTPUT_DIRECTORIES, refresh_output_view
+from scagent_sdk.output_view import (
+    OUTPUT_DIRECTORIES,
+    _shell_label,
+    refresh_output_view,
+)
 from scagent_sdk.session import AnalysisSession
 
 
@@ -17,6 +21,8 @@ def _commit_artifact(
     tool_name: str,
     summary: str,
     files: list[tuple[str, str, str, bytes]],
+    titles: dict[str, str] | None = None,
+    hidden_from_output_view: set[str] | None = None,
 ) -> Path:
     artifact_path = session.directory / "artifacts" / "capabilities" / execution_id
     artifact_path.mkdir(parents=True)
@@ -25,14 +31,17 @@ def _commit_artifact(
         path = artifact_path / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-        records.append(
-            {
-                "name": name,
-                "relative_path": relative_path,
-                "media_type": media_type,
-                "size_bytes": len(content),
-            }
-        )
+        record: dict[str, Any] = {
+            "name": name,
+            "relative_path": relative_path,
+            "media_type": media_type,
+            "size_bytes": len(content),
+        }
+        if titles and name in titles:
+            record["title"] = titles[name]
+        if hidden_from_output_view and name in hidden_from_output_view:
+            record["include_in_output_view"] = False
+        records.append(record)
     artifact_record = {
         "kind": "capability-result",
         "skill_id": "test-skill",
@@ -177,6 +186,41 @@ def test_committed_files_are_projected_by_kind_without_copying_data(tmp_path: Pa
     assert "`finalize_analysis`" in markdown
 
 
+def test_supporting_document_stays_canonical_but_is_not_advertised_as_a_report(
+    tmp_path: Path,
+) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="internal-doc")
+    artifact_path = _commit_artifact(
+        session,
+        execution_id="abababab-1111-2222-3333-444444444444",
+        tool_name="investigate_batch",
+        summary="Investigated sample-associated structure",
+        files=[
+            (
+                "batch-report",
+                "batch-investigation.md",
+                "text/markdown",
+                b"# Scientific report\n",
+            ),
+            (
+                "batch-diagnostic-readme",
+                "README.md",
+                "text/markdown",
+                b"# File guide\n",
+            ),
+        ],
+        hidden_from_output_view={"batch-diagnostic-readme"},
+    )
+
+    assert (artifact_path / "README.md").is_file()
+    reports = sorted(path.name for path in (session.directory / "reports").glob("*.md"))
+    assert reports == ["batch-report--abababab.md"]
+    index = json.loads((session.directory / "outputs.json").read_text())
+    assert [entry["artifact_name"] for entry in index["categories"]["reports"]] == [
+        "batch-report"
+    ]
+
+
 def test_single_code_artifact_keeps_the_plain_summary_label(tmp_path: Path) -> None:
     """The production shape: one code file per execution, named for what it does."""
 
@@ -292,15 +336,64 @@ def test_repeated_names_remain_distinct_and_traceable(tmp_path: Path) -> None:
             execution_id=execution_id,
             tool_name="visualize_embedding",
             summary="Visualized UMAP",
-            files=[("embedding", "embedding.png", "image/png", content)],
+            files=[("umap-by-leiden", "embedding.png", "image/png", content)],
         )
 
     figures = sorted((session.directory / "figures").glob("*.png"))
     assert [path.name for path in figures] == [
-        "embedding--visualize-embedding--11111111.png",
-        "embedding--visualize-embedding--22222222.png",
+        "umap-by-leiden--11111111.png",
+        "umap-by-leiden--22222222.png",
     ]
     assert [path.read_bytes() for path in figures] == [b"first", b"second"]
+
+
+def test_a_declared_title_names_the_projection_and_the_name_stays_matchable(
+    tmp_path: Path,
+) -> None:
+    """One tool emits many embeddings per session; the filename has to say which one this is.
+
+    The artifact name is what floors and report selection match on, so it must not absorb the
+    subject. The title carries it instead, and only the browsable filename changes.
+    """
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="titles")
+    _commit_artifact(
+        session,
+        execution_id="a8c2f0d0-1111-2222-3333-444444444444",
+        tool_name="plot_embedding",
+        summary="Plotted UMAP",
+        files=[
+            ("embedding", "embedding.png", "image/png", b"one"),
+            ("embedding-grid-sample", "embedding-grid-sample.png", "image/png", b"two"),
+        ],
+        titles={
+            "embedding": "umap by leiden_int sample",
+            "embedding-grid-sample": "umap grid by sample",
+        },
+    )
+
+    assert sorted(path.name for path in (session.directory / "figures").glob("*.png")) == [
+        "umap-by-leiden-int-sample--a8c2f0d0.png",
+        "umap-grid-by-sample--a8c2f0d0.png",
+    ]
+    index = json.loads((session.directory / "outputs.json").read_text())
+    names = {entry["artifact_name"] for entry in index["categories"]["figures"]}
+    assert names == {"embedding", "embedding-grid-sample"}
+
+
+def test_an_untitled_artifact_still_projects_under_its_name(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="untitled")
+    _commit_artifact(
+        session,
+        execution_id="bbbbbbbb-1111-2222-3333-444444444444",
+        tool_name="calculate_single_cell_qc",
+        summary="Calculated QC",
+        files=[("qc-violin-metrics", "violin.png", "image/png", b"PNG")],
+    )
+
+    assert [path.name for path in (session.directory / "figures").glob("*.png")] == [
+        "qc-violin-metrics--bbbbbbbb.png"
+    ]
 
 
 def test_resume_rebuilds_a_deleted_projection_from_committed_state(tmp_path: Path) -> None:
@@ -497,8 +590,9 @@ def test_shell_runs_project_as_named_bundles_with_their_output(tmp_path: Path) -
         ),
     )
 
-    # The long absolute path collapses to its basename, which is what makes the name readable.
-    bundle = session.directory / "shell" / "001-tail-5-events-jsonl-f513a638"
+    # The bundle is named for the function -- reading the end of a file -- and the long absolute
+    # path collapses to the basename the command actually acted on.
+    bundle = session.directory / "shell" / "001-read-end-of-events-jsonl-f513a638"
     assert bundle.is_dir()
     assert sorted(path.name for path in bundle.iterdir()) == [
         "command.sh",
@@ -533,7 +627,9 @@ def test_shell_index_entries_carry_run_facts_in_reading_order(tmp_path: Path) ->
         "stderr.txt",
         "run.json",
     ]
-    assert {entry["bundle_path"] for entry in entries} == {"shell/001-wc-l-notes-txt-470aee80"}
+    assert {entry["bundle_path"] for entry in entries} == {
+        "shell/001-count-lines-in-notes-txt-470aee80"
+    }
     assert entries[0]["command"] == "wc -l notes.txt"
     assert entries[0]["exit_code"] == 0
     assert entries[0]["duration_seconds"] == pytest.approx(2.83)
@@ -560,9 +656,9 @@ def test_shell_bundles_are_numbered_by_run_order_not_by_name(tmp_path: Path) -> 
         )
 
     assert sorted(path.name for path in (session.directory / "shell").iterdir()) == [
-        "001-zcat-archive-gz-cccccccc",
-        "002-awk-nr-1-table-csv-bbbbbbbb",
-        "003-md5sum-matrix-h5ad-aaaaaaaa",
+        "001-decompress-archive-gz-cccccccc",
+        "002-extract-from-table-csv-bbbbbbbb",
+        "003-checksum-matrix-h5ad-aaaaaaaa",
     ]
 
 
@@ -582,7 +678,7 @@ def test_multiline_inline_script_still_yields_a_recognizable_bundle_name(tmp_pat
     )
 
     bundle = next((session.directory / "shell").iterdir())
-    assert bundle.name.startswith("001-python3-c-import-json")
+    assert bundle.name.startswith("001-run-inline-python")
     assert bundle.name.endswith("-b3516d16")
     assert "home-user-sessions" not in bundle.name
 
@@ -627,7 +723,73 @@ def test_a_trailing_separator_does_not_swallow_the_directory_name(tmp_path: Path
     )
 
     bundle = next((session.directory / "shell").iterdir())
-    assert bundle.name == "001-ls-la-figures-e7834fb1"
+    assert bundle.name == "001-list-figures-e7834fb1"
+
+
+@pytest.mark.parametrize(
+    ("command", "label"),
+    [
+        # The working step is named, not the clause that only positioned the shell.
+        (
+            "cd /home/user/skills/cluster-qc/scripts && grep -n 'artifact_relative_path' run.py",
+            "search-run-py-for-artifact-relative-path",
+        ),
+        # A pattern supplied through -e is still the pattern, so the file is not mistaken for one.
+        ("grep -e 'floor' -n /work/events.jsonl", "search-events-jsonl-for-floor"),
+        ("grep -rn 'batch_decision' src tests", "search-src-for-batch-decision"),
+        # First step for the subject, last step for the outcome; the sed program is never a name.
+        (
+            "cd /work && cp qc.py qc.py.bak && sed -i 's/a/b/g' qc.py",
+            "copy-qc-py-then-edit",
+        ),
+        (
+            "grep -c finalize events.jsonl | wc -l",
+            "search-events-jsonl-for-finalize-then-count-lines",
+        ),
+        ("rm -rf build && mkdir build", "delete-build-then-create-directory"),
+        # A repeated subject is not repeated in the name.
+        ("head -20 outputs.md && tail -20 outputs.md", "read-start-of-outputs-md-then-read-end"),
+        # Option values are not objects, and a redirection is plumbing rather than function.
+        ("head -n 20 /data/qc_report.md", "read-start-of-qc-report-md"),
+        ("echo ready > /work/out.txt 2>&1", "print-ready"),
+        ("find /data/reference -type f", "find-files-in-reference"),
+        ("find . -name '*.h5ad'", "find-files-named-h5ad"),
+        # Inline source is unnameable, so the label says what kind of run it was.
+        ("python3 -c 'import json; print(json.load(open(\"state.json\")))'", "run-inline-python"),
+        ("python -m pytest tests/unit/output_view_test.py -q", "run-pytest-output-view-test-py"),
+        ("python scripts/validate_p0_live.py --dataset reyfman.h5ad", "run-validate-p0-live-py"),
+        ("tar -xzf /models/reference.tar.gz -C models", "extract-archive-reference-tar-gz"),
+        ("git log --oneline -5", "git-log"),
+        # An unfamiliar tool keeps its own name; a non-path first operand is its subcommand.
+        ("scagent-sdk capability validate", "scagent-sdk-capability-validate"),
+        ("gnuplot plot.gp", "gnuplot-plot-gp"),
+        # A verb that expects an object loses its preposition when the command supplies none.
+        ("wc -l", "count-lines"),
+        # Nothing but preamble, and text that does not lex, both fall back to the command itself.
+        ("cd /tmp/work", "cd-work"),
+        ("grep -n 'unbalanced", "grep-n-unbalanced"),
+    ],
+)
+def test_a_bundle_is_named_for_the_function_the_command_performed(
+    command: str, label: str
+) -> None:
+    assert _shell_label(command, "Shell command completed.") == label
+
+
+def test_an_overlong_subject_is_cut_at_a_word_boundary(tmp_path: Path) -> None:
+    """A hard character cut ("...-consultation-attest") defeats the point of a readable name."""
+
+    session = AnalysisSession.create(tmp_path / "sessions", title="long label")
+    _commit_artifact(
+        session,
+        execution_id="1eadbeef-0000-0000-0000-000000000000",
+        tool_name="run_shell_command",
+        summary="Shell command completed.",
+        files=_shell_files("grep -rn 'batch_consultation_attestation_recorded' /work/events.jsonl"),
+    )
+
+    bundle = next((session.directory / "shell").iterdir())
+    assert bundle.name == "001-search-events-jsonl-for-batch-consultation-attestation-1eadbeef"
 
 
 def test_shell_run_without_a_readable_report_falls_back_to_the_summary(tmp_path: Path) -> None:
@@ -730,8 +892,10 @@ def test_shell_section_of_the_markdown_index_is_browsable(tmp_path: Path) -> Non
     assert "`grep -c finalize events.jsonl`" in markdown
     assert "`command.sh` holds the exact text that ran" in markdown
     assert "2.81s" in markdown
-    assert "shell/001-grep-c-finalize-events-jsonl-7a3d322e" in markdown
-    assert "[stdout.txt](shell/001-grep-c-finalize-events-jsonl-7a3d322e/stdout.txt)" in markdown
+    assert "shell/001-search-events-jsonl-for-finalize-7a3d322e" in markdown
+    assert (
+        "[stdout.txt](shell/001-search-events-jsonl-for-finalize-7a3d322e/stdout.txt)" in markdown
+    )
 
 
 def test_a_backtick_command_cannot_break_the_markdown_table(tmp_path: Path) -> None:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
-from scagent_sdk.runtime.observer import ToolActivity
+from scagent_sdk.runtime.observer import ToolActivity, ToolOutput
 from scagent_sdk.runtime.protocol import RuntimeMessage, RuntimeResponse
 from scagent_sdk.terminal.rendering import (
     ElapsedStatus,
@@ -58,6 +58,39 @@ def test_rich_observer_distinguishes_thinking_text_and_tool_progress() -> None:
     assert "▶ Running code..." in rendered
     assert "✓ Running code done" in rendered
     assert "Created one artifact." in rendered
+
+
+def test_committed_outputs_show_names_descriptions_paths_and_complete_index() -> None:
+    output = StringIO()
+    observer = RichRuntimeObserver(
+        Console(file=output, force_terminal=False, width=120)
+    )
+    activity = ToolActivity("plot_embedding", "Plotting embedding", "visualize-single-cell")
+
+    observer.on_tool_outputs(
+        activity,
+        (
+            ToolOutput(
+                name="embedding-grid-sample",
+                path="/sessions/run/figures/embedding-grid-sample.png",
+                media_type="image/png",
+                description="Embedding split into panels by sample",
+            ),
+            ToolOutput(
+                name="embedding",
+                path="/sessions/run/figures/embedding.png",
+                media_type="image/png",
+                description="Embedding colored by cluster",
+            ),
+        ),
+        index_path="/sessions/run/outputs.md",
+    )
+
+    rendered = output.getvalue()
+    assert "embedding-grid-sample" in rendered
+    assert "Embedding split into panels by sample" in rendered
+    assert "/sessions/run/figures/embedding.png" in rendered
+    assert "Complete named output index: /sessions/run/outputs.md" in rendered
 
 
 def test_reasoning_embedded_in_text_and_final_is_not_rendered_twice() -> None:
@@ -151,6 +184,12 @@ def test_wait_indicator_tracks_tool_execution_and_recovery() -> None:
 
     observer.on_tool_started(activity)
     assert observer._status_label == "Materializing raw counts"
+
+    status_display = observer._status_display
+    observer.on_tool_progress(activity, {"message": "epoch 12/200"})
+    assert observer._status_label == "Materializing raw counts — epoch 12/200"
+    # Progress updates mutate the live display instead of restarting the elapsed clock.
+    assert observer._status_display is status_display
 
     observer.on_tool_finished(activity, "Materialized X as raw counts.")
     assert observer._status_label == "Analyzing results"

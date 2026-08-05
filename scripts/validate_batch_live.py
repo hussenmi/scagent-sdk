@@ -1,7 +1,8 @@
 """Bounded inspect/prepare/gene-first-batch-evidence/decision acceptance on Iris.
 
-Drives the real broker through inspect -> prepare -> investigate_batch (gene-first evidence, no
-decision) -> decide_batch_handling (identity-bound decision against the current evidence id).
+Drives the real broker through inspect -> prepare -> investigate_batch (gene-first matched-
+population evidence) -> request_guidance. A substantive post-investigation decision deliberately
+requires a later real user turn and is therefore outside this non-interactive acceptance.
 """
 
 from __future__ import annotations
@@ -87,7 +88,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "evidence_id": evidence_id,
             "decision": args.decision,
-            "rationale": "Bounded acceptance: record the conservative decision here.",
+            "rationale": (
+                "Bounded acceptance: the evidence is ready and the user choice is pending."
+            ),
         },
     )
     state = session.store.state
@@ -125,7 +128,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--organism", choices=("human", "mouse"), default="human")
     parser.add_argument("--batch-key", default="sample")
     parser.add_argument("--condition-keys", nargs="*", default=[])
-    parser.add_argument("--decision", default="keep_uncorrected")
+    parser.add_argument("--decision", choices=("request_guidance",), default="request_guidance")
     parser.add_argument("--max-regions", type=int, default=20)
     parser.add_argument("--random-seed", type=int, default=0)
     return parser

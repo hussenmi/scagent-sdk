@@ -187,6 +187,170 @@ def test_decisions_and_full_rationales_are_promoted_not_truncated(tmp_path: Path
     assert "x" * 900 not in code
 
 
+def _write_artifact(session_dir: Path, execution_id: str, relative: str, body: str) -> None:
+    target = session_dir / "artifacts" / "capabilities" / execution_id / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+
+def test_custom_python_appears_verbatim_instead_of_a_call_stub(tmp_path: Path) -> None:
+    """Code the agent actually wrote is real; showing a stub in its place discards the record."""
+
+    execution_id = "c0dec0de"
+    code = "import scanpy as sc\n\nadata = sc.read_h5ad('x.h5ad')\nprint(adata.shape)\n"
+    _write_artifact(tmp_path, execution_id, "analysis.py", code)
+    history = [
+        _step(
+            execution_id=execution_id,
+            tool_name="run_analysis_code",
+            skill_id="analysis-workspace",
+            summary="Custom analysis code completed for: shape check",
+            arguments={"code": code, "purpose": "shape check"},
+            files=[
+                {"name": "analysis-code", "relative_path": "analysis.py",
+                 "media_type": "text/x-python", "size_bytes": len(code)}
+            ],
+        )
+    ]
+    history[0]["environment"] = {"name": "gpu-singlecell"}
+
+    document = _build(tmp_path, history)
+
+    cell = _sources(document, "code")[-1]
+    assert "# Custom Python, exactly as it ran in gpu-singlecell." in cell
+    assert "adata = sc.read_h5ad('x.h5ad')" in cell
+    assert "call(" not in cell
+    compile(cell.split("\n", 1)[1], "analysis.py", "exec")
+    # The same text must not also appear quoted as prose in the markdown.
+    markdown = "\n".join(_sources(document, "markdown"))
+    assert "> import scanpy" not in markdown
+    assert "code=..." not in "\n".join(_sources(document, "code"))
+
+
+def test_a_shell_command_becomes_an_executable_bash_cell(tmp_path: Path) -> None:
+    execution_id = "5he11c0d"
+    script = "#!/usr/bin/env bash\nset -o pipefail\nwc -l notes.txt\n"
+    _write_artifact(tmp_path, execution_id, "shell-command.sh", script)
+    history = [
+        _step(
+            execution_id=execution_id,
+            tool_name="run_shell_command",
+            skill_id="analysis-workspace",
+            summary="Shell command completed in 1.2s: wc -l notes.txt",
+            arguments={"command": "wc -l notes.txt"},
+            files=[
+                {"name": "shell-command", "relative_path": "shell-command.sh",
+                 "media_type": "text/x-shellscript", "size_bytes": len(script)}
+            ],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert cell.startswith("%%bash")
+    assert "wc -l notes.txt" in cell
+    assert "set -o pipefail" in cell
+
+
+def test_the_committed_artifact_wins_over_the_recorded_argument(tmp_path: Path) -> None:
+    """The artifact is what ran; an argument could have been resolved or rewritten since."""
+
+    execution_id = "a11fa11f"
+    _write_artifact(tmp_path, execution_id, "analysis.py", "print('committed')\n")
+    history = [
+        _step(
+            execution_id=execution_id,
+            tool_name="run_analysis_code",
+            skill_id="analysis-workspace",
+            arguments={"code": "print('argument')\n"},
+            files=[
+                {"name": "analysis-code", "relative_path": "analysis.py",
+                 "media_type": "text/x-python", "size_bytes": 20}
+            ],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert "print('committed')" in cell
+    assert "print('argument')" not in cell
+
+
+def test_code_is_recovered_from_the_argument_when_no_artifact_survives(tmp_path: Path) -> None:
+    history = [
+        _step(
+            execution_id="beefbeef",
+            tool_name="run_analysis_code",
+            skill_id="analysis-workspace",
+            arguments={"code": "print('from argument')\n"},
+            files=[],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert "print('from argument')" in cell
+
+
+def test_an_oversized_code_cell_is_bounded_and_says_so(tmp_path: Path) -> None:
+    execution_id = "b1gc0de0"
+    code = "x = 1\n" * 20000
+    _write_artifact(tmp_path, execution_id, "analysis.py", code)
+    history = [
+        _step(
+            execution_id=execution_id,
+            tool_name="run_analysis_code",
+            skill_id="analysis-workspace",
+            files=[
+                {"name": "analysis-code", "relative_path": "analysis.py",
+                 "media_type": "text/x-python", "size_bytes": len(code)}
+            ],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert len(cell) < len(code)
+    assert "truncated at 40,000 characters" in cell
+
+
+def test_the_recipe_artifact_is_never_mistaken_for_executed_code(tmp_path: Path) -> None:
+    """`analysis-recipe.py` is text/x-python too, but it is a replay list, not a step's code."""
+
+    execution_id = "fe7aeed8"
+    _write_artifact(tmp_path, execution_id, "analysis-recipe.py", "CAPABILITY_CALLS = []\n")
+    history = [
+        _step(
+            execution_id=execution_id,
+            tool_name="finalize_analysis",
+            skill_id=_FINALIZE,
+            arguments={"cluster_key": "leiden"},
+            files=[
+                {"name": "analysis-recipe", "relative_path": "analysis-recipe.py",
+                 "media_type": "text/x-python", "size_bytes": 22}
+            ],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert cell.startswith("call('finalize_analysis'")
+    assert "CAPABILITY_CALLS" not in cell
+
+
+def test_a_code_artifact_outside_the_session_is_refused(tmp_path: Path) -> None:
+    history = [
+        _step(
+            execution_id="e5cape00",
+            tool_name="run_analysis_code",
+            skill_id="analysis-workspace",
+            files=[
+                {"name": "analysis-code", "relative_path": "../../../../etc/passwd",
+                 "media_type": "text/x-python", "size_bytes": 10}
+            ],
+        )
+    ]
+
+    cell = _sources(_build(tmp_path, history), "code")[-1]
+    assert cell.startswith("call('run_analysis_code'")
+    assert "root:" not in cell
+
+
 def test_phase_headings_follow_the_real_order_and_mark_recurrence(tmp_path: Path) -> None:
     """Regrouping steps into phase buckets would misrepresent an iterative analysis."""
 
@@ -379,7 +543,9 @@ def test_the_intro_states_the_shape_and_that_cells_are_not_runnable(tmp_path: Pa
 
     intro = _sources(document, "markdown")[0]
     assert "43,559 cells × 33,694 genes, 29 clusters" in intro
-    assert "not a runnable pipeline" in intro
+    # The two kinds of code cell must be distinguished rather than blanket-disclaimed.
+    assert "not runnable science" in intro
+    assert "that code verbatim" in intro
     # The stub turns shift-enter into an explanation instead of a NameError.
     stub = _sources(document, "code")[0]
     assert "def call(tool, **arguments):" in stub

@@ -1,4 +1,4 @@
-"""Reconstructing the lineage forest from committed events, and the v1 -> v2 migration.
+"""Reconstructing the lineage forest from committed events and legacy-state migration.
 
 Stage 5 of ``docs/artifact-lineage-and-head-spec.md``. A schema default cannot substitute for a
 reducer: historical events carry no lineage patch, so replaying them leaves every recorded artifact
@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from scagent_sdk.contracts.state import SESSION_STATE_SCHEMA_VERSION
 from scagent_sdk.state.lineage import (
     active_head,
     ancestry,
@@ -268,7 +269,7 @@ def test_opening_a_v1_session_reconstructs_and_upgrades_it(tmp_path: Path) -> No
 
     store = SessionStore.open(root, "run_v1_000000")
 
-    assert store.state.schema_version == 2
+    assert store.state.schema_version == SESSION_STATE_SCHEMA_VERSION
     assert active_head(store.state.lineage) == "b"
     assert ancestry(store.state.lineage, "b") == ["b", "a"]
     expected_path = _artifact("b")
@@ -277,7 +278,10 @@ def test_opening_a_v1_session_reconstructs_and_upgrades_it(tmp_path: Path) -> No
         store.state.lineage, "b", merge=apply_merge_patch
     )["analysis"]["dataset_revision"]["prepared_path"] == expected_path
     # Written through, so the reconstruction is paid for once.
-    assert json.loads((store.session_dir / "state.json").read_text())["schema_version"] == 2
+    assert (
+        json.loads((store.session_dir / "state.json").read_text())["schema_version"]
+        == SESSION_STATE_SCHEMA_VERSION
+    )
 
 
 def test_moved_session_reconstructs_absolute_historical_paths_without_losing_facts(
@@ -371,7 +375,7 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     revision = first.state.revision
     second = SessionStore.open(root, "run_v1_000000")
 
-    assert second.state.schema_version == 2
+    assert second.state.schema_version == SESSION_STATE_SCHEMA_VERSION
     assert second.state.lineage == first.state.lineage
     assert second.state.revision == revision  # no second migration event
 
@@ -402,7 +406,7 @@ def test_a_session_with_no_matrix_work_migrates_to_an_empty_forest(tmp_path: Pat
     )
     store = SessionStore.open(root, "run_v1_000000")
 
-    assert store.state.schema_version == 2
+    assert store.state.schema_version == SESSION_STATE_SCHEMA_VERSION
     assert store.state.lineage["nodes"] == {}
     assert store.state.facts["dataset_contents"] == {"n": 1}
 

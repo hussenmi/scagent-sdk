@@ -12,18 +12,19 @@ from scagent_sdk.contracts.state import SessionState
 # forcing a rerun of the strengthened cluster QC before annotation or finalization.
 CLUSTER_QC_EVIDENCE_SCHEMA = 3
 
-# The gene-first batch-evidence schema. Legacy-shaped batch facts lack it and fail closed.
-BATCH_EVIDENCE_SCHEMA = 1
+# The gene-first batch-evidence schema. Legacy-shaped batch facts lack it and fail closed. Schema 2
+# added the consultation anchor, without which a decision cannot prove the user was consulted about
+# this evidence, so earlier evidence must be re-investigated.
+BATCH_EVIDENCE_SCHEMA = 2
 
 # Authorization policy version applied when a batch decision was validated. Decisions validated
 # under an older policy no longer authorize integration.
-BATCH_DECISION_POLICY_VERSION = 1
+BATCH_DECISION_POLICY_VERSION = 4
 
-# Recommendations that permit integration without an explicit override warning.
-_INTEGRATION_SUPPORTING_RECOMMENDATIONS = frozenset(
-    {"integration_supported", "integration_optional_for_confirmed_replicates"}
-)
-
+# A decision value that records the batch question as put to the user and still unanswered. It is
+# a legitimate decision to record but not a resolution, so it must not satisfy the decision floor —
+# otherwise "I need to ask the user" silently becomes the cheapest way to finalize.
+_PENDING_BATCH_DECISION = "request_guidance"
 
 @dataclass(frozen=True)
 class FloorFailure:
@@ -166,20 +167,43 @@ class FloorEvaluator:
         if floor == "batch_decision":
             evidence = self._batch_evidence(facts)
             decision = self._batch_decision(facts)
-            if (
+            bound = (
                 isinstance(decision, dict)
                 and isinstance(evidence, dict)
-                and decision.get("decision")
+                and bool(decision.get("decision"))
                 and decision.get("evidence_id") == evidence.get("evidence_id")
-                and self._batch_identities_current(facts, decision)
-            ):
+                and self._batch_decision_current(facts, decision)
+            )
+            if bound and decision.get("decision") == _PENDING_BATCH_DECISION:
+                return FloorFailure(
+                    floor,
+                    "The batch question was put to the user and is recorded as still unanswered "
+                    "(request_guidance), so batch handling is pending rather than decided.",
+                    "Ask the user how to handle the batch structure, then record their answer with "
+                    "decide_batch_handling as keep_uncorrected, integrate, or separate, passing "
+                        "user_consultation with the turn that carried their reply.",
+                )
+            resolved = bool(
+                bound
+                and (
+                    decision.get("decision") == "not_applicable"
+                    or (
+                        decision.get("decision") in ("keep_uncorrected", "integrate", "separate")
+                        and decision.get("validated") is True
+                        and decision.get("decision_policy_version")
+                        == BATCH_DECISION_POLICY_VERSION
+                        and self._user_consultation_recorded(decision)
+                    )
+                )
+            )
+            if resolved:
                 return None
             return FloorFailure(
                 floor,
                 "No explicit batch-handling decision is recorded against current batch evidence "
                 "for the active cells, counts, representation, and clustering.",
                 "Run investigate_batch, then decide_batch_handling with keep, integrate, "
-                "separate, request-guidance, or not-applicable.",
+                "separate, or not-applicable.",
             )
         if floor == "integration_authorized":
             evidence = self._batch_evidence(facts)
@@ -194,10 +218,12 @@ class FloorEvaluator:
                 # It was taken against exactly this evidence, for the current analysis identities.
                 and decision.get("evidence_id") == evidence.get("evidence_id")
                 and decision.get("integration_basis")
-                in ("documented_technical_batch", "user_authorized_comparable_replicates")
-                and self._batch_identities_current(facts, decision)
-                # When the evidence does not support integration, an explicit override is required.
-                and self._integration_override_satisfied(decision)
+                in (
+                    "documented_technical_batch",
+                    "user_authorized_integration",
+                )
+                and self._user_consultation_recorded(decision)
+                and self._batch_decision_current(facts, decision)
             ):
                 return None
             return FloorFailure(
@@ -258,6 +284,7 @@ class FloorEvaluator:
             failure for floor in floors if (failure := self.evaluate(state, floor)) is not None
         )
 
+
     @staticmethod
     def _clustering_id(facts: dict[str, Any]) -> str | None:
         return FloorEvaluator._analysis_id(facts, "clustering")
@@ -280,31 +307,118 @@ class FloorEvaluator:
         return batch.get("decision") if isinstance(batch, dict) else None
 
     @staticmethod
-    def _integration_override_satisfied(decision: dict[str, Any]) -> bool:
-        """Integration against a non-supporting recommendation needs an explicit override."""
-        recommendation = decision.get("recommendation")
-        if recommendation in _INTEGRATION_SUPPORTING_RECOMMENDATIONS:
-            return True
-        override = decision.get("override_warning")
-        return isinstance(override, str) and bool(override.strip())
+    def _user_consultation_recorded(decision: dict[str, Any]) -> bool:
+        consultation = decision.get("user_consultation")
+        return bool(
+            isinstance(consultation, dict)
+            and consultation.get("turn_id")
+            and consultation.get("question_asked")
+            and consultation.get("user_answer")
+        )
 
     @staticmethod
-    def _batch_identities_current(facts: dict[str, Any], node: dict[str, Any]) -> bool:
-        """A batch evidence/decision object is current only if the cells, counts, representation,
-        and clustering it was computed against still match the active analysis identities."""
-
+    def _identities_current(
+        facts: dict[str, Any], node: dict[str, Any], keys: tuple[tuple[str, str], ...]
+    ) -> bool:
         analysis = facts.get("analysis")
         if not isinstance(analysis, dict):
             return False
-        for fact_key, id_key in (
-            ("cell_set", "cell_set_id"),
-            ("count_representation", "count_representation_id"),
-            ("representation", "representation_id"),
-            ("clustering", "clustering_id"),
-        ):
+        for fact_key, id_key in keys:
             entry = analysis.get(fact_key)
             current = entry.get("id") if isinstance(entry, dict) else None
             recorded = node.get(id_key)
             if not current or not recorded or current != recorded:
                 return False
         return True
+
+    @classmethod
+    def _batch_identities_current(cls, facts: dict[str, Any], node: dict[str, Any]) -> bool:
+        """Batch *evidence* is a measurement of a specific representation and clustering, so it is
+        current only if all four identities — cells, counts, representation, clustering — still
+        match the active analysis."""
+
+        return cls._identities_current(
+            facts,
+            node,
+            (
+                ("cell_set", "cell_set_id"),
+                ("count_representation", "count_representation_id"),
+                ("representation", "representation_id"),
+                ("clustering", "clustering_id"),
+            ),
+        )
+
+    @classmethod
+    def _batch_decision_current(cls, facts: dict[str, Any], node: dict[str, Any]) -> bool:
+        """A batch *decision* governs how the cells and their counts are handled. Integration, and
+        the reclustering that follows it, are the *execution* of that decision — not new inputs to
+        it — so the decision is current whenever the cells and count representation it was taken
+        against are unchanged. Binding it to representation/clustering (as the evidence is bound)
+        would make honoring an 'integrate' decision immediately invalidate the decision that
+        authorized it, forcing a circular re-investigation of batch on the corrected data at
+        finalize time. Removing cells (e.g. cluster cleanup) still changes cell_set and correctly
+        stales the decision the moment it happens."""
+
+        return cls._identities_current(
+            facts,
+            node,
+            (
+                ("cell_set", "cell_set_id"),
+                ("count_representation", "count_representation_id"),
+            ),
+        )
+
+
+def render_outstanding_block(failures: tuple[FloorFailure, ...]) -> str:
+    """Render the currently unmet floors as a system-prompt section.
+
+    A floor is a state predicate, not a step in a pipeline, and there is more than one legitimate
+    order in which to satisfy one. What makes them feel like a fixed pipeline is discovering them
+    only on denial: a real session ran for two and a half hours and learned at `finalize_analysis`
+    that four separate predicates were unmet, one of them stale since a filtering step near the
+    beginning. Stating them up front costs a few lines and lets the model choose its own route.
+    """
+
+    if not failures:
+        return ""
+    lines = [
+        "## Outstanding scientific requirements",
+        "",
+        "Unmet right now, in this session. These are state predicates, not a required order: "
+        "satisfy them by whatever route the analysis actually takes, interleaved with the work "
+        "the user asked for. Nothing here is a checklist to run through before starting, and an "
+        "empty list is not permission to skip evidence. Recomputing something upstream can make "
+        "one of these stale again, and you will be told when that happens.",
+        "",
+    ]
+    for failure in failures:
+        lines.append(f"- **{failure.floor}** — {failure.reason} {failure.remediation}")
+    return "\n".join(lines)
+
+
+def render_floor_change(
+    before: frozenset[str],
+    after: tuple[FloorFailure, ...],
+) -> str:
+    """Describe what just became required or stopped being required, or return ``""``.
+
+    Reported per tool call so staleness surfaces when it is caused rather than when it blocks. The
+    silence when nothing changed is the point: this must not read as a checklist being ticked off.
+    """
+
+    now = {failure.floor: failure for failure in after}
+    newly_unmet = [floor for floor in now if floor not in before]
+    newly_met = sorted(floor for floor in before if floor not in now)
+    if not newly_unmet and not newly_met:
+        return ""
+    parts: list[str] = []
+    if newly_unmet:
+        detail = " ".join(
+            f"[{floor}] {now[floor].reason} {now[floor].remediation}" for floor in newly_unmet
+        )
+        parts.append(
+            f"This step made {len(newly_unmet)} scientific requirement(s) outstanding: {detail}"
+        )
+    if newly_met:
+        parts.append(f"No longer outstanding: {', '.join(newly_met)}.")
+    return " ".join(parts)

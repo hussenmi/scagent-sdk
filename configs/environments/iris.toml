@@ -101,3 +101,13 @@ runtime = "diffxpy"
 timeout_seconds = 7200
 gpu_required = false
 required_modules = ["diffxpy", "numpy"]
+
+# On-request package installs run on the rapids-main runtime (where custom analysis code runs)
+# but need no GPU and import nothing heavy, so this is a light no-GPU view of that runtime. Its
+# entrypoints resolve and install additive packages into the per-user overlay the broker layers
+# onto rapids-main. See docs/decisions/0010-on-request-package-installs.md.
+[capabilities.overlay-admin]
+runtime = "rapids-main"
+timeout_seconds = 1800
+gpu_required = false
+required_modules = []

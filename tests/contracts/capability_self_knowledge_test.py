@@ -48,3 +48,16 @@ def test_base_instructions_forbid_discovering_capabilities_by_searching_the_host
 
     assert "Never search the filesystem" in prompt
     assert "local-prerequisite inventory" in prompt
+
+
+def test_base_instructions_require_user_facing_scientific_explanations() -> None:
+    prompt = " ".join(BASE_PROMPT.read_text(encoding="utf-8").split())
+
+    assert "Internal reasoning is not a substitute for user-facing explanation" in prompt
+    assert "Before it runs" in prompt
+    assert "After it returns" in prompt
+    assert "When it fails" in prompt
+    assert "At a milestone" in prompt
+    assert "Do not expose private chain-of-thought" in prompt
+    assert "evidence → interpretation → decision" in prompt
+    assert "account for every unit that receives a decision" in prompt

@@ -26,16 +26,34 @@ def _load_handler(source: Path, function_name: str) -> Any:
 
 async def _run(args: argparse.Namespace) -> None:
     payload = json.loads(args.input.read_text(encoding="utf-8"))
+    session_dir = Path(payload["context"]["session_dir"])
+    artifact_relative_dir = payload["context"].get(
+        "artifact_relative_dir",
+        "artifacts/capabilities/" + payload["context"]["execution_id"],
+    )
+
+    def artifact_relative_path(relative_path: str) -> str:
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("capability artifact path must stay inside its execution directory")
+        return str(Path(artifact_relative_dir) / relative)
+
     context = SimpleNamespace(
         scientific_session_id=payload["context"]["scientific_session_id"],
-        session_dir=Path(payload["context"]["session_dir"]),
+        session_dir=session_dir,
         staging_dir=Path(payload["context"]["staging_dir"]),
         skill_id=payload["context"]["skill_id"],
         tool_name=payload["context"]["tool_name"],
         execution_id=payload["context"]["execution_id"],
+        artifact_relative_dir=artifact_relative_dir,
+        artifact_relative_path=artifact_relative_path,
+        artifact_absolute_path=lambda relative_path: (
+            session_dir / artifact_relative_path(relative_path)
+        ),
         state_revision=payload["context"]["state_revision"],
         state_facts=payload["context"]["state_facts"],
         state_lineage=payload["context"].get("state_lineage", {}),
+        user_turns=tuple(payload["context"].get("user_turns", ())),
     )
     handler = _load_handler(args.entrypoint, args.function)
     value = handler(payload["arguments"], context)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from scagent_sdk.capabilities.assembly import CapabilityAssembler
 from scagent_sdk.capabilities.registry import CapabilityRegistry
+from scagent_sdk.runtime.observer import NullRuntimeObserver, ToolActivity, ToolOutput
 from scagent_sdk.session import AnalysisSession
 
 
@@ -31,6 +32,20 @@ def create_sdk_mcp_server(name, *, version, tools):
     return {"name": name, "version": version, "tools": tools}
 
 
+class OutputObserver(NullRuntimeObserver):
+    def __init__(self) -> None:
+        self.outputs: list[tuple[ToolActivity, tuple[ToolOutput, ...], str]] = []
+
+    def on_tool_outputs(
+        self,
+        activity: ToolActivity,
+        outputs: tuple[ToolOutput, ...],
+        *,
+        index_path: str,
+    ) -> None:
+        self.outputs.append((activity, outputs, index_path))
+
+
 def test_assembler_builds_allowlisted_tool_and_committing_post_hook(tmp_path: Path) -> None:
     sdk = SimpleNamespace(
         tool=tool,
@@ -39,7 +54,13 @@ def test_assembler_builds_allowlisted_tool_and_committing_post_hook(tmp_path: Pa
     )
     skills_root = Path(__file__).parents[2] / ".claude" / "skills"
     session = AnalysisSession.create(tmp_path / "sessions", title="assembly")
-    assembler = CapabilityAssembler(CapabilityRegistry(skills_root), session, sdk_module=sdk)
+    observer = OutputObserver()
+    assembler = CapabilityAssembler(
+        CapabilityRegistry(skills_root),
+        session,
+        sdk_module=sdk,
+        observer=observer,
+    )
     extensions = assembler.assemble()
     dataset = tmp_path / "matrix.mtx"
     dataset.write_text("%%MatrixMarket matrix coordinate integer general\n", encoding="utf-8")
@@ -55,10 +76,43 @@ def test_assembler_builds_allowlisted_tool_and_committing_post_hook(tmp_path: Pa
     assert "adopt_untracked" in transforming.input_schema["properties"]
     registered = extensions.mcp_servers["inspect_dataset"]["tools"][0]
     response = asyncio.run(registered.handler({"path": str(dataset)}))
-    hook = extensions.hooks["PostToolUse"][0].hooks[0]
+    hook = next(
+        item
+        for item in extensions.hooks["PostToolUse"]
+        if item.matcher == "mcp__inspect_dataset__inspect_dataset"
+    ).hooks[0]
     asyncio.run(hook({"tool_response": response}, "use-1", {}))
 
     assert session.store.state.facts["dataset"]["format"]["byte_signature"] == "matrix-market"
+    # Dataset inspection itself has no file output. Add a file to that exact committed record to
+    # exercise the post-commit reporting contract with a path that truly exists.
+    execution_id = response["structuredContent"]["scagent_execution_id"]
+    artifact_root = session.directory / session.store.state.artifacts[execution_id]["path"]
+    (artifact_root / "inventory.md").write_text("inventory", encoding="utf-8")
+    session.store.record(
+        "test.output_added",
+        payload={},
+        state_patch={
+            "artifacts": {
+                execution_id: {
+                    "files": [
+                        {
+                            "name": "dataset-inventory",
+                            "relative_path": "inventory.md",
+                            "media_type": "text/markdown",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    asyncio.run(hook({"tool_response": response}, "use-1", {}))
+
+    assert observer.outputs
+    activity, outputs, index_path = observer.outputs[0]
+    assert activity.tool_name == "inspect_dataset"
+    assert all(Path(output.path).is_file() for output in outputs)
+    assert index_path == str((session.directory / "outputs.md").resolve())
 
 
 def test_assembler_denies_floor_bound_tool_until_state_satisfies_floor(tmp_path: Path) -> None:
@@ -156,3 +210,52 @@ def test_assembler_grants_only_the_skill_builtin_and_publishes_skills_as_a_plugi
     assert (Path(plugin["path"]) / ".claude-plugin" / "plugin.json").is_file()
     # The skill allowlist still gates which skills may be loaded.
     assert "celltypist-annotation" in (extensions.skills or ())
+
+
+def test_outstanding_requirements_are_stated_up_front_and_changes_are_reported(
+    tmp_path: Path,
+) -> None:
+    """A floor must never be a surprise at the end of a two-hour analysis.
+
+    The session that motivated this ran for two and a half hours and discovered at
+    `finalize_analysis` that four predicates were unmet — one of them stale since an early
+    filtering step. The set is now declared at bind time, and each committed step reports what it
+    newly made outstanding or satisfied.
+    """
+
+    sdk = SimpleNamespace(
+        tool=tool,
+        HookMatcher=HookMatcher,
+        create_sdk_mcp_server=create_sdk_mcp_server,
+    )
+    skills_root = Path(__file__).parents[2] / ".claude" / "skills"
+    session = AnalysisSession.create(tmp_path / "sessions", title="outstanding")
+    assembler = CapabilityAssembler(
+        CapabilityRegistry(skills_root), session, sdk_module=sdk
+    )
+    extensions = assembler.assemble()
+
+    assert "## Outstanding scientific requirements" in extensions.system_prompt_suffix
+    assert "dataset_identity" in extensions.system_prompt_suffix
+    # Declared as predicates to satisfy by any route, not as a pipeline to execute.
+    assert "not a required order" in extensions.system_prompt_suffix
+
+    dataset = tmp_path / "matrix.mtx"
+    dataset.write_text("%%MatrixMarket matrix coordinate integer general\n", encoding="utf-8")
+    registered = extensions.mcp_servers["inspect_dataset"]["tools"][0]
+    response = asyncio.run(registered.handler({"path": str(dataset)}))
+    hook = next(
+        item
+        for item in extensions.hooks["PostToolUse"]
+        if item.matcher == "mcp__inspect_dataset__inspect_dataset"
+    ).hooks[0]
+
+    result = asyncio.run(hook({"tool_response": response}, "use-1", {}))
+
+    # Establishing identity satisfied a requirement, and the model is told so where it happened.
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert "No longer outstanding" in context
+    assert "dataset_identity" in context
+
+    # Nothing changed on a second commit of the same execution, so the hook stays silent.
+    assert asyncio.run(hook({"tool_response": response}, "use-1", {})) == {}

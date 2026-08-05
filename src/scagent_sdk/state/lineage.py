@@ -60,6 +60,7 @@ FACT_ROOT_SCOPES: dict[str, Scope] = {
     "custom_analysis": "session",
     "dataset": "session",
     "dataset_contents": "session",
+    "environment_overlay": "session",
     "gene_conversion": "session",
     "reference_runs": "session",
 }
@@ -383,7 +384,8 @@ def _historical_node_for_path(
     Live dispatch deliberately accepts only a canonical path match. Historical events, however,
     recorded absolute paths rooted at the session's location at execution time. After a backup is
     restored elsewhere those paths are stale even though the executor-owned
-    ``artifacts/capabilities/<execution_id>/...`` identity is unchanged.
+    ``artifacts/capabilities/<action>--<execution_id>/...`` identity is unchanged. Legacy
+    UUID-only directories remain accepted.
 
     Try the strict live rule first, then match the complete executor-owned artifact tail. This
     fallback is migration-only: it cannot weaken live input validation, and requiring the known
@@ -405,8 +407,11 @@ def _historical_node_for_path(
         if not isinstance(candidate, str) or not candidate:
             continue
         relative = candidate.replace("\\", "/").lstrip("./").rstrip("/")
-        owned_prefix = f"artifacts/capabilities/{execution_id}/"
-        if not relative.startswith(owned_prefix):
+        parts = relative.split("/")
+        if len(parts) < 4 or parts[:2] != ["artifacts", "capabilities"]:
+            continue
+        directory = parts[2]
+        if directory != str(execution_id) and not directory.endswith(f"--{execution_id}"):
             continue
         if normalized == relative or normalized.endswith("/" + relative):
             matches.append(str(execution_id))

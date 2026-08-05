@@ -21,6 +21,10 @@ class SessionIdentityError(SessionFormatError):
     """Persisted files disagree about which scientific session they belong to."""
 
 
+class RetentionError(ScagentSDKError):
+    """A retention classification or filesystem operation was refused safely."""
+
+
 class ModelProfileError(ScagentSDKError):
     """A model profile is missing required or internally consistent configuration."""
 

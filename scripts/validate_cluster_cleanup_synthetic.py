@@ -56,12 +56,19 @@ def _build(seed: int = 0) -> ad.AnnData:
 
     # Junk cluster: high MT, high ribo, and identity/filler genes drawn as INDEPENDENT moderate
     # noise (no shared factor) so their gene-gene covariance is unstructured.
+    #
+    # `size=n_junk` is load-bearing. Without it `rng.poisson(20)` returns a SCALAR, which broadcasts
+    # one draw across all 150 cells and makes every gene constant within the cluster. The covariance
+    # check then sees zero variance, np.corrcoef returns NaN, and "unstructured" is asserted from
+    # undefined evidence rather than from the independent noise this fixture means to inject -- so
+    # the acceptance passed while testing nothing about covariance.
     for g in mt:
-        counts[n_clean:, gi[g]] = rng.poisson(20)  # dominant MT -> high MT fraction
+        counts[n_clean:, gi[g]] = rng.poisson(20, size=n_junk)  # dominant MT -> high MT fraction
     for g in ribo:
-        counts[n_clean:, gi[g]] = rng.poisson(10)
+        counts[n_clean:, gi[g]] = rng.poisson(10, size=n_junk)
     for g in identity + filler:
-        counts[n_clean:, gi[g]] = rng.poisson(2.0)  # independent -> unstructured covariance
+        # independent -> unstructured covariance
+        counts[n_clean:, gi[g]] = rng.poisson(2.0, size=n_junk)
 
     adata = ad.AnnData(X=counts.astype(np.float32))
     adata.obs_names = [f"cell{i}" for i in range(adata.n_obs)]

@@ -29,10 +29,24 @@ clusters, and Scrublet enrichment. Doublet enrichment nominates review; it never
 or proves a coherent state is artifactual. `attested` means the checks ran for the current
 identities — not that every cluster is biologically valid.
 
-The capability saves a per-cluster metric boxplot (library size and genes per cell on log axes,
-metric-flagged clusters in red), a cluster/QC UMAP, a per-cluster highlight grid, and one
-covariance heatmap for every eligible cluster. Inspect all of them, including heatmaps not
-attached inline, then call `review_cluster_qc`. The highlight grid is where a per-cluster
+The capability saves a per-cluster metric boxplot (library size and genes per cell as log10 values,
+metric-flagged clusters in red and named beneath the figure), a cluster/QC UMAP, a per-cluster
+highlight grid, and one covariance heatmap for every eligible cluster, each titled with its
+clustering, cluster, gene and cell counts, and `mean_abs_corr`. Inspect all of them, including
+heatmaps not attached inline, then call `review_cluster_qc`. Name each required figure in
+`reviewed_artifacts`; the file name alone is enough, so `cluster-qc-umap.png` matches. Any figure
+the runtime reports as *not attached* must be opened with `inspect-media` before the review.
+
+The covariance heatmaps deliberately do **not** print the structure verdict. Read the pattern:
+red blocks along the diagonal are genes switching on together, a real transcriptional program; an
+even pale wash is genes varying independently, which is what noise and doublet mixtures look like.
+Coherent clusters are rendered too, on purpose — they are the contrast that makes an incoherent one
+obvious. State the structure you actually see rather than repeating `mean_abs_corr`.
+
+It also writes a plain-language `README.md` beside those files that explains what the three checks
+are, what they found on this dataset, and how to read every file in the folder. That is written
+automatically from the decision table — you do not author or update it — and it exists for a human
+reading the session directory later, so do not restate it back to the user as your own analysis. The highlight grid is where a per-cluster
 judgement is actually made: the overlaid UMAP cannot separate thirty-plus colors, so use the grid
 to see whether a flagged cluster is one coherent region or debris scattered across the embedding. The review must cover every returned visual artifact and every cluster marked
 for review. A `keep` rationale resolves a warning; remove/merge/split/recluster/defer remains an

@@ -15,6 +15,7 @@ from scagent_sdk.capabilities.manifest import CapabilityTool
 from scagent_sdk.capabilities.registry import SkillPackage
 from scagent_sdk.capabilities.results import CapabilityContext
 from scagent_sdk.errors import CapabilityExecutionError, CapabilityInterrupted
+from scagent_sdk.execution.overlay import apply_to_worker_environment
 from scagent_sdk.execution.profile import (
     EnvironmentProfile,
     EnvironmentRegistry,
@@ -399,15 +400,21 @@ print(json.dumps({{
                 "skill_id": context.skill_id,
                 "tool_name": context.tool_name,
                 "execution_id": context.execution_id,
+                "artifact_relative_dir": context.artifact_relative_dir,
                 "state_revision": context.state_revision,
                 "state_facts": context.state_facts,
                 "state_lineage": context.state_lineage,
+                "user_turns": list(context.user_turns),
             },
         }
         input_path.write_text(
             json.dumps(payload, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
         )
         environment = profile.build_environment()
+        # Layer this user's persistent package overlay for the runtime on top of the immutable
+        # base. Done here in execute (never in the health probe) so a probe still measures a clean
+        # base, and recorded in provenance so a result names any added packages that were on path.
+        overlay_provenance = apply_to_worker_environment(environment, profile.runtime)
         pinned_devices: list[int] = []
         if profile.gpu_required:
             probe_result = self._probe_results.get(profile.name, {})
@@ -484,5 +491,6 @@ print(json.dumps({{
                 "module_versions": probe.get("module_versions", {}),
                 "cuda_runtime_version": probe.get("cuda_runtime_version"),
                 "environment_isolated": True,
+                "overlay": overlay_provenance,
             },
         )

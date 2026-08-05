@@ -284,24 +284,81 @@ def _render_markdown(sheet: dict[str, Any]) -> str:
     shape = sheet["shape"]
     raw = sheet["raw"]
     raw_line = f"present, {raw.get('n_vars')} genes" if raw["present"] else "none"
+    signals = sheet["matrix_signals"]
+    x_facts = sheet["X"]
+    if signals.get("x_all_integer_sample") and not signals.get("x_has_negative_sample"):
+        matrix_interpretation = (
+            "The sampled values in `X` are non-negative integers, so `X` looks like raw counts."
+        )
+    elif signals.get("log1p_in_uns"):
+        matrix_interpretation = (
+            "The file records a log1p transformation, so `X` appears to be processed expression "
+            "rather than untouched counts."
+        )
+    else:
+        matrix_interpretation = (
+            "The available signals do not establish whether `X` contains raw counts or processed "
+            "expression; confirm this before normalization or count-based modeling."
+        )
+    sample_words = ("sample", "donor", "patient", "subject", "batch", "library", "lane")
+    sample_columns = [
+        (name, facts)
+        for name, facts in sheet["obs_columns"].items()
+        if any(word in name.casefold() for word in sample_words)
+        and 1 < int(facts.get("n_unique", 0)) < shape["n_obs"]
+    ]
+    if sample_columns:
+        grouped = ", ".join(
+            f"`{name}` ({int(facts['n_unique'])} groups)" for name, facts in sample_columns
+        )
+        sample_interpretation = (
+            f"The cell metadata contains possible sample or batch columns: {grouped}. "
+            "These should be discussed before deciding whether to integrate."
+        )
+    else:
+        sample_interpretation = (
+            "No obvious multi-sample column was identified from the cell-metadata names."
+        )
+    representation_interpretation = (
+        "No embedding or clustering is stored, so dimensionality reduction and clustering still "
+        "need to be computed."
+        if not sheet["obsm_keys"]
+        else "The file already contains embeddings that should be identified before recomputing."
+    )
+    count_storage = (
+        "A separate raw-count representation is available."
+        if raw["present"] or sheet["layers"]
+        else "No separate `raw` matrix or layer is present, so preserve `X` as counts before "
+        "normalizing if the count interpretation is confirmed."
+    )
     lines = [
         f"# Dataset contents: {Path(sheet['path']).name}",
         "",
-        f"- Shape: **{shape['n_obs']:,} cells × {shape['n_vars']:,} genes**"
-        + (" (read backed)" if sheet.get("backed") else ""),
-        f"- X: {sheet['X']}",
-        f"- Layers: {sheet['layers'] or 'none'}",
-        f"- raw: {raw_line}",
-        f"- Embeddings (obsm): {sheet['obsm_keys'] or 'none'}",
-        f"- uns keys: {sheet['uns_keys'] or 'none'}",
-        f"- Gene-identifier signals: {sheet['gene_namespace']}",
-        f"- Gene symbols (MT/ribo, mapping): {sheet['gene_symbols']}",
-        f"- Normalization signals: {sheet['matrix_signals']}",
+        "## Summary",
         "",
-        "## obs columns",
+        f"This file contains **{shape['n_obs']:,} cells and {shape['n_vars']:,} genes**."
+        + (
+            " It was inspected without loading the full matrix into memory."
+            if sheet.get("backed")
+            else ""
+        ),
         "",
-        "| column | dtype | n_unique | unique_fraction | examples / stats |",
-        "|---|---|---:|---:|---|",
+        f"- {matrix_interpretation}",
+        f"- {count_storage}",
+        f"- {sample_interpretation}",
+        f"- {representation_interpretation}",
+        "",
+        "## What this means for the analysis",
+        "",
+        "The immediate decisions are whether `X` is the count matrix to preserve, which metadata "
+        "column identifies independent samples, and whether those samples should be investigated "
+        "for sample-associated structure before any integration. This inspection describes the "
+        "file; it does not make those scientific choices automatically.",
+        "",
+        "## Cell metadata",
+        "",
+        "| Column | Type | Distinct values | Examples or range |",
+        "|---|---|---:|---|",
     ]
     for name, facts in sheet["obs_columns"].items():
         if "top_values" in facts:
@@ -313,10 +370,33 @@ def _render_markdown(sheet: dict[str, Any]) -> str:
         else:
             summary = ""
         lines.append(
-            f"| {name} | {facts['dtype']} | {facts['n_unique']} | "
-            f"{facts.get('unique_fraction')} | {summary} |"
+            f"| `{name}` | {facts['dtype']} | {facts['n_unique']} | {summary} |"
         )
-    lines.extend(["", f"Example gene names: {sheet['var_names_examples']}", ""])
+    lines.extend(
+        [
+            "",
+            "## Gene identifiers",
+            "",
+            f"The gene names appear to come from `{sheet['gene_symbols'].get('symbol_source')}`. "
+            f"The inspection found {sheet['gene_symbols'].get('mt_genes', 0)} mitochondrial and "
+            f"{sheet['gene_symbols'].get('ribo_genes', 0)} ribosomal genes, which are needed for "
+            "standard single-cell QC.",
+            "",
+            f"Examples: {', '.join(map(str, sheet['var_names_examples']))}.",
+            "",
+            "## Technical record",
+            "",
+            f"- `X`: {x_facts}",
+            f"- Layers: {sheet['layers'] or 'none'}",
+            f"- `raw`: {raw_line}",
+            f"- Embeddings (`obsm`): {sheet['obsm_keys'] or 'none'}",
+            f"- Other stored metadata (`uns`): {sheet['uns_keys'] or 'none'}",
+            f"- Normalization signals: {signals}",
+            "",
+            "The complete machine-readable inspection is in `dataset-contents.json`.",
+            "",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 

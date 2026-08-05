@@ -29,7 +29,9 @@ def test_registry_discovers_and_loads_executable_project_skill() -> None:
         "finalize-analysis",
         "inspect-dataset",
         "inspect-media",
+        "manage-environment",
         "marker-annotation",
+        "query-analysis-state",
         "research-literature",
         "research-web",
         "scimilarity-annotation",
@@ -44,7 +46,7 @@ def test_registry_discovers_and_loads_executable_project_skill() -> None:
     assert tool.name == "inspect_dataset"
     assert callable(package.load_handler(tool))
     skills = CapabilityRegistry(root).skills()
-    assert len(skills) == 23
+    assert len(skills) == 25
     assert {skill.name for skill in skills if not skill.executable} == {"orchestrate-single-cell"}
 
 

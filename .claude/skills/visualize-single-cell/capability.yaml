@@ -1,7 +1,7 @@
 schema_version: 1
 skill:
   id: visualize-single-cell
-  version: "0.3.0"
+  version: "0.4.0"
   description: Deterministic single-cell figure sets for QC, embeddings, composition, label agreement, and markers, with log-scaled heavy-tailed metrics and per-category highlight grids.
 tools:
   - name: plot_qc_distributions

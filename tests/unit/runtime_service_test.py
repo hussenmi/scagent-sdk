@@ -68,6 +68,7 @@ def test_runtime_turn_binds_sdk_session_and_persists_transcript_events(tmp_path:
     assert response.final_text == "done"
     assert backend.requests[0].resume_session_id is None
     assert "New user request:\nContinue analysis" in backend.requests[0].prompt
+    assert "ground claims about prior work" in backend.requests[0].prompt
     assert session.store.state.runtime["active"]["runtime_session_id"] == "sdk-new"
     assert session.store.state.runtime["active"]["model_profile_fingerprint"] == profile.fingerprint
     kinds = [event.kind for event in session.store.events()]
@@ -227,6 +228,7 @@ class SequentialBackend:
 class RecordingObserver(NullRuntimeObserver):
     def __init__(self) -> None:
         self.rollovers: list[dict[str, object]] = []
+        self.consistency_warnings: list[tuple[str, ...]] = []
 
     def on_context_rollover(
         self,
@@ -242,6 +244,9 @@ class RecordingObserver(NullRuntimeObserver):
                 "context_window_tokens": context_window_tokens,
             }
         )
+
+    def on_runtime_consistency_warning(self, warnings: tuple[str, ...]) -> None:
+        self.consistency_warnings.append(warnings)
 
 
 def _bind_exact(session: AnalysisSession, profile: ModelProfile) -> None:
@@ -269,6 +274,18 @@ def test_preflight_rollover_reconstructs_without_losing_scientific_state(
             "artifacts": {"umap": {"path": "artifacts/umap.png", "summary": "UMAP"}},
         },
     )
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "stale-turn", "user_prompt": "Did scVI run?"},
+        actor="user",
+    )
+    session.store.record(
+        "runtime.turn_completed",
+        payload={
+            "turn_id": "stale-turn",
+            "response": {"final_text": "Stale handoff: scVI has not run yet."},
+        },
+    )
     _bind_exact(session, profile)
     before = session.store.state.to_dict()
     backend = SequentialBackend(
@@ -292,7 +309,7 @@ def test_preflight_rollover_reconstructs_without_losing_scientific_state(
     )
 
     response = asyncio.run(
-        service.run_turn(session, user_prompt="continue annotation", profile=profile, cwd=tmp_path)
+        service.run_turn(session, user_prompt="sure", profile=profile, cwd=tmp_path)
     )
 
     assert response.runtime_session_id == "sdk-reconstructed"
@@ -301,6 +318,13 @@ def test_preflight_rollover_reconstructs_without_losing_scientific_state(
     assert '"clusters"' in backend.requests[1].prompt
     assert '"normalization"' in backend.requests[1].prompt
     assert "artifacts/umap.png" in backend.requests[1].prompt
+    assert "automatic mid-turn context rollover" in backend.requests[1].prompt
+    assert "Initiating user message (intent only; not a new reply):\nsure" in (
+        backend.requests[1].prompt
+    )
+    assert "New user request:" not in backend.requests[1].prompt
+    assert "recent_turn_handoff" not in backend.requests[1].prompt
+    assert "Stale handoff" not in backend.requests[1].prompt
     after = session.store.state.to_dict()
     assert after["facts"] == before["facts"]
     assert after["decisions"] == before["decisions"]
@@ -407,4 +431,78 @@ def test_subsequent_exact_turn_uses_checkpoint_reference_not_full_state_dump(
     assert "marker evidence" in backend.requests[0].prompt
     assert "marker evidence" not in backend.requests[1].prompt
     assert "authoritative_state" in backend.requests[1].prompt
+    assert "Ground every answer and every use of prior analysis information" in (
+        backend.requests[1].prompt
+    )
     assert len(backend.requests[1].prompt) < len(backend.requests[0].prompt)
+
+
+def test_false_completion_claim_is_corrected_and_recorded(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="Not finalized")
+    claimed = RuntimeResponse(
+        runtime_session_id="sdk-new",
+        messages=(),
+        final_text=(
+            "Final artifacts:\n\n"
+            "- reports/final-analysis-report.md\n"
+            "- code/analysis-recipe.py\n\n"
+            "The session is complete."
+        ),
+        stop_reason="end_turn",
+        is_error=False,
+        subtype="success",
+    )
+    observer = RecordingObserver()
+
+    response = asyncio.run(
+        AgentRuntimeService(FakeBackend(claimed), observer=observer).run_turn(
+            session,
+            user_prompt="continue",
+            profile=_profile(tmp_path),
+            cwd=tmp_path,
+        )
+    )
+
+    assert "Completion correction" in response.final_text
+    assert "not finalized" in response.final_text
+    assert "reports/final-analysis-report.md" in response.final_text
+    warning = next(
+        event
+        for event in session.store.events()
+        if event.kind == "runtime.response_consistency_warning"
+    )
+    assert warning.payload["warnings"]
+    assert observer.consistency_warnings
+
+
+def test_completion_claim_is_allowed_after_durable_finalization(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path / "sessions", title="Finalized")
+    session.checkpoint_facts(
+        {"finalization": {"status": "complete"}},
+        reason="finalize_analysis succeeded",
+    )
+    claimed = RuntimeResponse(
+        runtime_session_id="sdk-new",
+        messages=(),
+        final_text="The analysis is complete.",
+        stop_reason="end_turn",
+        is_error=False,
+        subtype="success",
+    )
+    observer = RecordingObserver()
+
+    response = asyncio.run(
+        AgentRuntimeService(FakeBackend(claimed), observer=observer).run_turn(
+            session,
+            user_prompt="finish",
+            profile=_profile(tmp_path),
+            cwd=tmp_path,
+        )
+    )
+
+    assert response.final_text == "The analysis is complete."
+    assert not observer.consistency_warnings
+    assert not any(
+        event.kind == "runtime.response_consistency_warning"
+        for event in session.store.events()
+    )

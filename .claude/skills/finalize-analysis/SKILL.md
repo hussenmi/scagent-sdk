@@ -22,6 +22,10 @@ ordered capability-call recipe into the session `code/` view.
 
 Finalization emits two surfaces over the same provenance: `reports/final-analysis-report.md` is the
 narrative findings and caveats, and `code/analysis-recipe.py` is the machine replay list.
+It also reports the exact absolute paths of the final H5AD, label table, report, recipe, final
+annotation plots, and the session `outputs.md` index. Describe each final plot in plain language.
+Do not claim any of these exists unless this capability returned it successfully and durable
+`facts.finalization.status` is `complete`.
 
 It deliberately does **not** emit a notebook. A readable step-by-step walkthrough is the separate
 `analysis-notebook` capability, requestable at any point and rebuildable as the analysis grows —

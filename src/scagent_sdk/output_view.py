@@ -4,9 +4,16 @@ Capability artifacts remain authoritative under ``artifacts/capabilities/<execut
 This module builds a disposable review surface from those records using relative symlinks, so
 large scientific files are never copied merely to make a session easier to navigate.
 
-Most categories project one file to one link. Shell runs instead project as a bundle directory
-per execution -- ``shell/003-tail-5-events-jsonl-f513a638/{command,stdout,stderr,run}`` -- because
-a command is only interpretable together with the output it produced.
+Most categories project one file to one link, named ``<artifact-name>--<execution-short-id>`` so
+the descriptive part of the name is what a reader sees first. Naming a projection usefully is
+therefore the producing skill's job: when a tool can emit the same kind of artifact for different
+subjects, its artifact names must carry the subject (the embedding and the column it is coloured
+by, the cluster key and resolution) or the projection cannot describe the file either.
+
+Shell runs instead project as a bundle directory per execution --
+``shell/003-read-end-of-events-jsonl-f513a638/{command,stdout,stderr,run}`` -- because a command is
+only interpretable together with the output it produced. The bundle is named for the function the
+command performed rather than for its text, so a listing reads as what the session did.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -68,12 +76,106 @@ _SHELL_SUFFIXES = frozenset({".sh", ".bash"})
 _JSON_MEDIA_TYPES = frozenset({"application/json", "text/json"})
 # A shell run report is a handful of scalars; anything larger is not the report this expects.
 _SHELL_REPORT_MAX_BYTES = 256 * 1024
-_SHELL_LABEL_MAXLEN = 40
+# A label describes a function ("search-evaluate-py-for-artifact-relative-path"), which needs more
+# room than an abbreviated command did.
+_SHELL_LABEL_MAXLEN = 56
+_SHELL_OBJECT_MAXLEN = 32
 _SHELL_COMMAND_CELL_MAXLEN = 120
 # Reading order within a bundle: what ran, what it printed, then how it ran.
 _SHELL_MEMBER_ORDER = ("command", "stdout", "stderr", "run")
 _PROTECTED_DIRECTORIES = frozenset({"data/intermediates"})
 _ABSOLUTE_PATH = re.compile(r"(?<![:/\w.])/(?:[\w.@%+=~-]+/)+([\w.@%+=~-]+)?")
+# ``shlex`` with ``punctuation_chars`` emits these as tokens of their own, which is what lets one
+# pass both tokenize a command and cut it into the steps it performs.
+_SHELL_SEPARATORS = frozenset({"&&", "||", "|", "|&", ";", "&", "(", ")", "{", "}"})
+_SHELL_REDIRECTIONS = frozenset({">", ">>", ">|", ">&", "&>", "&>>", "<", "<<", "<<<", "<&"})
+# Commands that only position a shell. Naming a run after one of these describes nothing, so a
+# leading ``cd``/``source`` clause is skipped in favour of the step that did the work.
+_SHELL_PREAMBLE_HEADS = frozenset(
+    {"cd", "pushd", "popd", "set", "source", ".", "export", "unset", "true", ":", "clear"}
+)
+# What each command does, in the reader's terms rather than the shell's. A verb ending in a
+# preposition expects an object; when the command has none, the preposition is dropped.
+_SHELL_VERBS = {
+    "awk": "extract-from",
+    "basename": "name-of",
+    "bat": "read",
+    "cat": "read",
+    "chmod": "set-permissions-on",
+    "chown": "set-owner-of",
+    "cmp": "compare",
+    "cp": "copy",
+    "cut": "extract-columns-from",
+    "df": "check-free-space",
+    "diff": "compare",
+    "du": "measure-size-of",
+    "echo": "print",
+    "file": "identify",
+    "find": "find-files-in",
+    "gunzip": "decompress",
+    "gzip": "compress",
+    "head": "read-start-of",
+    "jq": "query-json-in",
+    "kill": "stop-process",
+    "less": "read",
+    "ln": "link",
+    "ls": "list",
+    "md5sum": "checksum",
+    "mkdir": "create-directory",
+    "more": "read",
+    "mv": "move",
+    "mypy": "type-check",
+    "nvidia-smi": "check-gpus",
+    "printf": "print",
+    "ps": "list-processes",
+    "pytest": "run-tests",
+    "rm": "delete",
+    "rmdir": "remove-directory",
+    "ruff": "lint",
+    # Without an in-place flag a stream editor prints selected or transformed lines.
+    "sed": "extract-from",
+    "sha1sum": "checksum",
+    "sha256sum": "checksum",
+    "shasum": "checksum",
+    "sort": "sort",
+    "stat": "inspect",
+    "tail": "read-end-of",
+    "touch": "create",
+    "tr": "translate-characters-in",
+    "unzip": "decompress",
+    "uniq": "deduplicate",
+    "wc": "count-lines-in",
+    "wget": "download",
+    "which": "locate-command",
+    "zcat": "decompress",
+}
+_SHELL_SEARCH_HEADS = frozenset({"ack", "ag", "egrep", "fgrep", "grep", "rg", "ugrep"})
+_SHELL_STREAM_EDIT_HEADS = frozenset({"awk", "perl", "sed"})
+_SHELL_PYTHON_HEADS = frozenset({"ipython", "python", "python2", "python3"})
+_SHELL_IN_PLACE_FLAGS = frozenset({"-i", "-pi", "-ip", "--in-place"})
+_SHELL_PREPOSITIONS = frozenset({"of", "in", "on", "from", "for", "to", "named"})
+# Options whose value is the interesting part of the command (the pattern searched for, the name
+# looked for) rather than something the command acted on. Deliberately short: a flag wrongly listed
+# here swallows a real operand, so only flags whose value is never a subject belong.
+_SHELL_VALUE_FLAGS = frozenset(
+    {
+        "--exclude",
+        "--exclude-dir",
+        "--expression",
+        "--file",
+        "--include",
+        "--max-count",
+        "--regexp",
+        "-e",
+        "-f",
+        "-iname",
+        "-m",
+        "-name",
+        "-path",
+    }
+)
+_SHELL_PATTERN_FLAGS = ("-e", "--regexp", "--expression", "-f", "--file")
+_SHELL_RUFF_VERBS = {"check": "lint", "format": "format-code"}
 
 
 def _slugify(text: str, *, maxlen: int = 64) -> str:
@@ -130,25 +232,247 @@ def _compress_command_paths(command: str) -> str:
     return _ABSOLUTE_PATH.sub(replace, command)
 
 
-def _shell_label(command: str, fallback: str) -> str:
-    """Name a shell run after the command itself, collapsed onto one readable line.
+def _trim_slug(text: str, maxlen: int) -> str:
+    """Slugify, and when the budget is exceeded cut at a word boundary.
 
-    Only the fallback drops a leading clause at ``:``, because a summary carries boilerplate that
-    would otherwise consume the whole label budget ("Shell command completed in 2.83s: ls"). A
-    command is used verbatim -- its own colons are part of what ran.
+    A hard character cut leaves a reader guessing ("...-artifact-relat"), which defeats the point
+    of a descriptive name; dropping the last whole word does not.
     """
 
-    for candidate, strip_prefix in ((command, False), (fallback, True)):
-        text = candidate.split(":", 1)[1] if strip_prefix and ":" in candidate else candidate
-        collapsed = " ".join(text.split())
-        if not collapsed:
+    slug = _slugify(text, maxlen=max(len(text), 1))
+    if len(slug) <= maxlen:
+        return slug
+    cut = slug[:maxlen]
+    boundary = cut.rfind("-")
+    return (cut[:boundary] if boundary > 0 else cut).rstrip("-")
+
+
+def _object_slug(operand: str) -> str:
+    """Name the thing a command acted on, not the path used to reach it."""
+
+    return _trim_slug(operand.rstrip("/").rsplit("/", 1)[-1] or operand, _SHELL_OBJECT_MAXLEN)
+
+
+def _tokenize_command(command: str) -> list[str] | None:
+    """Split a command into words and shell operators, or return None if it does not lex.
+
+    Unbalanced quotes are common in a generated one-liner and are not worth a partial parse: the
+    caller falls back to naming the run after the raw text instead.
+    """
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _command_steps(tokens: list[str]) -> list[list[str]]:
+    """Cut a token list at every separator, so each step is one thing the command did."""
+
+    steps: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                steps.append(current)
+            current = []
             continue
-        label = _slugify(
-            _compress_command_paths(collapsed), maxlen=_SHELL_LABEL_MAXLEN
-        ) or _slugify(collapsed, maxlen=_SHELL_LABEL_MAXLEN)
+        current.append(token)
+    if current:
+        steps.append(current)
+    return steps
+
+
+def _strip_redirections(tokens: list[str]) -> list[str]:
+    """Drop redirection operators and their targets; they are plumbing, not the function."""
+
+    kept: list[str] = []
+    skip_target = False
+    for token in tokens:
+        if skip_target:
+            skip_target = False
+            continue
+        if token in _SHELL_REDIRECTIONS:
+            # ``2>&1`` lexes as ``2``, ``>&``, ``1``: the descriptor is not an operand either.
+            if kept and kept[-1].isdigit():
+                kept.pop()
+            skip_target = True
+            continue
+        kept.append(token)
+    return kept
+
+
+def _split_operands(tokens: list[str]) -> tuple[str, list[str], list[str], dict[str, str]]:
+    """Return the command name, its options, its operands, and the values of its value-taking flags.
+
+    Leading ``VAR=value`` assignments are stripped so the head is the program. A bare number after
+    an option is that option's value (``head -n 5 notes.txt``), not something the command acted on.
+    """
+
+    index = 0
+    while index < len(tokens) and "=" in tokens[index] and not tokens[index].startswith("-"):
+        index += 1
+    if index >= len(tokens):
+        return "", [], [], {}
+    head = Path(tokens[index]).name.lower()
+    options: list[str] = []
+    operands: list[str] = []
+    values: dict[str, str] = {}
+    pending: str | None = None
+    for token in tokens[index + 1 :]:
+        if token.startswith("-") and token != "-":
+            options.append(token)
+            pending = token
+            continue
+        if pending is not None and (token.isdigit() or pending in _SHELL_VALUE_FLAGS):
+            values.setdefault(pending, token)
+            pending = None
+            continue
+        pending = None
+        operands.append(token)
+    return head, options, operands, values
+
+
+def _first_value(values: dict[str, str], flags: tuple[str, ...]) -> str:
+    return next((values[flag] for flag in flags if flag in values), "")
+
+
+def _describe_step(tokens: list[str]) -> tuple[str, list[str]] | None:
+    """Describe one step as a verb plus the words that complete it, or None for shell preamble.
+
+    The verb says what the step accomplished and the tail says on what, so a bundle name reads as
+    a sentence ("search-evaluate-py-for-artifact-relative-path") rather than as re-slugified shell.
+    A command outside the table keeps its own name as the verb, which stays honest about an
+    unfamiliar tool instead of inventing a description for it.
+    """
+
+    head, options, operands, values = _split_operands(_strip_redirections(tokens))
+    if not head or head in _SHELL_PREAMBLE_HEADS:
+        return None
+    objects = [slug for slug in (_object_slug(operand) for operand in operands) if slug]
+
+    if head in _SHELL_SEARCH_HEADS:
+        # The pattern comes from ``-e``/``-f`` when given and is otherwise the first operand, which
+        # also decides whether that operand is one of the files searched.
+        flagged = _first_value(values, _SHELL_PATTERN_FLAGS)
+        pattern = _trim_slug(flagged or (operands[0] if operands else ""), _SHELL_OBJECT_MAXLEN)
+        targets = objects if flagged else objects[1:]
+        if not pattern:
+            return "search", targets[:1]
+        return "search", ([targets[0], "for", pattern] if targets else ["for", pattern])
+    if head in _SHELL_STREAM_EDIT_HEADS:
+        # Likewise the program text is an operand unless it came from a flag, and it never makes a
+        # readable name either way.
+        in_place = any(
+            option in _SHELL_IN_PLACE_FLAGS or (head == "sed" and option.startswith("-i"))
+            for option in options
+        )
+        verb = "edit" if in_place else _SHELL_VERBS.get(head, f"run-{_slugify(head)}")
+        files = objects if _first_value(values, _SHELL_PATTERN_FLAGS) else objects[1:]
+        return verb, files[:1]
+    if head in _SHELL_PYTHON_HEADS:
+        if "-c" in options:
+            return "run-inline-python", []
+        if "-m" in options:
+            # ``python -m pytest tests/x.py`` ran pytest, so the module is the verb and the file
+            # it was pointed at is the object.
+            module = _slugify(values.get("-m", ""), maxlen=_SHELL_OBJECT_MAXLEN)
+            return (f"run-{module}" if module else "run-python-module"), objects[:1]
+        return ("run", objects[:1]) if objects else ("start-python", [])
+    if head == "find":
+        named = _first_value(values, ("-name", "-iname", "-path"))
+        if named:
+            return "find-files-named", [_trim_slug(named, _SHELL_OBJECT_MAXLEN)]
+        return "find-files-in", objects[:1]
+    if head == "git":
+        return (f"git-{_slugify(operands[0])}" if operands else "git"), objects[1:2]
+    if head == "ruff":
+        verb = _SHELL_RUFF_VERBS.get(operands[0] if operands else "", "lint")
+        return verb, objects[1:2] if operands and operands[0] in _SHELL_RUFF_VERBS else objects[:1]
+    if head == "tar":
+        short = [option for option in options if not option.startswith("--")]
+        extracting = "--extract" in options or any("x" in option for option in short)
+        return ("extract-archive" if extracting else "create-archive"), objects[:1]
+    if head == "curl":
+        # A URL is the subject of a fetch, so it is kept whole rather than reduced to a basename.
+        return "fetch", [_trim_slug(operands[0], _SHELL_OBJECT_MAXLEN)] if operands else []
+    known = _SHELL_VERBS.get(head)
+    if known:
+        return known, objects[:1]
+    # An unfamiliar tool keeps its own name, and a first operand that is not a path is almost
+    # always its subcommand -- ``scagent-sdk capability validate`` needs both words to mean
+    # anything, while ``gnuplot plot.gp`` is complete after one.
+    verb = _slugify(head, maxlen=_SHELL_OBJECT_MAXLEN) or "run"
+    subcommand = bool(operands) and not set("./").intersection(operands[0])
+    return verb, objects[:2] if subcommand else objects[:1]
+
+
+def _verb_without_object(verb: str) -> str:
+    """``count-lines-in`` with nothing after it reads as a fragment; ``count-lines`` does not."""
+
+    parts = verb.split("-")
+    return "-".join(parts[:-1]) if len(parts) > 1 and parts[-1] in _SHELL_PREPOSITIONS else verb
+
+
+def _describe_command(command: str) -> str:
+    """Name a command by what it did: the first real step, then a differing final step.
+
+    A run is usually one function reached through some plumbing -- ``cd`` into a directory, then
+    grep a file, then pipe the result through ``wc``. Naming the first working step captures the
+    subject and appending the last step captures the outcome, which together describe the run
+    without replaying every clause of it.
+    """
+
+    tokens = _tokenize_command(command)
+    if tokens is None:
+        return ""
+    steps = [
+        description
+        for description in (_describe_step(step) for step in _command_steps(tokens))
+        if description is not None
+    ]
+    if not steps:
+        return ""
+    verb, tail = steps[0]
+    parts = [verb, *tail] if tail else [_verb_without_object(verb)]
+    if len(steps) > 1:
+        last_verb, last_tail = steps[-1]
+        subject_changed = last_tail[:1] != tail[:1]
+        if last_verb != verb or subject_changed:
+            follow = (
+                [last_verb, *last_tail[:1]]
+                if last_tail and subject_changed
+                else [_verb_without_object(last_verb)]
+            )
+            parts += ["then", *follow]
+    return _trim_slug("-".join(part for part in parts if part), _SHELL_LABEL_MAXLEN)
+
+
+def _shell_label(command: str, fallback: str) -> str:
+    """Name a shell run after the function it performed, falling back to the text that ran.
+
+    Only the command is described as a function; the summary is a sentence a skill wrote, and
+    reading it as shell would name a run after its grammar rather than its work. The summary does
+    drop a leading clause at ``:``, because it carries boilerplate that would otherwise consume the
+    whole label budget ("Shell command completed in 2.83s: ls").
+    """
+
+    collapsed = " ".join(command.split())
+    if collapsed:
+        label = _describe_command(collapsed) or _trim_slug(
+            _compress_command_paths(collapsed), _SHELL_LABEL_MAXLEN
+        )
         if label:
             return label
-    return "command"
+    text = fallback.split(":", 1)[1] if ":" in fallback else fallback
+    collapsed = " ".join(text.split())
+    return (
+        _trim_slug(_compress_command_paths(collapsed), _SHELL_LABEL_MAXLEN)
+        or _trim_slug(collapsed, _SHELL_LABEL_MAXLEN)
+        or "command"
+    )
 
 
 def _shell_member(artifact_name: str, relative_path: str, media_type: str) -> str | None:
@@ -252,9 +576,9 @@ def _projected_name(
     *,
     category: str,
     execution_id: str,
-    tool_name: str,
     summary: str,
     artifact_name: str,
+    artifact_title: str = "",
     relative_path: str,
     disambiguate: bool = False,
 ) -> str:
@@ -270,9 +594,17 @@ def _projected_name(
         if disambiguate and artifact and artifact != label:
             return f"{label}-{artifact}-{short_id}{suffix or '.py'}"
         return f"{label}-{short_id}{suffix or '.py'}"
-    artifact = _slugify(artifact_name) or _slugify(Path(relative_path).stem) or "output"
-    tool = _slugify(tool_name, maxlen=48) or "capability"
-    return f"{artifact}--{tool}--{short_id}{suffix}"
+    # The title says what this file shows and the name only says what kind of file it is, so the
+    # title wins when a skill supplied one. The short id makes the projection unique across passes
+    # and traceable to its execution. The producing tool is deliberately absent -- it is recorded in
+    # state and in outputs.md, and repeating it here only crowds out the descriptive part.
+    artifact = (
+        _slugify(artifact_title)
+        or _slugify(artifact_name)
+        or _slugify(Path(relative_path).stem)
+        or "output"
+    )
+    return f"{artifact}--{short_id}{suffix}"
 
 
 def _safe_source(session_dir: Path, artifact_path: str, relative_path: str) -> Path | None:
@@ -589,6 +921,7 @@ def refresh_output_view(
             1
             for raw_file in files
             if isinstance(raw_file, Mapping)
+            and raw_file.get("include_in_output_view") is not False
             and isinstance(raw_file.get("relative_path"), str)
             and _classify(
                 str(raw_file["relative_path"]),
@@ -598,6 +931,7 @@ def refresh_output_view(
         )
         is_shell_run = any(
             isinstance(raw_file, Mapping)
+            and raw_file.get("include_in_output_view") is not False
             and isinstance(raw_file.get("relative_path"), str)
             and _is_shell_script(
                 str(raw_file["relative_path"]),
@@ -619,11 +953,14 @@ def refresh_output_view(
         for raw_file in files:
             if not isinstance(raw_file, Mapping):
                 continue
+            if raw_file.get("include_in_output_view") is False:
+                continue
             relative_path = raw_file.get("relative_path")
             if not isinstance(relative_path, str):
                 continue
             media_type = str(raw_file.get("media_type", "application/octet-stream"))
             artifact_name = str(raw_file.get("name", Path(relative_path).stem))
+            artifact_title = str(raw_file.get("title", ""))
             shell_member = (
                 _shell_member(artifact_name, relative_path, media_type)
                 if shell_bundle is not None
@@ -643,9 +980,9 @@ def refresh_output_view(
                 filename = _projected_name(
                     category=category,
                     execution_id=execution_id,
-                    tool_name=tool_name,
                     summary=summary,
                     artifact_name=artifact_name,
+                    artifact_title=artifact_title,
                     relative_path=relative_path,
                     disambiguate=code_files > 1,
                 )
@@ -676,6 +1013,8 @@ def refresh_output_view(
                 "canonical_path": canonical_path,
                 "commit_sequence": sequence,
             }
+            if artifact_title:
+                entry["artifact_title"] = artifact_title
             if category == "shell" and shell_bundle is not None:
                 report = shell_report or {}
                 entry["bundle_path"] = shell_bundle

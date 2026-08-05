@@ -69,7 +69,12 @@ def _capability_history(session_dir: Path) -> list[dict[str, Any]]:
                 "tool_name": raw.get("tool_name"),
                 "arguments": raw.get("arguments", {}),
                 "summary": raw.get("summary", ""),
+                "artifact_path": raw.get(
+                    "path", f"artifacts/capabilities/{execution_id}"
+                ),
                 "files": raw.get("files", []),
+                # Carried so a step holding real executed code can name the runtime it ran in.
+                "environment": raw.get("environment", {}),
             }
         )
     return sorted(history, key=lambda item: (item["sequence"], item["execution_id"]))

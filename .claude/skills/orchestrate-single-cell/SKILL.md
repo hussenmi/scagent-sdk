@@ -16,9 +16,15 @@ from an already processed artifact, and the observed data may require replanning
 
 1. Inspect and describe the input, establish byte identity, resolve raw counts, and convert gene
    identifiers before QC when symbols are available.
-2. Calculate cell QC with `counts_layer="auto"`. Inspect every returned standard figure, evaluate
-   doublets when raw counts permit it, and call `review_single_cell_qc` with a concrete keep/filter
-   rationale. If cells or genes are removed, recalculate and review QC on the retained artifact.
+2. Calculate cell QC with `counts_layer="auto"`. Inspect every returned standard figure and call
+   `review_single_cell_qc` with a concrete keep/filter rationale. Then, mirroring the legacy
+   pipeline, **generate doublet evidence from the raw counts before the first clustering** —
+   normally per biological library — and review it (`retain_for_cluster_review` is the usual first
+   decision). Cluster QC reads the `predicted_doublet` calls, so producing them now means the first
+   clustering pass is not blind to doublets. Optional gene filtering (low-detection plus ribosomal
+   removal) belongs here too. Gene filtering preserves the cell set, so it carries the cell-QC
+   review and doublet evidence forward: no QC re-review is needed after it. Only removing *cells*
+   (here or at cluster cleanup) requires recalculating and reviewing QC on the retained artifact.
 3. Normalize, select HVGs, compute PCA, inspect the PCA variance figure, build neighbors, compute
    UMAP, and call `plot_qc_embedding`. Explain where quality signals localize; distributions alone
    do not show whether a signal is a coherent population.
@@ -51,6 +57,15 @@ from an already processed artifact, and the observed data may require replanning
    QC resolution is discarded when you later step down. Make that clustering current, then
    investigate batch structure when meaningful batch metadata exists and record an explicit
    decision. Record `not_applicable` when no defensible batch unit exists.
+
+   Batch metadata alone never authorizes integration. When multiple samples are detected, ask the
+   user whether to investigate, integrate, continue combined uncorrected, analyze separately, or
+   describe the experiment. If they choose investigation, run the uncorrected first pass and the
+   gene-first matched-population diagnostic: sample-enriched regions, each region versus the rest of
+   its own sample, cross-sample identity matching from those DEG signatures, and a small number of
+   direct pair comparisons. Show a readable sample-colored embedding and name the actual matched
+   regions and genes. Then put the action choice back to the user; investigation is evidence, not
+   authorization. Record `request_guidance` until they answer.
 6. For annotation, use SCimilarity early when it helps establish broad tissue/context, inspect the
    complete readiness inventory of cached CellTypist models, and choose the closest organism/tissue
    model rather than a generic immune default. When both are suitable, run and summarize both and
@@ -75,11 +90,37 @@ describing an earlier notebook as stale.
 ## Operating loop
 
 1. Establish the relevant artifact and current processing state. Never assume a resumed file is unchanged.
-2. State the immediate scientific question and why the selected capability answers it.
-3. Prefer deterministic capability tools for computation and validation. Use model reasoning to choose parameters, compare evidence, and interpret results.
-4. Inspect the committed facts and artifacts after every material action. Do not infer success from narration. If a figure is unreadable because of crowded legends or labels, treat visual review as incomplete and use its table or regenerate a legible view before making a visual claim.
+2. Before each material capability call, tell the user the immediate scientific question, what is
+   being measured or compared, why the selected capability answers it, and what result would alter
+   the next decision. Use a short explanatory paragraph rather than a bare status sentence.
+3. Prefer deterministic capability tools for computation and validation. Use model reasoning to
+   choose parameters, compare evidence, and interpret results. After each material result, explain
+   the key output, biological or technical meaning, evidence strength, uncertainty, and consequence
+   before moving to a different question. Tool summaries are not a substitute for this
+   interpretation.
+4. Inspect the committed facts and artifacts after every material action. Use that same state both
+   when the user asks what happened and when choosing or interpreting the next step yourself. Do
+   not infer a result, decision, parameter, identity, or file from narration, expected workflow, or
+   a conventional filename. If it is absent from current state and committed artifacts, treat it as
+   not recorded. If a figure is unreadable because of crowded legends or labels, treat visual
+   review as incomplete and use its table or regenerate a legible view before making a visual
+   claim.
 5. Replan when evidence contradicts the initial path. Avoid running integration, fine-grained annotation, or destructive filtering merely because those steps are common.
-6. Conclude with actual results, decisions, caveats, and artifact paths—not a list of tools used.
+6. If an action fails, explain the failure, its scientific impact, and the recovery in plain
+   language before retrying. Never claim to have reviewed evidence that a failed action did not
+   return.
+7. After every plot-producing result, name the plot, explain plainly what it shows, and cite the
+   exact absolute path returned in `files[]`. For a large series, name the overview plots and cite
+   the exact `outputs.md` index containing every plot.
+8. At meaningful milestones, give the user a short synthesis linking evidence streams and stating
+   the current decision or uncertainty. Avoid empty narration such as “good progress” or “now
+   continuing.”
+9. Conclude with actual results, decisions, caveats, and verified artifact paths—not a list of
+   tools used. List important figures with one-line descriptions. Never infer that a conventional
+   report, recipe, dataset, or plot exists from its expected filename.
+10. Say the session is complete only after a successful `finalize_analysis` result and after
+   confirming `facts.finalization.status=complete`. Otherwise state what is complete and what
+   remains. Conversation compaction is never evidence of scientific completion.
 
 ## Scientific floors
 
@@ -87,6 +128,7 @@ describing an earlier notebook as stale.
 - Generate doublet evidence from verified raw counts, normally per biological library. Treat predicted calls and cluster enrichment as probabilistic review evidence, never as cell-type truth or automatic permission to remove cells.
 - Require cluster DEGs plus independent reference/marker evidence before final labels. DEGs are primary; reference-model predictions are hypotheses. When programs conflict, lower confidence, generalize the label, or leave it unresolved instead of forcing a subtype.
 - Require an evidence-bound visual QC decision and a resolved cluster-QC visual review before final publication.
+- Require the user's own post-investigation answer before resolving batch handling, and treat a recorded `request_guidance` as pending rather than decided.
 - Invalidate downstream evidence when filtering, representation, or clustering identity changes.
 - Register every saved dataset, table, figure, and report with provenance.
 

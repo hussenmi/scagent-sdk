@@ -30,7 +30,7 @@ def _g(name: str) -> Any:
 
 def test_manifest_bumped_and_declares_three_axis_parameters() -> None:
     package = _package()
-    assert package.manifest.version == "0.6.0"
+    assert package.manifest.version == "0.7.1"
     assert {tool.name for tool in package.manifest.tools} == {
         "evaluate_cluster_qc",
         "review_cluster_qc",
@@ -342,3 +342,197 @@ def test_cluster_grid_points_stay_visible_at_every_dataset_size() -> None:
     assert small_foreground > small_background
     assert large_foreground > large_background
     assert large_background >= 0.4 and large_foreground >= 0.8
+
+
+# --- artifact documentation --------------------------------------------------
+
+
+def _documentation_for(
+    decisions: list[dict[str, Any]], **evidence_overrides: Any
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "n_clusters": len(decisions),
+        "cleanup": {
+            "confirmed_junk": [],
+            "removed_cells": 0,
+            "removal_fraction": 0.0,
+            "applied": False,
+            "held_reason": None,
+        },
+        "review_clusters": [],
+        "doublet_signal_missing": False,
+        "doublet_enriched_clusters": [],
+        "effective_parameters": {"cluster_key": "leiden", "min_cluster_cells": 30},
+    }
+    evidence.update(evidence_overrides)
+    return _g("_documentation")(
+        output_prefix="cluster-qc/leiden",
+        cluster_key="leiden",
+        evidence=evidence,
+        decisions=decisions,
+        n_heatmaps=len(decisions),
+        has_metric_figure=True,
+        umap_names=["cluster-qc-umap", "cluster-qc-umap-grid"],
+    )
+
+
+def _decision(cluster: str, metric: str, deg: str, structure: str) -> dict[str, Any]:
+    return {
+        "cluster": cluster,
+        "metric_severity": metric,
+        "deg_verdict": deg,
+        "structure": structure,
+        "action": "keep",
+    }
+
+
+def test_documentation_names_the_clusters_each_axis_flagged() -> None:
+    doc = _documentation_for(
+        [
+            _decision("0", "clean", "identity_supported", "strong"),
+            _decision("4", "obvious", "identity_supported", "moderate"),
+            _decision("11", "ambiguous", "junk_markers", "unstructured"),
+            _decision("2", "clean", "junk_markers", "strong"),
+        ]
+    )
+    findings = "\n".join(doc["findings"])
+
+    # Findings must be about THIS dataset. A reader should not have to open four CSVs to learn
+    # which cluster was flagged, and cluster order must read numerically, not "11" before "2".
+    assert "4 clusters were checked in `leiden`." in findings
+    assert "singled out: clusters 4 and 11." in findings
+    assert "distinguishing genes — for: clusters 2 and 11." in findings
+    assert "for: cluster 11." in findings
+    assert doc["directory"] == "cluster-qc/leiden"
+    assert doc["name"] == "cluster-qc-guide"
+
+
+def test_axis_membership_uses_the_same_vocabulary_the_decision_rule_does() -> None:
+    """A README that summarises the decision table must not disagree with it.
+
+    `synthesize_decision` treats `weak` covariance as adverse and spells the DEG verdict
+    `junk_markers`; matching on `junk`/`unstructured` alone silently reported "none" for clusters
+    the same pass had just removed.
+    """
+
+    doc = _documentation_for(
+        [
+            _decision("1", "obvious", "junk_markers", "weak"),
+            _decision("5", "clean", "identity_supported", "strong"),
+        ]
+    )
+    findings = "\n".join(doc["findings"])
+
+    assert "distinguishing genes — for: cluster 1." in findings
+    assert "for: cluster 1." in findings
+
+
+def test_a_cluster_list_cannot_be_misread_as_a_count() -> None:
+    """Clusters are labelled from 0, so "decide: 0" must not read as "zero clusters"."""
+
+    doc = _documentation_for(
+        [_decision("0", "clean", "identity_supported", "weak")], review_clusters=["0"]
+    )
+
+    assert any("decide: cluster 0." in item for item in doc["findings"])
+
+
+def test_documentation_says_plainly_when_nothing_was_removed() -> None:
+    doc = _documentation_for([_decision("0", "clean", "identity_supported", "strong")])
+
+    assert any("cell set is unchanged" in item for item in doc["findings"])
+    assert not any("were removed here" in item for item in doc["findings"])
+
+
+def test_documentation_separates_an_applied_removal_from_one_held_for_review() -> None:
+    applied = _documentation_for(
+        [_decision("3", "obvious", "junk_markers", "unstructured")],
+        cleanup={
+            "confirmed_junk": ["3"],
+            "removed_cells": 412,
+            "removal_fraction": 0.041,
+            "applied": True,
+            "held_reason": None,
+        },
+    )
+    held = _documentation_for(
+        [_decision("3", "obvious", "junk_markers", "unstructured")],
+        cleanup={
+            "confirmed_junk": ["3"],
+            "removed_cells": 0,
+            "removal_fraction": 0.62,
+            "applied": False,
+            "held_reason": "removal fraction 0.62 exceeds the 0.20 ceiling",
+        },
+    )
+
+    assert any("412 cells, 4.1% of cells" in item for item in applied["findings"])
+    assert any("but nothing was removed" in item for item in held["findings"])
+    assert any("exceeds the 0.20 ceiling" in item for item in held["findings"])
+
+
+def test_documentation_flags_a_missing_doublet_signal_as_reduced_evidence() -> None:
+    doc = _documentation_for(
+        [_decision("0", "clean", "identity_supported", "strong")], doublet_signal_missing=True
+    )
+
+    assert any("No doublet scores were available" in item for item in doc["findings"])
+
+
+def test_documented_files_cover_every_artifact_the_pass_writes() -> None:
+    doc = _documentation_for([_decision("0", "clean", "identity_supported", "strong")])
+    documented = {entry["filename"] for entry in doc["files"]}
+
+    assert documented == {
+        "cluster-qc-decision-table.csv",
+        "cluster-metric-evidence.csv",
+        "cluster-deg-identity.csv",
+        "cluster-structure-evidence.csv",
+        "cluster-qc-evidence.json",
+        "cluster-qc-metrics.png",
+        "cluster-qc-umap.png",
+        "cluster-qc-umap-grid.png",
+        "cluster-structure/cluster_<id>_correlation.png",
+    }
+    # Every entry earns its place by explaining something, not by being listed.
+    assert all(entry["purpose"].strip() for entry in doc["files"])
+
+
+def test_figures_absent_from_a_pass_are_not_documented_as_present() -> None:
+    doc = _g("_documentation")(
+        output_prefix="cluster-qc/leiden",
+        cluster_key="leiden",
+        evidence={
+            "n_clusters": 1,
+            "cleanup": {
+                "confirmed_junk": [],
+                "removed_cells": 0,
+                "removal_fraction": 0.0,
+                "applied": False,
+                "held_reason": None,
+            },
+            "review_clusters": [],
+            "doublet_signal_missing": False,
+            "doublet_enriched_clusters": [],
+            "effective_parameters": {},
+        },
+        decisions=[_decision("0", "clean", "identity_supported", "strong")],
+        n_heatmaps=0,
+        has_metric_figure=False,
+        umap_names=[],
+    )
+    documented = {entry["filename"] for entry in doc["files"]}
+
+    assert not any(name.endswith(".png") for name in documented)
+
+
+def test_documentation_renders_through_the_runtime_contract() -> None:
+    from scagent_sdk.capabilities.documentation import ArtifactDocumentation, render_readme
+
+    doc = _documentation_for([_decision("0", "clean", "identity_supported", "strong")])
+    rendered = render_readme(ArtifactDocumentation.from_dict(doc))
+
+    assert rendered.startswith("# leiden cluster check explained")
+    assert "## What was done" in rendered
+    assert "## What this found" in rendered
+    assert "| min_cluster_cells | 30 |" in rendered

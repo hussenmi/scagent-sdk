@@ -1,7 +1,7 @@
 schema_version: 1
 skill:
   id: marker-annotation
-  version: "0.4.0"
+  version: "0.5.1"
   description: Transparent cluster DEG/marker evidence and evidence-bound annotation review.
 tools:
   - name: evaluate_marker_evidence
@@ -43,6 +43,7 @@ tools:
           type: array
           minItems: 2
           uniqueItems: true
+          description: "Evidence sources actually compared, at least two. Must include 'markers' (the DEG/marker evidence from evaluate_marker_evidence), since a label cannot rest on classifier agreement alone; name each other source you read, e.g. 'scimilarity', 'celltypist', 'literature'."
           items: {type: string, minLength: 1}
         reviewed_artifacts:
           type: array

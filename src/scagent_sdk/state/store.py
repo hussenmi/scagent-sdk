@@ -39,6 +39,14 @@ from scagent_sdk.state.lineage import (
 # alphanumerics, dash, underscore, or dot, and never a ".." traversal sequence.
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
+# The event kind that records a real user utterance. It is the only durable proof that a human
+# spoke, which is what a consultation-bound decision has to be checked against.
+USER_TURN_EVENT_KIND = "runtime.turn_started"
+# Bounds on the user-turn index. It travels into worker environments on every capability
+# execution, so it stays small: the most recent turns, with prompts truncated.
+MAX_USER_TURN_INDEX = 200
+MAX_USER_TURN_PROMPT_CHARS = 2000
+
 
 def new_session_id() -> str:
     """Return a time-ordered, collision-safe session id.
@@ -290,6 +298,55 @@ class SessionStore:
                 expected += 1
         return parsed
 
+    def user_turns(self, *, limit: int = MAX_USER_TURN_INDEX) -> list[dict[str, Any]]:
+        """Ordered index of the user turns in this session, oldest first.
+
+        Streams the event log and parses only the turn-start lines. A capability that needs to
+        establish *whether the user actually spoke, and when* must not pay to parse every staged
+        scientific payload in the log — those dominate its bytes. The returned records are the
+        durable answer to that question, so a decision can be bound to a real human utterance
+        instead of the model's report of one.
+
+        Sequences are event sequences, so they order a turn against any other event: a
+        consultation is only meaningful if the user spoke *after* the evidence being decided on.
+        """
+        if not self.events_path.is_file():
+            raise SessionFormatError(f"required session file is missing: {self.events_path}")
+        turns: list[dict[str, Any]] = []
+        with self.events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                # Cheap substring prefilter before any JSON parsing; the kind is re-checked below
+                # so a payload that merely mentions the string cannot enter the index.
+                if USER_TURN_EVENT_KIND not in line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    # Full validation belongs to ``events()``; this view never raises on a
+                    # malformed line so a consultation check cannot become the thing that
+                    # fails a session.
+                    continue
+                if not isinstance(value, dict) or value.get("kind") != USER_TURN_EVENT_KIND:
+                    continue
+                payload = value.get("payload")
+                sequence = value.get("sequence")
+                if not isinstance(payload, dict) or not isinstance(sequence, int):
+                    continue
+                turn_id = payload.get("turn_id")
+                if not isinstance(turn_id, str) or not turn_id:
+                    continue
+                prompt = payload.get("user_prompt")
+                turns.append(
+                    {
+                        "turn_id": turn_id,
+                        "sequence": sequence,
+                        "user_prompt": (
+                            prompt[:MAX_USER_TURN_PROMPT_CHARS] if isinstance(prompt, str) else ""
+                        ),
+                    }
+                )
+        return turns[-limit:] if limit > 0 else turns
+
     def _replay_unapplied_events(self) -> None:
         events = self.events()
         if self.state.last_event_sequence > len(events):
@@ -302,12 +359,12 @@ class SessionStore:
             _atomic_write_json(self.state_path, self.state.to_dict())
 
     def _migrate_state_schema(self) -> list[str]:
-        """Bring a v1 state checkpoint up to v2 by reconstructing the artifact lineage.
+        """Bring an older state checkpoint to the current materialized-view schema.
 
-        A schema default cannot substitute for this: historical events carry no lineage patch, so
-        replaying them leaves the forest empty and every recorded artifact unreachable. The forest
-        is derived rather than new information, so it is materialized into the checkpoint without
-        recording an event -- consistent with ``state.json`` being a replayable view of the log.
+        v1 -> v2 reconstructs artifact lineage. A schema default cannot substitute for that:
+        historical events carry no lineage patch, so replaying them leaves every recorded artifact
+        unreachable. v2 -> v3 adds only the empty, fail-closed retention registry; classifications
+        and operations are user-authored events and therefore cannot be inferred during migration.
 
         Returns any reconstruction warnings for the caller to record once the lock is released. They
         are worth an event: a fact root that could not be placed changes what a checkout restores.
@@ -316,45 +373,52 @@ class SessionStore:
 
         if self.state.schema_version >= SESSION_STATE_SCHEMA_VERSION:
             return []
-        committed = [
-            (str(event.payload["execution_id"]), event.payload, event.state_patch)
-            for event in self.events()
-            if event.kind == "capability.result_committed"
-            and isinstance(event.payload.get("execution_id"), str)
-        ]
-        forest, warnings = rebuild_forest(
-            committed, merge=apply_merge_patch, session_dir=self.session_dir
-        )
-        self.state.lineage = forest
-        nodes = forest.get("nodes")
-        nodes = nodes if isinstance(nodes, Mapping) else {}
-        flat_forest = len(nodes) > 1 and all(
-            not isinstance(node, Mapping) or node.get("parent_execution_id") is None
-            for node in nodes.values()
-        )
-        degraded = bool(warnings) or flat_forest
-        if degraded:
-            # The legacy checkpoint is lossy across branches but it is still the only complete
-            # materialized view when parentage could not be reconstructed. Never replace it with a
-            # partial head view: doing so silently deletes evidence when a session is restored at a
-            # new path or its early events did not record inputs.
-            warnings.append(
-                "preserved legacy global facts because lineage reconstruction was degraded; "
-                "the checkpoint was not narrowed to the reconstructed active head"
+        warnings: list[str] = []
+        if self.state.schema_version < 2:
+            committed = [
+                (str(event.payload["execution_id"]), event.payload, event.state_patch)
+                for event in self.events()
+                if event.kind == "capability.result_committed"
+                and isinstance(event.payload.get("execution_id"), str)
+            ]
+            forest, warnings = rebuild_forest(
+                committed, merge=apply_merge_patch, session_dir=self.session_dir
             )
-        else:
-            # A legacy checkpoint merged node-scoped facts globally in event order. Reconcile that
-            # view with a cleanly reconstructed active line so migration cannot leave facts
-            # describing a sibling.
-            session_facts = {
-                key: deepcopy(value)
-                for key, value in self.state.facts.items()
-                if FACT_ROOT_SCOPES.get(key) != "node"
+            self.state.lineage = forest
+            nodes = forest.get("nodes")
+            nodes = nodes if isinstance(nodes, Mapping) else {}
+            flat_forest = len(nodes) > 1 and all(
+                not isinstance(node, Mapping) or node.get("parent_execution_id") is None
+                for node in nodes.values()
+            )
+            degraded = bool(warnings) or flat_forest
+            if degraded:
+                # The legacy checkpoint is lossy across branches but it is still the only complete
+                # materialized view when parentage could not be reconstructed. Never replace it
+                # with a partial head view.
+                warnings.append(
+                    "preserved legacy global facts because lineage reconstruction was degraded; "
+                    "the checkpoint was not narrowed to the reconstructed active head"
+                )
+            else:
+                session_facts = {
+                    key: deepcopy(value)
+                    for key, value in self.state.facts.items()
+                    if FACT_ROOT_SCOPES.get(key) != "node"
+                }
+                head = active_head(forest)
+                if head is not None:
+                    session_facts.update(
+                        resolve_node_facts(forest, head, merge=apply_merge_patch)
+                    )
+                self.state.facts = session_facts
+        if self.state.schema_version < 3:
+            self.state.retention = {
+                "schema_version": 1,
+                "branches": {},
+                "artifact_roles": {},
+                "operations": {},
             }
-            head = active_head(forest)
-            if head is not None:
-                session_facts.update(resolve_node_facts(forest, head, merge=apply_merge_patch))
-            self.state.facts = session_facts
         self.state.schema_version = SESSION_STATE_SCHEMA_VERSION
         _atomic_write_json(self.state_path, self.state.to_dict())
         return warnings

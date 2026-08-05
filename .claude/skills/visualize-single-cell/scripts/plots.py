@@ -180,44 +180,57 @@ def stable_color_slots(
     return {label: index for index, label in enumerate(unique)}
 
 
-def positive_span(values: list[float]) -> tuple[float, float, int]:
-    """Smallest and largest strictly positive value, and how many values were not positive.
+def log10_positive(values: Any, np: Any) -> tuple[Any, int]:
+    """The strictly positive values as log10, and how many could not be transformed.
 
-    A log axis cannot show a zero, so the count of dropped cells is returned rather than
-    discarded: "1,204 cells have zero counts" is QC evidence, and silently omitting them from a
-    library-size histogram is how an empty-droplet population disappears from the figure that was
-    supposed to reveal it.
+    Plotting the logarithm is not the same as log-*scaling* raw values. On a log-scaled axis the
+    numbers printed are not the numbers being drawn, so a distribution's spread and symmetry cannot
+    be read off it and equal spacing carries no fixed meaning. Transforming first makes the axis
+    read in decades, makes histogram bins uniform by construction, and makes equal distances equal
+    fold-changes -- which is also the space library-size and gene-count cutoffs are chosen in.
+
+    Zero has no logarithm, so those cells are dropped and counted rather than folded in by a log1p
+    shift that would present them as ordinary small values: "1,204 cells have zero counts" is QC
+    evidence, and silently omitting them is how an empty-droplet population disappears from the
+    figure that was supposed to reveal it.
+
+    Kept identical to the copy in `single-cell-qc` on purpose. A skill's scripts directory is the
+    only thing on its import path, so a shared plotting convention has to be duplicated rather than
+    imported; the two must not drift.
     """
 
-    positive = [float(value) for value in values if float(value) > 0.0]
-    dropped = len(values) - len(positive)
-    if not positive:
-        raise ValueError("no positive values to plot on a log scale")
-    return min(positive), max(positive), dropped
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    positive = finite[finite > 0.0]
+    return np.log10(positive), int(finite.size - positive.size)
 
 
-def log_spaced_bins(minimum: float, maximum: float, count: int = HISTOGRAM_BINS) -> list[float]:
-    """Bin edges uniform in log space, for a metric drawn on a log axis.
+def raw_reference_ticks(low: float, high: float) -> list[float]:
+    """Raw values to mark opposite a log10 axis spanning ``[low, high]``, both given raw.
 
-    Linear bins under a log axis is the standard mistake, and the original scagent run makes it:
-    the leftmost bar spans hundreds of counts while the rightmost spans tens of thousands, so the
-    low end of the distribution is compressed into two or three blocks and the shape that decides
-    a threshold cannot be read. Uniform-in-log edges give every bar the same width on the drawn
-    axis.
+    The mantissa set widens as the range narrows. One mark per decade is too sparse to place a
+    value against and a mark per integer collides, so 1/2/5 is the default -- but a metric confined
+    to a third of a decade would get one mark or none from it, which is no reference at all.
     """
 
     import math
 
-    if count < 1:
-        raise ValueError("count must be at least 1")
-    if minimum <= 0.0:
-        raise ValueError("log-spaced bins need a positive minimum; drop non-positive values first")
-    if maximum <= minimum:
-        # A degenerate span still has to produce usable edges rather than a zero-width axis.
-        maximum = minimum * 10.0
-    low, high = math.log10(minimum), math.log10(maximum)
-    step = (high - low) / count
-    return [10.0 ** (low + step * index) for index in range(count + 1)]
+    if not low > 0.0 or not high > low:
+        return []
+    decades = math.log10(high) - math.log10(low)
+    if decades >= 1.5:
+        mantissas: tuple[float, ...] = (1.0, 2.0, 5.0)
+    elif decades >= 0.6:
+        mantissas = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+    else:
+        mantissas = (1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
+    ticks: list[float] = []
+    for exponent in range(math.floor(math.log10(low)), math.ceil(math.log10(high)) + 1):
+        for mantissa in mantissas:
+            value = mantissa * 10.0**exponent
+            if low <= value <= high:
+                ticks.append(value)
+    return sorted(ticks)
 
 
 def highlight_grid_layout(n_categories: int) -> dict[str, Any]:
@@ -262,6 +275,31 @@ def figure_slug(key: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned.strip("-").lower() or "panel"
+
+
+def basis_label(embedding_key: str) -> str:
+    """The embedding's short human name: ``X_scVI`` reads as ``scvi``, ``X_umap`` as ``umap``."""
+
+    return figure_slug(str(embedding_key).removeprefix("X_"))
+
+
+def embedding_figure_title(
+    embedding_key: str, color_keys: list[str], *, max_named: int = 3
+) -> str:
+    """Describe an embedding figure by which embedding it is and what it is coloured by.
+
+    One session plots many embeddings of the same dataset -- pre- and post-integration, coloured by
+    clustering, by sample, by QC metric -- and they are told apart only by these two facts. Panel
+    sets past `max_named` are summarised with a count rather than concatenated, so the part that
+    identifies the figure is not pushed past the length a filename keeps.
+    """
+
+    named = [figure_slug(key) for key in color_keys[:max_named]]
+    remaining = max(len(color_keys) - len(named), 0)
+    if not named:
+        return basis_label(embedding_key)
+    described = " ".join(named) + (f" and {remaining} more" if remaining else "")
+    return f"{basis_label(embedding_key)} by {described}"
 
 
 def natural_order(names: list[str]) -> list[str]:
@@ -374,7 +412,14 @@ def _load(arguments: dict[str, Any]) -> tuple[Path, Any]:
 
 
 def _figure(context: Any, name: str, title: str) -> dict[str, str]:
-    return {"name": name, "relative_path": f"{name}.png", "media_type": "image/png"}
+    # `name` is the stable identifier downstream selection matches on; `title` is what the human
+    # review surface names the file after, so it has to say which subject this figure shows.
+    return {
+        "name": name,
+        "relative_path": f"{name}.png",
+        "media_type": "image/png",
+        "title": title,
+    }
 
 
 def _save(figure: Any, context: Any, name: str) -> None:
@@ -463,21 +508,43 @@ def _categorical(adata: Any, key: str) -> Any:
     return adata.obs[key].astype(str)
 
 
-def _plain_log_ticks(axis: Any, which: str = "x") -> None:
-    """Label a log axis with plain numbers at 1/2/5 per decade instead of mantissa notation.
+def label_log10_axis(
+    axis: Any, which: str, label: str, np: Any, *, raw_label: str = "raw value"
+) -> None:
+    """Name an axis carrying log10 values and mirror the raw magnitudes opposite it.
 
-    Matplotlib's default over a two-decade range labels the minor ticks as "2 x 10^2", "3 x 10^2",
-    ... which run together into an unreadable smear — visible on the genes-per-cell panel of the
-    original scagent run. Decade-only labels are legible but too sparse to read a threshold off,
-    so 1/2/5 per decade is used and written out in full.
+    The mirror is what keeps the change honest: a reader still has to act in raw counts, and the
+    log-scaled axis this replaces was previously the only place those numbers appeared. Kept
+    identical to the copy in `single-cell-qc`; see `log10_positive` for why it is duplicated.
     """
 
-    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+    from matplotlib.ticker import FuncFormatter
 
-    target = axis.xaxis if which == "x" else axis.yaxis
-    target.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
-    target.set_major_formatter(FuncFormatter(lambda value, _: compact_tick(value)))
-    target.set_minor_formatter(NullFormatter())
+    formatter = FuncFormatter(lambda value, _: compact_tick(value))
+    forward_inverse = (
+        lambda value: 10.0**value,
+        lambda value: np.log10(np.clip(value, 1e-12, None)),
+    )
+    if which == "x":
+        axis.set_xlabel(f"{label} (log10)")
+        low, high = axis.get_xlim()
+        mirror = axis.secondary_xaxis("top", functions=forward_inverse)
+        ticks = raw_reference_ticks(10.0**low, 10.0**high)
+        if ticks:
+            mirror.set_xticks(ticks)
+        mirror.xaxis.set_major_formatter(formatter)
+        # No axis label on the top mirror: it would only repeat the metric the primary label
+        # already names, and with sparse marks a centred label lands on top of a tick.
+    else:
+        axis.set_ylabel(f"{label} (log10)")
+        low, high = axis.get_ylim()
+        mirror = axis.secondary_yaxis("right", functions=forward_inverse)
+        ticks = raw_reference_ticks(10.0**low, 10.0**high)
+        if ticks:
+            mirror.set_yticks(ticks)
+        mirror.yaxis.set_major_formatter(formatter)
+        mirror.set_ylabel(raw_label, fontsize=8, labelpad=2)
+    mirror.tick_params(labelsize=8)
 
 
 def _violin_panel(axis: Any, values: Any, label: str, rng: Any) -> int:
@@ -663,37 +730,43 @@ def plot_qc_distributions(arguments: dict[str, Any], context: Any) -> dict[str, 
     media: list[dict[str, str]] = []
     dropped_note: dict[str, int] = {}
 
-    def _log_histogram(axis: Any, values: Any, label: str) -> None:
-        """Histogram on a log axis with bins that are uniform *on that axis*."""
+    def _log_histogram(axis: Any, values: Any, label: str, unit: str) -> None:
+        """Histogram of the metric's log10 values, so the bins are uniform in what is plotted."""
 
-        low, high, dropped = positive_span([float(item) for item in values.tolist()])
+        logged, dropped = log10_positive(values, np)
         if dropped:
             dropped_note[label] = dropped
         axis.hist(
-            values[values > 0],
-            bins=log_spaced_bins(low, high),
+            logged,
+            bins=HISTOGRAM_BINS,
             color="#4c72b0",
             edgecolor="#22405f",
             linewidth=0.3,
         )
-        axis.set_xscale("log")
-        _plain_log_ticks(axis)
-        axis.set_xlabel(f"{label} (log scale)")
         axis.set_ylabel("cells")
+        label_log10_axis(axis, "x", label, np, raw_label=unit)
         title = label if not dropped else f"{label} ({dropped:,} non-positive omitted)"
-        axis.set_title(title)
+        # Padded clear of the raw-magnitude mirror that now runs along the top spine.
+        axis.set_title(title, pad=26)
 
     # --- distributions: knee, the two heavy-tailed size metrics, and the two fraction metrics ---
-    figure, axes = plt.subplots(1, 5, figsize=(23.0, 4.2))
+    figure, axes = plt.subplots(1, 5, figsize=(23.0, 4.6))
     ranked = np.sort(totals)[::-1]
-    axes[0].plot(np.arange(1, ranked.size + 1), np.maximum(ranked, 1e-9), color="#1f77b4")
-    axes[0].set_xscale("log")
-    axes[0].set_yscale("log")
-    axes[0].set_xlabel("cell rank")
-    axes[0].set_ylabel("total counts")
-    axes[0].set_title("UMI rank (knee)")
-    _log_histogram(axes[1], totals, "total counts per cell")
-    _log_histogram(axes[2], detected.astype(float), "genes detected per cell")
+    logged_ranks, _ = log10_positive(np.arange(1, ranked.size + 1), np)
+    logged_counts, dropped_ranks = log10_positive(ranked, np)
+    # `ranked` is sorted descending, so any zero-count cells are its tail and the surviving counts
+    # still line up with the leading ranks.
+    axes[0].plot(logged_ranks[: logged_counts.size], logged_counts, color="#1f77b4")
+    label_log10_axis(axes[0], "x", "cell rank", np, raw_label="cell rank")
+    label_log10_axis(axes[0], "y", "total counts", np, raw_label="counts")
+    axes[0].set_title(
+        "UMI rank (knee)"
+        if not dropped_ranks
+        else f"UMI rank (knee) ({dropped_ranks:,} non-positive omitted)",
+        pad=26,
+    )
+    _log_histogram(axes[1], totals, "total counts per cell", "counts")
+    _log_histogram(axes[2], detected.astype(float), "genes detected per cell", "genes")
     for axis, values, label, source in (
         (axes[3], mito_pct, "mitochondrial percent", mito_source),
         (axes[4], ribo_pct, "ribosomal percent", ribo_source),
@@ -712,10 +785,13 @@ def plot_qc_distributions(arguments: dict[str, Any], context: Any) -> dict[str, 
     artifacts.append(_figure(context, "qc-distributions", "QC distributions"))
     media.append(dict(artifacts[-1]))
 
-    # --- violins: log1p for the size metrics so the body is not one spike against a long tail ---
+    # --- violins: log10 for the size metrics so the body is not one spike against a long tail ---
+    # log10 rather than log1p so every logged panel across these figures reads in one unit: a
+    # decade is a decade and 3.7 is recognisably "a few thousand", where natural-log 8.5 has to be
+    # converted before it means anything.
     violin_panels = [
-        (np.log1p(totals), "log1p_total_counts"),
-        (np.log1p(detected.astype(float)), "log1p_n_genes_by_counts"),
+        (log10_positive(totals, np)[0], "total counts (log10)"),
+        (log10_positive(detected.astype(float), np)[0], "genes per cell (log10)"),
         (mito_pct, "pct_counts_mt"),
         (ribo_pct, "pct_counts_ribo"),
     ]
@@ -731,23 +807,22 @@ def plot_qc_distributions(arguments: dict[str, Any], context: Any) -> dict[str, 
     media.append(dict(artifacts[-1]))
 
     # --- scatters: the joint structure the marginal histograms cannot show ---
-    figure, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
+    figure, axes = plt.subplots(1, 3, figsize=(16.5, 5.2))
     positive = totals > 0
     axes[0].scatter(
-        totals[positive], np.maximum(detected[positive], 1), s=3, alpha=0.35, linewidths=0,
+        np.log10(totals[positive]), np.log10(np.maximum(detected[positive], 1)),
+        s=3, alpha=0.35, linewidths=0, color="#555555", rasterized=True,
+    )
+    label_log10_axis(axes[0], "x", "total counts", np, raw_label="counts")
+    label_log10_axis(axes[0], "y", "genes detected", np, raw_label="genes")
+    axes[0].set_title("genes versus counts", pad=26)
+    axes[1].scatter(
+        np.log10(totals[positive]), mito_pct[positive], s=3, alpha=0.35, linewidths=0,
         color="#555555", rasterized=True,
     )
-    axes[0].set(xscale="log", yscale="log", xlabel="total counts", ylabel="genes detected")
-    _plain_log_ticks(axes[0], "x")
-    _plain_log_ticks(axes[0], "y")
-    axes[0].set_title("genes versus counts (log-log)")
-    axes[1].scatter(
-        totals[positive], mito_pct[positive], s=3, alpha=0.35, linewidths=0, color="#555555",
-        rasterized=True,
-    )
-    axes[1].set(xscale="log", xlabel="total counts", ylabel="mitochondrial percent")
-    _plain_log_ticks(axes[1], "x")
-    axes[1].set_title("mitochondrial percent versus counts")
+    label_log10_axis(axes[1], "x", "total counts", np, raw_label="counts")
+    axes[1].set_ylabel("mitochondrial percent")
+    axes[1].set_title("mitochondrial percent versus counts", pad=26)
     axes[2].scatter(
         mito_pct, ribo_pct, s=3, alpha=0.35, linewidths=0, color="#555555", rasterized=True
     )
@@ -797,16 +872,19 @@ def plot_qc_distributions(arguments: dict[str, Any], context: Any) -> dict[str, 
         figure, axes = plt.subplots(
             len(panels), 1, figsize=(max(11.0, 0.55 * len(names) + 4.0), 3.1 * len(panels))
         )
-        for axis, (values, label, log_scale) in zip(axes, panels, strict=True):
+        for axis, (values, label, logged) in zip(axes, panels, strict=True):
             grouped = [values[selected] for selected in membership]
+            # Library size and gene counts span orders of magnitude across cell types; on a linear
+            # axis every low-complexity cluster collapses onto the floor and the difference that
+            # distinguishes debris from a small cell is not visible. The logarithm is taken here
+            # rather than applied to the axis so each box's spread is a spread in fold-change.
+            if logged:
+                grouped = [log10_positive(group, np)[0] for group in grouped]
             axis.boxplot(grouped, tick_labels=names, showfliers=False, patch_artist=True)
-            # Library size and gene counts span orders of magnitude across cell types; on a
-            # linear axis every low-complexity cluster collapses onto the floor and the
-            # difference that distinguishes debris from a small cell is not visible.
-            if log_scale and all(bool((group > 0).all()) for group in grouped if group.size):
-                axis.set_yscale("log")
-                _plain_log_ticks(axis, "y")
-            axis.set_ylabel(label)
+            if logged:
+                label_log10_axis(axis, "y", label, np, raw_label=label.split()[-1])
+            else:
+                axis.set_ylabel(label)
             axis.grid(axis="y", alpha=0.2)
             plt.setp(axis.get_xticklabels(), rotation=90, fontsize=7)
         axes[-1].set_xlabel(str(group_key))
@@ -835,7 +913,7 @@ def plot_qc_distributions(arguments: dict[str, Any], context: Any) -> dict[str, 
         "median_mito_percent": float(np.median(mito_pct)),
         "median_ribo_percent": float(np.median(ribo_pct)),
         "doublet_column": doublet_column,
-        "log_scaled_panels": ["total counts per cell", "genes detected per cell"],
+        "log10_panels": ["total counts per cell", "genes detected per cell"],
         "cells_omitted_from_log_panels": dropped_note,
         "violin_points_per_panel": jitter_shown,
         "figures": [item["name"] for item in artifacts if item["media_type"] == "image/png"],
@@ -1025,7 +1103,9 @@ def plot_embedding(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     _save(figure, context, "embedding")
     plt.close(figure)
 
-    artifacts = [_figure(context, "embedding", "Embedding")]
+    artifacts = [
+        _figure(context, "embedding", embedding_figure_title(embedding_key, color_keys))
+    ]
     media = [dict(artifacts[0])]
 
     # A companion grid per categorical panel. This is emitted automatically rather than on
@@ -1070,7 +1150,13 @@ def plot_embedding(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         _save(grid_figure, context, f"embedding-grid-{slug}")
         plt.close(grid_figure)
         grids[name] = f"embedding-grid-{slug}.png"
-        artifacts.append(_figure(context, f"embedding-grid-{slug}", f"{name} highlight grid"))
+        artifacts.append(
+            _figure(
+                context,
+                f"embedding-grid-{slug}",
+                f"{basis_label(embedding_key)} grid by {slug}",
+            )
+        )
         media.append(dict(artifacts[-1]))
 
     details = {
@@ -1151,6 +1237,8 @@ def plot_qc_embedding(arguments: dict[str, Any], context: Any) -> dict[str, Any]
                 source.replace(context.staging_dir / new_path)
             item["name"] = renamed
             item["relative_path"] = new_path
+            if item.get("title"):
+                item["title"] = f"qc {item['title']}"
     delegated["summary"] = (
         f"Plotted {delegated['details']['embedding_key']} with {len(keys)} QC overlays: "
         + ", ".join(keys)

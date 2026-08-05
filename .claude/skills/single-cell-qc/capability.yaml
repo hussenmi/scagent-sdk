@@ -1,7 +1,7 @@
 schema_version: 1
 skill:
   id: single-cell-qc
-  version: "0.2.0"
+  version: "0.5.0"
   description: Comprehensive flag-first QC, visual review, and explicit filtering operations.
 tools:
   - name: calculate_single_cell_qc
@@ -73,7 +73,7 @@ tools:
     primary_matrix_input: path
     primary_matrix_output: qc-anndata
   - name: filter_single_cell_genes
-    description: Remove genes detected in fewer than the requested number of cells, independently of cell filtering and downstream preprocessing.
+    description: Remove low-detection genes (a dataset-size-aware threshold by default) and, by default, ribosomal genes; keep mitochondrial genes. Per-cell mitochondrial/ribosomal percentages are computed before removal and preserved in obs.
     entrypoint: scripts/qc.py:filter_genes
     environment: gpu-singlecell
     activity_label: Filtering single-cell genes
@@ -86,7 +86,25 @@ tools:
           type: [string, "null"]
           default: auto
           description: "'auto' uses layers['counts'] when present and otherwise validates X; null explicitly uses X."
-        min_cells: {type: integer, minimum: 1, default: 3}
+        organism: {type: string, enum: [human, mouse], default: human, description: Used only to detect mitochondrial gene symbols when computing preserved QC percentages.}
+        min_cells:
+          type: [integer, "null"]
+          minimum: 1
+          default: null
+          description: Absolute minimum cells a gene must be detected in. Overrides the dataset-size fraction when set; leave unset to use min_cell_fraction capped at max_cells.
+        min_cell_fraction:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.02
+          description: "Keep genes detected in at least this fraction of cells (default 0.02 = 2%), capped at max_cells. Set 0 to disable the low-detection filter (e.g. strict source replication)."
+        max_cells:
+          type: integer
+          minimum: 0
+          default: 100
+          description: Absolute cap on the fraction-derived threshold so large datasets do not delete rare-cell-type markers. 2% governs small datasets; this cap takes over on large ones.
+        remove_ribosomal: {type: boolean, default: true, description: "Remove ribosomal genes (RPS/RPL and mitochondrial-ribosomal MRPS/MRPL) so they cannot drive embedding or marker interpretation. pct_counts_ribo is preserved in obs. Set false to keep them in the matrix."}
+        remove_mitochondrial: {type: boolean, default: false, description: "Remove mitochondrial (MT-) genes from the matrix. Off by default: mitochondrial content stays a cell-level QC concern (max_pct_mito) rather than a feature removal."}
         confirm_filtering: {type: boolean, description: Explicit confirmation that this operation changes the feature set.}
       required: [confirm_filtering]
       additionalProperties: false

@@ -1,0 +1,82 @@
+schema_version: 1
+skill:
+  id: manage-environment
+  version: "0.1.0"
+  description: >-
+    Add a Python package a user needs into their persistent per-runtime overlay, gated by a
+    dependency dry-run that admits only additive packages and by explicit user approval.
+tools:
+  - name: propose_package_install
+    description: >-
+      Resolve a requested package against the analysis runtime without installing it, and report
+      whether it is additive (safe to add), would conflict with the locked base, is already
+      present, or is unavailable on PyPI. Records a proposal the user can then approve. Installs
+      nothing. Always call this before install_proposed_package.
+    entrypoint: scripts/overlay_tools.py:propose_package_install
+    environment: overlay-admin
+    activity_label: Checking package
+    input_schema:
+      type: object
+      properties:
+        package:
+          type: string
+          minLength: 1
+          description: PyPI distribution name, optionally pinned (e.g. "gseapy" or "gseapy==1.1.3").
+        reason:
+          type: string
+          minLength: 1
+          description: Why the analysis needs this package; shown to the user with the approval request.
+      required: [package, reason]
+      additionalProperties: false
+  - name: install_proposed_package
+    description: >-
+      Install a package previously classified as additive by propose_package_install, after the
+      user has approved it. The tool re-verifies the package is still additive and finds the user's
+      approving turn in the session log; it refuses if no approval followed the proposal or if the
+      package would now change a base distribution. Writes only into the per-user overlay.
+    entrypoint: scripts/overlay_tools.py:install_proposed_package
+    environment: overlay-admin
+    activity_label: Installing package
+    input_schema:
+      type: object
+      properties:
+        install_request_id:
+          type: string
+          minLength: 1
+          description: The id returned by propose_package_install for this package.
+        question_asked:
+          type: string
+          minLength: 1
+          description: >-
+            The approval question put to the user. The tool records the exact answer from the first
+            real user turn after the proposal, so it must have actually been asked.
+      required: [install_request_id, question_asked]
+      additionalProperties: false
+  - name: list_installed_packages
+    description: >-
+      List the packages currently in this user's overlay for the analysis runtime, with versions
+      and the reason each was added. Read-only.
+    entrypoint: scripts/overlay_tools.py:list_installed_packages
+    environment: overlay-admin
+    activity_label: Listing packages
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+  - name: remove_installed_package
+    description: >-
+      Remove a previously added package from this user's overlay for the analysis runtime. Does not
+      touch the locked base. Use to clean up an overlay package that is no longer needed or has been
+      promoted into the base environment.
+    entrypoint: scripts/overlay_tools.py:remove_installed_package
+    environment: overlay-admin
+    activity_label: Removing package
+    input_schema:
+      type: object
+      properties:
+        package:
+          type: string
+          minLength: 1
+          description: Name of an overlay package reported by list_installed_packages.
+      required: [package]
+      additionalProperties: false

@@ -33,7 +33,7 @@ def _g(name: str) -> Any:
 
 def test_manifest_splits_evidence_and_decision_tools() -> None:
     package = _package()
-    assert package.manifest.version == "0.5.0"
+    assert package.manifest.version == "0.9.0"
     names = {tool.name for tool in package.manifest.tools}
     assert names == {"investigate_batch", "decide_batch_handling"}
     evidence = next(t for t in package.manifest.tools if t.name == "investigate_batch")
@@ -50,7 +50,10 @@ def test_manifest_splits_evidence_and_decision_tools() -> None:
     # The misleading diffxpy no-op is gone; Wilcoxon is the declared primary method.
     assert "prefer_diffxpy" not in props
     # Cost and match quality are explicitly bounded.
-    assert props["max_candidate_pairs"]["maximum"] == 500
+    assert props["max_candidate_pairs"]["default"] == 3
+    assert props["max_candidate_pairs"]["maximum"] == 20
+    assert props["max_pair_attempts"]["default"] == 10
+    assert props["min_profile_correlation"]["default"] == 0.4
     assert "min_match_jaccard" in props
     # Decision tool consumes an evidence id and is floored on current evidence.
     assert decision.floors == ("current_batch_evidence",)
@@ -62,6 +65,19 @@ def test_manifest_splits_evidence_and_decision_tools() -> None:
         "request_guidance",
         "not_applicable",
     }
+    assert "user_consultation" not in decision.input_schema["properties"]
+    assert "rationale" not in decision.input_schema["properties"]
+    assert "question_asked" in decision.input_schema["properties"]
+
+
+def test_batch_artifact_packet_is_preserved() -> None:
+    assert _g("BATCH_EVIDENCE_FILENAMES") == (
+        "batch_diagnostic_sample_enriched_regions.csv",
+        "batch_diagnostic_within_sample_degs.csv",
+        "batch_diagnostic_population_pairs.csv",
+        "batch_diagnostic_direct_pair_degs.csv",
+        "batch_diagnostic_design_check.csv",
+    )
 
 
 # --- gene-first pure helpers -------------------------------------------------
@@ -221,55 +237,27 @@ def test_recommendation_matrix() -> None:
 def test_non_integration_decisions_always_allowed() -> None:
     validate = _g("validate_decision")
     for decision in ("keep_uncorrected", "separate", "request_guidance", "not_applicable"):
-        assert (
-            validate(decision, "cannot_determine_technical_vs_biological", None, None)["ok"] is True
-        )
+        assert validate(decision, None)["ok"] is True
 
 
 def test_integrate_requires_explicit_basis() -> None:
     validate = _g("validate_decision")
-    assert validate("integrate", "integration_supported", None, None)["ok"] is False
+    assert validate("integrate", None)["ok"] is False
 
 
-def test_integrate_allowed_when_recommendation_supports_it() -> None:
+def test_integrate_allowed_with_explicit_basis() -> None:
     validate = _g("validate_decision")
-    assert (
-        validate("integrate", "integration_supported", "documented_technical_batch", None)["ok"]
-        is True
-    )
+    assert validate("integrate", "documented_technical_batch")["ok"] is True
 
 
-def test_integrate_against_evidence_requires_override_warning() -> None:
+def test_user_authorized_integration_is_not_blocked_by_an_advisory_recommendation() -> None:
     validate = _g("validate_decision")
-    blocked = validate(
-        "integrate",
-        "cannot_determine_technical_vs_biological",
-        "user_authorized_comparable_replicates",
-        None,
-    )
-    assert blocked["ok"] is False
-    allowed = validate(
-        "integrate",
-        "cannot_determine_technical_vs_biological",
-        "user_authorized_comparable_replicates",
-        "User confirmed the samples are technical replicates of one biological condition.",
-    )
-    assert allowed["ok"] is True
+    assert validate("integrate", "user_authorized_integration")["ok"] is True
 
 
-def test_integration_optional_needs_replicate_basis() -> None:
+def test_integration_optional_accepts_the_users_choice() -> None:
     validate = _g("validate_decision")
-    # A documented-technical basis does not by itself clear the optional-replicates recommendation
-    # without an override; the replicate basis does.
-    assert (
-        validate(
-            "integrate",
-            "integration_optional_for_confirmed_replicates",
-            "user_authorized_comparable_replicates",
-            None,
-        )["ok"]
-        is True
-    )
+    assert validate("integrate", "user_authorized_integration")["ok"] is True
 
 
 # --- integration basis must be backed by the evidence ------------------------
@@ -301,14 +289,363 @@ def test_documented_technical_basis_requires_documented_evidence() -> None:
     )
 
 
-def test_replicate_basis_needs_no_evidence_documentation() -> None:
+def test_user_authorized_basis_needs_no_evidence_documentation() -> None:
     check = _g("validate_integration_basis")
-    assert check("user_authorized_comparable_replicates", {})["ok"] is True
+    assert check("user_authorized_integration", {})["ok"] is True
     assert check(None, {})["ok"] is True
 
 
 def test_decision_policy_version_is_declared() -> None:
-    assert _g("DECISION_POLICY_VERSION") == 1
+    assert _g("DECISION_POLICY_VERSION") == 4
+    assert _g("BATCH_EVIDENCE_SCHEMA") == 2
+
+
+# --- user consultation on decisions the evidence cannot settle ---------------
+
+_UNSETTLED = "cannot_determine_technical_vs_biological"
+
+
+def _turns() -> tuple[dict[str, Any], ...]:
+    return (
+        {"turn_id": "t-open", "sequence": 4, "user_prompt": "analyze this dataset"},
+        {"turn_id": "t-answer", "sequence": 40, "user_prompt": "they are 8 unrelated donors"},
+    )
+
+
+_QUESTION = "Keep the 8 donors combined uncorrected, integrate, or separate?"
+
+
+def _check(decision: str, recommendation: str, question: Any, *, anchor: int = 20) -> Any:
+    return _g("validate_consultation")(
+        decision,
+        question,
+        anchor_sequence=anchor,
+        user_turns=_turns(),
+    )
+
+
+def test_latest_user_turn_sequence_ignores_malformed_entries() -> None:
+    latest = _g("latest_user_turn_sequence")
+    assert latest(_turns()) == 40
+    assert latest(()) == 0
+    assert latest([{"sequence": "nope"}, "junk", {"turn_id": "x"}]) == 0
+
+
+def test_anchor_is_carried_forward_for_unchanged_science() -> None:
+    # Re-running the investigation on unchanged science must not move the anchor forward: a user who
+    # already answered in the current turn would otherwise be told their answer predates the
+    # evidence and be made to repeat themselves.
+    carry = _g("carry_forward_anchor")
+    facts = {
+        "batch": {"evidence": {"evidence_id": "e1", "consultation_anchor_sequence": 5}},
+    }
+    assert carry(facts, "e1", 40) == 5
+    # Changed science is a different question and correctly starts over.
+    assert carry(facts, "e2", 40) == 40
+    # Nothing recorded yet, or a malformed/absent anchor, falls back to the current turn.
+    assert carry({}, "e1", 40) == 40
+    assert carry({"batch": {"evidence": {"evidence_id": "e1"}}}, "e1", 40) == 40
+    assert carry(
+        {"batch": {"evidence": {"evidence_id": "e1", "consultation_anchor_sequence": True}}},
+        "e1",
+        40,
+    ) == 40
+
+
+def test_every_substantive_post_investigation_choice_needs_consultation() -> None:
+    for recommendation in (
+        "do_not_integrate_based_on_current_evidence",
+        "integration_supported",
+        "not_applicable",
+    ):
+        verdict = _check("keep_uncorrected", recommendation, None)
+        assert verdict["ok"] is False
+        assert "question_asked" in verdict["violation"]
+
+
+def test_unsettled_recommendation_blocks_substantive_decision_without_consultation() -> None:
+    # The exact defect this gate exists for: keep_uncorrected was the frictionless path, needing
+    # neither a basis nor an override, so an unresolved question could be recorded as resolved.
+    for decision in ("keep_uncorrected", "integrate", "separate"):
+        verdict = _check(decision, _UNSETTLED, None)
+        assert verdict["ok"] is False
+        assert "question_asked" in verdict["violation"]
+        assert "request_guidance" in verdict["violation"]
+
+
+def test_integration_optional_recommendation_also_requires_consultation() -> None:
+    verdict = _check("integrate", "integration_optional_for_confirmed_replicates", None)
+    assert verdict["ok"] is False
+
+
+def test_deferring_decisions_never_require_consultation() -> None:
+    for decision in ("request_guidance", "not_applicable"):
+        assert _check(decision, _UNSETTLED, None)["ok"] is True
+
+
+def test_consultation_requires_the_question() -> None:
+    assert _check("keep_uncorrected", _UNSETTLED, None)["ok"] is False
+    assert _check("keep_uncorrected", _UNSETTLED, "   ")["ok"] is False
+
+
+def test_consultation_requires_a_real_later_user_turn() -> None:
+    # The opening "analyze this dataset" prompt cannot authorize an answer to a question that
+    # only the later evidence raised.
+    verdict = _check("keep_uncorrected", _UNSETTLED, _QUESTION, anchor=40)
+    assert verdict["ok"] is False
+    assert "no user answer after" in verdict["violation"]
+
+
+def test_consultation_rejects_the_turn_the_evidence_itself_was_produced_in() -> None:
+    # Evidence and decision inside one turn is exactly what the bad session did: the newest turn
+    # at evidence time is the anchor, so it cannot also be the consultation.
+    verdict = _check("keep_uncorrected", _UNSETTLED, _QUESTION, anchor=40)
+    assert verdict["ok"] is False
+
+
+def test_accepted_consultation_resolves_exact_answer_from_the_first_turn_after_the_question(
+) -> None:
+    verdict = _check("keep_uncorrected", _UNSETTLED, _QUESTION)
+    assert verdict["ok"] is True
+    assert verdict["consultation"] == {
+        "turn_id": "t-answer",
+        "turn_sequence": 40,
+        "question_asked": _QUESTION,
+        "user_answer": "they are 8 unrelated donors",
+        "anchor_sequence": 20,
+        "turns_after_anchor": 1,
+        "question_id": None,
+    }
+
+
+def test_an_unrelated_later_instruction_is_not_harvested_as_the_batch_answer() -> None:
+    """The answer to a question is the first thing the user says after it, not the newest thing.
+
+    Taking the newest post-anchor turn let a real session record "can you finalize" — typed two
+    hours later, about something else entirely — as the user's authorization to integrate.
+    """
+
+    turns = (
+        {"turn_id": "t-open", "sequence": 4, "user_prompt": "analyze this dataset"},
+        {"turn_id": "t-answer", "sequence": 40, "user_prompt": "yes integrate"},
+        {"turn_id": "t-unrelated", "sequence": 92, "user_prompt": "can you finalize"},
+    )
+
+    verdict = _g("validate_consultation")(
+        "integrate", _QUESTION, anchor_sequence=20, user_turns=turns
+    )
+
+    assert verdict["consultation"]["turn_id"] == "t-answer"
+    assert verdict["consultation"]["user_answer"] == "yes integrate"
+    # A longer exchange stays visible instead of being hidden behind the one quoted line.
+    assert verdict["consultation"]["turns_after_anchor"] == 2
+
+
+def test_a_recorded_answer_survives_re_investigation_of_the_same_question() -> None:
+    """The deadlock this fixes: integrate → re-cluster → re-investigate → decision impossible.
+
+    A real session asked, was told "yes integrate", trained scVI, re-clustered, re-ran
+    investigate_batch because the batch floor required evidence for the new clustering, and then
+    could not record the decision at all: the answer now predated the newest evidence, and only a
+    future user turn could unblock it. The question — how to handle this batch variable and its
+    samples — had not changed, so the recorded answer still applies.
+    """
+
+    question_id = _g("consultation_question_id")("sample", ["A", "B"])
+    prior = {
+        "turn_id": "t-answer",
+        "turn_sequence": 46,
+        "user_answer": "yes integrate",
+        "question_asked": _QUESTION,
+        "anchor_sequence": 42,
+        "question_id": question_id,
+    }
+    # No user turn exists after the *new* anchor, which is what made this unsatisfiable.
+    verdict = _g("validate_consultation")(
+        "integrate",
+        _QUESTION,
+        anchor_sequence=58,
+        user_turns=({"turn_id": "t-answer", "sequence": 46, "user_prompt": "yes integrate"},),
+        question_id=question_id,
+        prior_consultation=prior,
+    )
+
+    assert verdict["ok"] is True
+    assert verdict["consultation"]["turn_id"] == "t-answer"
+    assert verdict["consultation"]["user_answer"] == "yes integrate"
+    assert verdict["consultation"]["reaffirmed_without_new_turn"] is True
+
+    # A different batch variable is a different question and must be asked.
+    other = _g("validate_consultation")(
+        "integrate",
+        _QUESTION,
+        anchor_sequence=58,
+        user_turns=({"turn_id": "t-answer", "sequence": 46, "user_prompt": "yes integrate"},),
+        question_id=_g("consultation_question_id")("donor", ["A", "B"]),
+        prior_consultation=prior,
+    )
+    assert other["ok"] is False
+
+
+def test_carried_forward_consultation_requires_a_real_answer_to_the_same_question() -> None:
+    carry = _g("carry_forward_consultation")
+    question_id = _g("consultation_question_id")("sample", ["A", "B"])
+    answered = {
+        "batch": {
+            "decision": {
+                "decision": "integrate",
+                "user_consultation": {"turn_id": "t-answer", "question_id": question_id},
+            }
+        }
+    }
+    assert carry(answered, question_id)["turn_id"] == "t-answer"
+    # A different question, a deferral, and a missing consultation all carry nothing forward.
+    assert carry(answered, _g("consultation_question_id")("donor", ["A", "B"])) is None
+    assert (
+        carry(
+            {"batch": {"decision": {"decision": "request_guidance", "user_consultation": None}}},
+            question_id,
+        )
+        is None
+    )
+    assert carry({}, question_id) is None
+    assert carry(answered, None) is None
+
+
+def test_the_question_identity_ignores_representation_and_clustering() -> None:
+    same = _g("consultation_question_id")
+    # Same batch variable and samples, in any order: the same question.
+    assert same("sample", ["B", "A", "A"]) == same("sample", ["A", "B"])
+    assert same("sample", ["A", "B"]) != same("sample", ["A", "B", "C"])
+    assert same("sample", ["A", "B"]) != same("donor", ["A", "B"])
+
+
+# --- decision entrypoint end to end ------------------------------------------
+
+
+def _evidence_facts(recommendation: str = _UNSETTLED, anchor: int = 20) -> dict[str, Any]:
+    return {
+        "batch": {
+            "evidence": {
+                "schema_version": _g("BATCH_EVIDENCE_SCHEMA"),
+                "status": "complete",
+                "evidence_id": "batch-evidence:e1",
+                "recommendation": recommendation,
+                "consultation_anchor_sequence": anchor,
+                "technical_batch_documented": False,
+                "technical_batch_basis": None,
+                "matched_populations": [
+                    {
+                        "cluster_a": "1",
+                        "sample_a": "Donor_01",
+                        "cluster_b": "5",
+                        "sample_b": "Donor_02",
+                        "shared_top25_count": 12,
+                        "shared_identity_genes": ["C1QA", "C1QB", "APOC1"],
+                    }
+                ],
+                **_provenance(),
+            },
+            "decision": None,
+        }
+    }
+
+
+def _decision_context(tmp_path: Path, facts: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        staging_dir=tmp_path,
+        state_facts=facts,
+        user_turns=_turns(),
+        execution_id="exec-1",
+    )
+
+
+def test_run_decision_rejects_unconsulted_keep_and_accepts_the_consulted_one(
+    tmp_path: Path,
+) -> None:
+    run_decision = _handler("decide_batch_handling")
+    facts = _evidence_facts()
+    with pytest.raises(ValueError, match="question_asked"):
+        run_decision(
+            {
+                "evidence_id": "batch-evidence:e1",
+                "decision": "keep_uncorrected",
+            },
+            _decision_context(tmp_path, facts),
+        )
+    result = run_decision(
+        {
+            "evidence_id": "batch-evidence:e1",
+            "decision": "keep_uncorrected",
+            "question_asked": _QUESTION,
+        },
+        _decision_context(tmp_path, facts),
+    )
+    recorded = result["facts_patch"]["batch"]["decision"]
+    assert recorded["decision"] == "keep_uncorrected"
+    assert recorded["user_consultation"]["turn_id"] == "t-answer"
+    assert recorded["decision_policy_version"] == 4
+    assert "t-answer" in result["summary"]
+    report = (tmp_path / "batch-decision.md").read_text(encoding="utf-8")
+    assert "## What the user said" in report
+    assert "they are 8 unrelated donors" in report
+    assert "Keep the samples combined without integration" in report
+    assert "## Evidence considered" in report
+    assert "within-sample identity DEGs" in report
+    assert "## Effect on the analysis" in report
+    assert "cannot_determine_technical_vs_biological" not in report
+
+
+def test_run_decision_records_request_guidance_as_pending(tmp_path: Path) -> None:
+    run_decision = _handler("decide_batch_handling")
+    result = run_decision(
+        {
+            "evidence_id": "batch-evidence:e1",
+            "decision": "request_guidance",
+        },
+        _decision_context(tmp_path, _evidence_facts()),
+    )
+    recorded = result["facts_patch"]["batch"]["decision"]
+    assert recorded["decision"] == "request_guidance"
+    assert recorded["user_consultation"] is None
+    assert "finalization stays blocked" in result["summary"]
+    assert "Pending." in (tmp_path / "batch-decision.md").read_text(encoding="utf-8")
+
+
+def test_run_decision_records_user_authorized_integration_without_inventing_cause(
+    tmp_path: Path,
+) -> None:
+    run_decision = _handler("decide_batch_handling")
+    result = run_decision(
+        {
+            "evidence_id": "batch-evidence:e1",
+            "decision": "integrate",
+            "integration_basis": "user_authorized_integration",
+            "question_asked": "Would you like to integrate these samples?",
+        },
+        _decision_context(tmp_path, _evidence_facts()),
+    )
+    recorded = result["facts_patch"]["batch"]["decision"]
+    assert recorded["user_consultation"]["user_answer"] == "they are 8 unrelated donors"
+    assert "does not by itself establish" in recorded["rationale"]
+    assert "technical replicates" not in recorded["rationale"]
+    assert "technical variation" not in recorded["rationale"]
+
+
+def test_run_decision_still_needs_user_choice_when_advisory_looks_settled(
+    tmp_path: Path,
+) -> None:
+    run_decision = _handler("decide_batch_handling")
+    with pytest.raises(ValueError, match="question_asked"):
+        run_decision(
+            {
+                "evidence_id": "batch-evidence:e1",
+                "decision": "keep_uncorrected",
+            },
+            _decision_context(
+                tmp_path, _evidence_facts("do_not_integrate_based_on_current_evidence")
+            ),
+        )
 
 
 # --- identity resolution -----------------------------------------------------
@@ -360,3 +697,54 @@ def test_high_cardinality_switches_to_heatmap() -> None:
     layout = _g("_figure_layout")(26, 17)
     assert layout["mode"] == "heatmap"
     assert layout["figsize"][0] <= 26.0
+
+
+def test_evidence_report_translates_internal_labels_to_plain_language(tmp_path: Path) -> None:
+    report = tmp_path / "batch-investigation.md"
+    _g("_write_evidence_report")(
+        report,
+        {
+            "batch_key": "donor",
+            "gene_evidence": "recurring_sample_associated",
+            "design_interpretation": "unknown",
+            "recommendation": "cannot_determine_technical_vs_biological",
+            "n_enriched_regions": 30,
+            "n_supported_matches": 3,
+            "n_direct_compared_pairs": 3,
+            "n_recurring_programs": 10,
+            "de_engine": "scanpy_wilcoxon",
+            "gene_class_version": "batch-gene-class-v1",
+            "matched_populations": [
+                {
+                    "cluster_a": "7",
+                    "sample_a": "Donor_08",
+                    "within_sample_comparison_a": (
+                        "cluster 7 vs all other cells in Donor_08"
+                    ),
+                    "cluster_b": "26",
+                    "sample_b": "Donor_05",
+                    "within_sample_comparison_b": (
+                        "cluster 26 vs all other cells in Donor_05"
+                    ),
+                    "shared_top25_count": 20,
+                    "shared_identity_genes": ["APOC1", "C1QA", "C1QB", "TYROBP"],
+                    "direct_comparison_higher_in_a": ["GENEA"],
+                    "direct_comparison_higher_in_b": ["GENEB"],
+                }
+            ],
+        },
+    )
+    text = report.read_text(encoding="utf-8")
+    assert "## Conclusion" in text
+    assert "## Recommendation" in text
+    assert "The samples clearly organize the data" in text
+    assert "cluster 7 vs all other cells in Donor_08" in text
+    assert "share 20 of their top 25 genes" in text
+    assert "APOC1, C1QA, C1QB, TYROBP" in text
+    assert "does not prove that the cause is technical" in text
+    assert "The matched-population DEGs are the main evidence" in text
+    assert "batch_diagnostic_population_pairs.csv" in text
+    assert "Ask the user" not in text
+    assert "recurring_sample_associated" not in text
+    assert "cannot_determine_technical_vs_biological" not in text
+    assert "legacy" not in text.casefold()

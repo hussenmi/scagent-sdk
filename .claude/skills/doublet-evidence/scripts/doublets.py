@@ -203,25 +203,67 @@ def _write_report(
     parameters: dict[str, Any],
     rows: list[dict[str, Any]],
     warnings: list[str],
+    has_umap: bool,
 ) -> None:
+    total_cells = sum(int(row["n_cells"]) for row in rows)
+    total_predicted = sum(int(row["predicted_doublets"]) for row in rows)
+    overall_rate = total_predicted / total_cells if total_cells else 0.0
+    highest = max(rows, key=lambda row: float(row["predicted_rate"])) if rows else None
+    lowest = min(rows, key=lambda row: float(row["predicted_rate"])) if rows else None
     lines = [
-        "# Scrublet doublet evidence",
+        "# Doublet investigation",
         "",
-        f"- Raw-count source: `{count_source}`",
-        f"- Library key: `{batch_key}`" if batch_key else "- Library key: unstratified (confirmed)",
-        f"- Libraries: {len(rows)}",
-        f"- Random seed: {parameters['random_seed']}",
-        f"- Expected rate prior: {parameters['expected_doublet_rate']:.3f}",
+        "## Conclusion",
         "",
-        "## Per-library calls",
+        f"Scrublet marked **{total_predicted:,} of {total_cells:,} cells "
+        f"({overall_rate:.2%})** as possible doublets. These are candidates for review, not "
+        "confirmed cells to remove.",
         "",
     ]
+    if highest is not None and lowest is not None:
+        lines.extend(
+            [
+                f"The predicted rate ranged from {float(lowest['predicted_rate']):.2%} in "
+                f"`{lowest['library']}` to {float(highest['predicted_rate']):.2%} in "
+                f"`{highest['library']}`.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## What was done",
+            "",
+            f"Scrublet was run on the raw counts stored in `{count_source}`. "
+            + (
+                f"Cells were evaluated separately within each `{batch_key}` group so different "
+                "library sizes and compositions did not share one threshold."
+                if batch_key
+                else "The dataset was explicitly treated as one library."
+            ),
+            "",
+            "Scrublet creates simulated doublets, compares real cells with those simulations, and "
+            "assigns each cell a score plus a predicted-doublet call. The expected-rate value is a "
+            "prior used by the method; it is not a target that the observed calls must equal.",
+            "",
+            "## What was found",
+            "",
+            "| Library | Cells | Possible doublets | Rate | Score threshold |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
     for row in rows:
         lines.append(
-            f"- `{row['library']}`: {row['predicted_doublets']:,}/{row['n_cells']:,} "
-            f"({row['predicted_rate']:.2%}), score p95={row['score_p95']:.4f}, "
-            f"threshold={row['threshold']}"
+            f"| `{row['library']}` | {row['n_cells']:,} | "
+            f"{row['predicted_doublets']:,} | {row['predicted_rate']:.2%} | "
+            f"{row['threshold']} |"
         )
+    lines.extend(["", "## Interpretation and recommendation", ""])
+    lines.append(
+        "Do not remove cells from these calls alone. First check whether high-scoring cells "
+        "concentrate in clusters with mixed or contradictory marker genes, unusually high RNA "
+        "content, or other evidence of two cells captured together. If the calls are dispersed "
+        "among coherent populations, retain them and carry the flag into cluster review."
+    )
     lines.extend(["", "## Warnings", ""])
     lines.extend(
         f"- {warning}"
@@ -230,12 +272,35 @@ def _write_report(
     lines.extend(
         [
             "",
-            "## Interpretation boundary",
+            "## Supporting files",
             "",
-            "Scrublet predictions are review evidence, not ground truth. Heterotypic doublets are "
-            "easier to identify than homotypic doublets, and coherent high-RNA singlets may score "
-            "highly. Review cluster, marker, library, and QC context before filtering. Use the "
-            "recorded `predicted_doublet` call; do not invent a score cutoff.",
+            "- `doublet-library-summary.csv` — the per-library numbers shown above.",
+            "- `doublet-calls.csv` — each cell's score and predicted-doublet call.",
+            "- `doublet-score-distribution.png` — observed scores compared with simulated "
+            "doublets.",
+            "- `doublet-rate-by-library.png` — the predicted fraction in each library.",
+        ]
+    )
+    if has_umap:
+        lines.append(
+            "- `doublet-umap.png` — where high scores and predicted calls fall on the cell map."
+        )
+    lines.extend(
+        [
+            "- `doublet-annotated.h5ad` — the input cells with `doublet_score` and "
+            "`predicted_doublet` added.",
+            "",
+            "## Method settings",
+            "",
+            f"- Expected doublet-rate prior: {parameters['expected_doublet_rate']:.2%}",
+            f"- Random seed: {parameters['random_seed']}",
+            f"- Principal components used: {parameters['n_prin_comps_used']}",
+            "",
+            "## Important limit",
+            "",
+            "Heterotypic doublets are easier to detect than doublets made from two similar cells, "
+            "and coherent high-RNA singlets can receive high scores. The recorded call should be "
+            "reviewed as one evidence stream rather than replaced with an ad hoc score cutoff.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -460,6 +525,7 @@ def _execute_evidence(arguments: dict[str, Any], context: Any) -> dict[str, Any]
         parameters=parameters,
         rows=rows,
         warnings=warnings,
+        has_umap="X_umap" in adata.obsm,
     )
     details = {
         "status": "complete",
@@ -603,18 +669,61 @@ def _write_review_report(
     n_predicted: int,
     output_path: str | None,
 ) -> None:
-    path.write_text(
-        "# Doublet evidence review\n\n"
-        f"- Decision: **{decision}**\n"
-        f"- Current cells: {n_cells:,}\n"
-        f"- Scrublet predicted calls: {n_predicted:,}\n"
-        f"- Filtered raw-count artifact: `{output_path}`\n\n"
-        "## Rationale\n\n"
-        f"{rationale}\n\n"
-        "Filtering, when selected, used only `predicted_doublet == true`; no custom score cutoff "
-        "was applied. A filtered cell set requires fresh preparation and downstream evidence.\n",
-        encoding="utf-8",
+    decision_plain = {
+        "retain_for_cluster_review": "Retain the cells and review the calls by cluster",
+        "keep_all": "Keep all cells",
+        "remove_predicted": "Remove cells Scrublet predicted as doublets",
+        "request_guidance": "Wait for the user's guidance",
+    }.get(decision, decision)
+    fraction = n_predicted / n_cells if n_cells else 0.0
+    lines = [
+        "# Doublet-handling decision",
+        "",
+        "## Decision",
+        "",
+        f"**{decision_plain}.**",
+        "",
+        f"Scrublet marked {n_predicted:,} of {n_cells:,} cells ({fraction:.2%}) as possible "
+        "doublets.",
+        "",
+        "## Why",
+        "",
+        rationale,
+        "",
+        "The important reason for this decision is that the calls are probabilistic and can now "
+        "be checked against cluster composition, marker genes, and RNA-content evidence. The "
+        "6% expected rate is method context, not a target and not proof that calls below it are "
+        "correct.",
+        "",
+        "## Effect on the data",
+        "",
+    ]
+    if output_path:
+        lines.extend(
+            [
+                f"The {n_predicted:,} cells with `predicted_doublet == true` were removed. "
+                f"The filtered raw-count dataset is `{output_path}`.",
+                "",
+                "Because the cell set changed, normalization, dimensionality reduction, "
+                "clustering, and downstream evidence must be recomputed from the filtered counts.",
+            ]
+        )
+    else:
+        lines.append(
+            "No cells were removed. The score and predicted call remain attached to each cell so "
+            "they can be considered together with cluster quality and marker evidence."
+        )
+    lines.extend(
+        [
+            "",
+            "## Supporting record",
+            "",
+            "`doublet-review.json` stores the same decision and rationale in machine-readable "
+            "form. If filtering is selected, it uses the recorded boolean call exactly; no custom "
+            "score cutoff is introduced.",
+        ]
     )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _execute_review(arguments: dict[str, Any], context: Any) -> dict[str, Any]:

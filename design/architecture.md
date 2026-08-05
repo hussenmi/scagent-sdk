@@ -112,6 +112,23 @@ without selecting the analysis path. Examples include:
 `PostToolUseFailure` adds recovery context, and `Stop` prevents premature completion. Hooks
 must be independent because the SDK may dispatch multiple matchers concurrently.
 
+Three properties keep a predicate from behaving like a step in a pipeline, and all three are load-
+bearing — a floor that loses one of them is indistinguishable from a fixed DAG:
+
+- **Always satisfiable.** Some action available to the model must clear it. A floor whose evidence
+  cannot be produced — because the tool that produces it fails for an unrelated reason, or because
+  the only satisfying action is a *future user turn* — is not a gate, it is a dead end.
+- **Never invalidated by something that did not change the question.** Staleness must follow the
+  scientific identity the evidence is actually about. A recorded human answer is about the analysis,
+  not about which artifact was on screen when it was given.
+- **Visible before it binds.** The unmet set is stated up front, and a step that makes evidence stale
+  says so when it happens rather than when something is finally blocked. Discovering four unmet
+  predicates at `finalize_analysis` is what makes an order-free design feel like a fixed sequence.
+
+Transport, presentation, and bookkeeping limits are not floors and must never fail an execution that
+already produced its science. They degrade: attach a smaller figure, name what could not be attached,
+match a file by its name rather than demanding an exact path.
+
 ## 3. Model transport
 
 The scientific system should depend on a small model-profile contract, not on LiteLLM,

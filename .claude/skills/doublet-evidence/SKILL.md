@@ -11,6 +11,13 @@ can score highly, and the expected rate depends on loading and capture design.
 
 ## Evidence sequence
 
+Run this **before the first clustering**, right after cell QC — the position legacy Scrublet held
+in its QC pipeline. Cluster QC reads the per-cell `predicted_doublet` calls as a junk-cluster
+signal, so producing doublet evidence first means the initial clustering and cluster QC are not
+blind to doublets. Scrublet scores are clustering-independent, so nothing about the computation
+needs clusters to exist yet; the cluster-distribution *review* (step 4) uses the clustering once it
+does.
+
 1. Start from an H5AD with integer-valued raw counts in `layers["counts"]` or `X`. Evaluation
    derives portable identities from the artifact. CellBender, when chosen, belongs before this
    step. Never run Scrublet on log-normalized or scaled values.
@@ -37,7 +44,9 @@ can score highly, and the expected rate depends on loading and capture design.
 - If calls concentrate in a coherent biological cluster, review marker identity and library/QC
   context before removal. Doublet enrichment alone is not proof that the cluster is artifactual.
 - Removing calls changes the cell set. Re-run preparation, embedding, clustering, cluster QC,
-  batch investigation, and annotation on the filtered raw-count artifact.
+  batch investigation, and annotation on the filtered raw-count artifact. Gene filtering is
+  different: it removes genes, not cells, so `filter_single_cell_genes` carries this doublet
+  evidence forward re-stamped rather than invalidating it.
 
 Read [references/scrublet-and-state-contract.md](references/scrublet-and-state-contract.md) before
 changing parameters or removing calls.

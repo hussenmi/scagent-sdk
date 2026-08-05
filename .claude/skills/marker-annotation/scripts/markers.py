@@ -268,19 +268,98 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
             "candidates": candidates,
         },
     )
+    report_lines = [
+        "# Cluster marker investigation",
+        "",
+        "## Conclusion",
+        "",
+        f"Marker evidence was evaluated for all **{len(clusters)} clusters** in `{cluster_key}`. "
+        "The entries below are candidate identities supported by cluster DEGs; they are not final "
+        "cell-type labels.",
+        "",
+        "## What was done",
+        "",
+        "For each cluster, cells in that cluster were compared with all other cells. The report "
+        "keeps positive DEGs that pass the adjusted-p-value and log-fold-change thresholds, then "
+        "asks which curated marker programs those genes support. Genes shared by many programs "
+        "are down-weighted so one generic marker cannot decide a label.",
+        "",
+        "## Findings by cluster",
+        "",
+    ]
+    for cluster in clusters:
+        deg_info = deg_summary[cluster]
+        top_genes = [str(item["gene"]) for item in deg_info["top_degs"][:8]]
+        supported = [
+            item for item in candidates[cluster] if item.get("support") == "supported"
+        ]
+        report_lines.extend(
+            [
+                f"### Cluster {cluster}",
+                "",
+                f"- Significant positive DEGs: "
+                f"{deg_info['n_significant_positive_degs']:,}.",
+                f"- Highest-ranked DEGs: {', '.join(top_genes) if top_genes else 'none passed'}.",
+            ]
+        )
+        if supported:
+            for item in supported:
+                overlap = str(item.get("overlap_genes", "")).replace(";", ", ")
+                report_lines.append(
+                    f"- Marker-program support: **{item['candidate']}**, from "
+                    f"{int(item['overlap_count'])} overlapping gene(s)"
+                    f" ({overlap or 'genes not listed'})."
+                )
+            report_lines.append(
+                "- Interpretation: the DEG pattern supports these identities as hypotheses. "
+                "Compare them with an independent reference method and check conflicting markers "
+                "before assigning the final label."
+            )
+        else:
+            report_lines.extend(
+                [
+                    "- Marker-program support: no program reached the required overlap.",
+                    "- Interpretation: the DEGs do not support a confident identity from the "
+                    "current marker library; keep this cluster unresolved until another evidence "
+                    "source clarifies it.",
+                ]
+            )
+        report_lines.append("")
+    report_lines.extend(
+        [
+            "## Recommendation",
+            "",
+            "Use the cluster DEGs as the primary biological evidence, then compare each candidate "
+            "with independent CellTypist, SCimilarity, or other reference evidence. Resolve "
+            "agreement and conflict cluster by cluster; do not turn the highest marker score into "
+            "a final label automatically.",
+            "",
+            "## Warnings",
+            "",
+        ]
+    )
+    report_lines.extend(
+        f"- {warning}" for warning in warnings or ["No automated DEG warnings."]
+    )
+    report_lines.extend(
+        [
+            "",
+            "## Supporting files",
+            "",
+            "- `cluster-deg.csv` — the full differential-expression table.",
+            "- `marker-program-scores.csv` — every marker program scored for every cluster.",
+            "- `marker-candidates.json` — the top candidate programs and DEG summary per cluster.",
+            "",
+            "## Method settings",
+            "",
+            f"- Adjusted p-value threshold: {max_adjusted_pvalue}",
+            f"- Minimum log fold-change: {min_logfoldchange}",
+            f"- Minimum marker overlap: {min_overlap} genes",
+            f"- Marker-set fingerprint: `{marker_sets_fingerprint}`",
+        ]
+    )
     (context.staging_dir / "marker-evidence.md").write_text(
-        "# Marker and DEG evidence\n\n"
-        f"- Clustering identity: `{clustering_id}`\n"
-        f"- Cell-set identity: `{cell_set_id}`\n"
-        f"- Positive DEG thresholds: adjusted p <= {max_adjusted_pvalue}, "
-        f"log fold-change >= {min_logfoldchange}\n"
-        f"- Marker-set fingerprint: `{marker_sets_fingerprint}`\n\n"
-        "Candidates are hypotheses. Shared markers are down-weighted, insufficient overlap is "
-        "reported, and final labels require independent reference evidence plus explicit "
-        "DEG-derived adjudication.\n\n"
-        "## Warnings\n\n"
-        + "\n".join(f"- {warning}" for warning in warnings or ["No automated DEG warnings."])
-        + "\n",
+        "\n".join(report_lines) + "\n",
         encoding="utf-8",
     )
     return {

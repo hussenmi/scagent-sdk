@@ -1,0 +1,42 @@
+schema_version: 1
+skill:
+  id: query-analysis-state
+  version: "0.1.0"
+  description: Answer what an analysis has done, with which parameters, and what was decided, directly from the durable session record.
+tools:
+  - name: summarize_analysis_state
+    description: Report where the analysis stands now from durable facts and lineage — dataset identity and working shape, the active version, and every recorded fact area with its scalar values.
+    entrypoint: scripts/query.py:summarize_analysis_state
+    activity_label: Reading analysis state
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+  - name: find_analysis_steps
+    description: Find committed steps and their exact recorded arguments from the event log, most recent first, each labelled with whether it sits on the active line of descent. Use to answer whether a step ran and with what parameters.
+    entrypoint: scripts/query.py:find_analysis_steps
+    activity_label: Searching committed steps
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Case-insensitive text matched against tool name, skill, summary, and argument values. Omit to list all committed steps.
+        tool_name:
+          type: string
+          description: Case-insensitive substring of the tool name to restrict the search to one kind of step.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 25
+          description: Maximum number of most-recent matching steps to return.
+      additionalProperties: false
+  - name: list_recorded_decisions
+    description: List the explicit recorded decisions (batch handling, QC and cluster reviews, version switches) with their rationale and, when a decision cites one, the authorizing user turn.
+    entrypoint: scripts/query.py:list_recorded_decisions
+    activity_label: Reading recorded decisions
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false

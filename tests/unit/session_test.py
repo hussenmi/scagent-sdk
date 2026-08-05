@@ -14,6 +14,7 @@ from scagent_sdk.errors import (
 from scagent_sdk.runtime.resume import ResumeMode
 from scagent_sdk.session import AnalysisSession
 from scagent_sdk.state.store import (
+    MAX_USER_TURN_PROMPT_CHARS,
     SessionStore,
     apply_merge_patch,
     new_session_id,
@@ -144,6 +145,36 @@ def test_reconstructed_handoff_includes_recent_narrative_and_authoritative_paths
     assert "model narrative, not authoritative evidence" in plan.context
 
 
+def test_reconstructed_handoff_excludes_reasoning_and_textual_tool_protocol(
+    tmp_path: Path,
+) -> None:
+    session = AnalysisSession.create(tmp_path, title="Sanitized handoff")
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "turn-1", "user_prompt": "Continue"},
+        actor="user",
+    )
+    session.store.record(
+        "runtime.turn_completed",
+        payload={
+            "turn_id": "turn-1",
+            "response": {
+                "final_text": (
+                    "<think>private chain of thought</think>"
+                    "Visible scientific handoff."
+                    "<tool_call>{\"name\":\"read_file\",\"arguments\":{}}</tool_call>"
+                )
+            },
+        },
+    )
+
+    plan = session.plan_resume(runtime="claude-agent-sdk", model_profile="new-profile")
+
+    assert "Visible scientific handoff." in plan.context
+    assert "private chain of thought" not in plan.context
+    assert "<tool_call>" not in plan.context
+
+
 def test_reconstructed_handoff_preserves_the_request_from_a_failed_turn(
     tmp_path: Path,
 ) -> None:
@@ -233,3 +264,59 @@ def test_list_sessions_is_recent_first(tmp_path: Path) -> None:
 def test_missing_session_has_specific_error(tmp_path: Path) -> None:
     with pytest.raises(SessionNotFoundError, match="not found"):
         AnalysisSession.resume(tmp_path, "missing")
+
+
+def test_user_turn_index_reports_only_real_user_turns_in_order(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path, title="Turn index", session_id="turns")
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "t1", "user_prompt": "analyze this dataset"},
+        actor="user",
+    )
+    # A capability payload that merely mentions the turn kind must not enter the index; the cheap
+    # substring prefilter is re-checked against the event kind.
+    session.store.record(
+        "capability.result_committed",
+        payload={"summary": "wrote a note about runtime.turn_started", "turn_id": "t-fake"},
+    )
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "t2", "user_prompt": "keep them uncorrected"},
+        actor="user",
+    )
+
+    turns = session.store.user_turns()
+
+    assert [turn["turn_id"] for turn in turns] == ["t1", "t2"]
+    # Sequences are event sequences (the session-created event is 1), so they order a turn
+    # against any other event in the log.
+    assert [turn["sequence"] for turn in turns] == [2, 4]
+    assert turns[1]["user_prompt"] == "keep them uncorrected"
+
+
+def test_user_turn_index_truncates_prompts_and_keeps_the_most_recent(tmp_path: Path) -> None:
+    session = AnalysisSession.create(tmp_path, title="Turn bounds", session_id="bounds")
+    for index in range(5):
+        session.store.record(
+            "runtime.turn_started",
+            payload={"turn_id": f"t{index}", "user_prompt": "x" * 5000},
+            actor="user",
+        )
+
+    turns = session.store.user_turns(limit=2)
+
+    assert [turn["turn_id"] for turn in turns] == ["t3", "t4"]
+    assert len(turns[0]["user_prompt"]) == MAX_USER_TURN_PROMPT_CHARS
+
+
+def test_user_turn_index_survives_a_malformed_line(tmp_path: Path) -> None:
+    # A consultation check must never be the thing that fails a session, so this view tolerates
+    # what events() rejects.
+    session = AnalysisSession.create(tmp_path, title="Turn tolerance", session_id="tolerant")
+    session.store.record(
+        "runtime.turn_started", payload={"turn_id": "t1", "user_prompt": "hi"}, actor="user"
+    )
+    with session.store.events_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"kind": "runtime.turn_started", broken\n')
+
+    assert [turn["turn_id"] for turn in session.store.user_turns()] == ["t1"]

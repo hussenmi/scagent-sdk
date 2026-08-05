@@ -1,11 +1,11 @@
 schema_version: 1
 skill:
   id: batch-investigation
-  version: "0.5.0"
-  description: Gene-first batch evidence and a separate identity-bound handling decision.
+  version: "0.9.0"
+  description: Gene-first matched-population batch evidence followed by a user-owned, identity-bound handling decision.
 tools:
   - name: investigate_batch
-    description: Produce gene-first batch evidence — sample-enriched regions, within-sample identity DEGs, cross-sample population matches, direct matched comparisons, recurring programs, and design confounding — with a two-axis verdict and non-binding recommendation. Records no decision.
+    description: Produce a five-table gene-first evidence packet — sample-enriched regions, within-sample identity DEGs, cross-sample population matches, direct matched comparisons, and design confounding — plus SDK state artifacts. Records no decision.
     entrypoint: scripts/investigate.py:run_evidence
     environment: gpu-singlecell
     activity_label: Investigating batch evidence
@@ -32,19 +32,31 @@ tools:
         technical_batch_basis: {type: [string, "null"], default: null}
         min_cells_per_region: {type: integer, minimum: 10, default: 30}
         min_enrichment: {type: number, minimum: 1, default: 2.0}
-        n_identity_genes: {type: integer, minimum: 5, maximum: 100, default: 25}
+        n_identity_genes: {type: integer, minimum: 5, maximum: 100, default: 50}
         max_regions: {type: integer, minimum: 1, maximum: 200, default: 40}
         max_candidate_pairs:
           type: integer
           minimum: 1
-          maximum: 500
-          default: 60
-          description: Hard cap on matched region pairs that receive a direct DE comparison.
+          maximum: 20
+          default: 3
+          description: Maximum confirmed cross-sample population pairs receiving direct DE, matching the compact original investigation.
+        max_pair_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: Maximum profile-nominated candidate pairs checked for identity-DEG overlap.
+        min_profile_correlation:
+          type: number
+          minimum: -1
+          maximum: 1
+          default: 0.4
+          description: Minimum mean-expression correlation for cross-sample pair nomination.
         min_shared_identity_genes:
           type: integer
           minimum: 1
-          default: 3
-          description: Minimum shared DISCRIMINATING genes for a supported cross-sample match.
+          default: 5
+          description: Minimum shared top-25 DISCRIMINATING identity genes for a supported cross-sample match.
         min_match_jaccard:
           type: number
           minimum: 0
@@ -61,7 +73,7 @@ tools:
       additionalProperties: false
     primary_matrix_input: path
   - name: decide_batch_handling
-    description: Record an explicit batch-handling decision against current batch evidence. Non-integration decisions are always allowed; integration requires an explicit basis and never proceeds silently against the evidence.
+    description: Record the user's explicit post-investigation batch-handling choice against current evidence. The tool captures the newest post-evidence user turn automatically; request_guidance remains pending. Integration additionally requires an explicit basis.
     entrypoint: scripts/investigate.py:run_decision
     environment: gpu-singlecell
     activity_label: Recording batch decision
@@ -73,11 +85,15 @@ tools:
         decision:
           type: string
           enum: [keep_uncorrected, integrate, separate, request_guidance, not_applicable]
-        rationale: {type: string, minLength: 1}
         integration_basis:
           type: [string, "null"]
-          enum: [documented_technical_batch, user_authorized_comparable_replicates, null]
+          enum: [documented_technical_batch, user_authorized_integration, null]
           default: null
-        override_warning: {type: [string, "null"], default: null}
-      required: [evidence_id, decision, rationale]
+        question_asked:
+          type: [string, "null"]
+          default: null
+          description: >-
+            The question put to the user. Required for keep_uncorrected, integrate, or separate.
+            The tool finds the newest real user turn after the evidence and records its exact answer.
+      required: [evidence_id, decision]
       additionalProperties: false

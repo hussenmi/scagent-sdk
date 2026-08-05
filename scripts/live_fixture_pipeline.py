@@ -126,7 +126,10 @@ async def build_standard_fixture(
         {
             "path": str(current),
             "neighbors_key": "neighbors",
-            "cluster_key": "leiden",
+            # A distinct, resolution-named key, not bare "leiden": several real validation inputs
+            # are already-annotated artifacts carrying a legacy "leiden" column, and the
+            # non-overwrite guard correctly refuses to clobber it.
+            "cluster_key": "leiden_res_0_8",
             "resolution": 0.8,
             "random_seed": random_seed,
         },

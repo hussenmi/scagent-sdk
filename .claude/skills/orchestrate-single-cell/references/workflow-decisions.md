@@ -28,8 +28,10 @@ metrics, logs, convergence/report artifacts, and corrected-count comparison befo
 new lineage. Evaluate mitochondrial/library QC, doublet evidence, and cluster QC on the selected
 corrected counts as appropriate to the analysis.
 
-Run doublet evidence only from a validated raw-count representation, normally separately for each
-biological capture/library. Scrublet's expected rate is a prior, not a target, and its
+Run doublet evidence **before the first clustering**, right after cell QC (legacy Scrublet's
+position), from a validated raw-count representation, normally separately for each biological
+capture/library. Cluster QC consumes the `predicted_doublet` calls, so producing them first keeps
+the first clustering pass from being blind to doublets. Scrublet's expected rate is a prior, not a target, and its
 `predicted_doublet` call is evidence rather than ground truth. Review score distributions,
 per-library rates, cluster/sample enrichment, library size, detected genes, mitochondrial signal,
 and marker coherence together. Keep flagged cells through that review. Removal is a separate,
@@ -72,30 +74,28 @@ evidence supports, and switch before annotating or finalizing, since those run a
 version. A branch's cluster QC is bound to that branch and does not become the session's current
 evidence until it is active — so compare from what each run returned, not from session facts.
 
-Each clustering step continues from the artifact the analysis is currently on, so omit the dataset
-path and let the runtime supply it. A transforming tool refuses a superseded artifact, because
-continuing from one silently discards whatever the intervening steps added.
-
-That makes the descent above the default shape: cluster, read the evidence, clean up, cluster again
-from the result. When a comparison genuinely needs two clusterings of the *same* embedding side by
-side, pass `branch_from` with the version to fork from; each alternative is recorded without
-changing which version is active. The full or short version ID reported by `analysis-versions` is
-accepted directly. Use `analysis-versions` to list them and to switch to the one the
-evidence supports, and switch before annotating or finalizing, since those run against the active
-version. A branch's cluster QC is bound to that branch and does not become the session's current
-evidence until it is active — so compare from what each run returned, not from session facts.
-
 ## Batch handling
 
-A sample-like column is not proof that correction is appropriate. Examine composition, per-sample
-QC/doublet summaries, neighborhood mixing, sample-associated expression programs, and experimental
-design. Strong association or weak mixing does not identify technical causality when sample,
-condition, donor, tissue, or cell type is confounded. Record one decision: keep combined
-uncorrected, integrate with a justified method, analyze separately, or request user guidance. A
-decision is current only for the cell/count/representation/clustering identities it evaluated.
+A sample-like column is not proof that correction is appropriate. When multiple samples are
+detected, ask the user to investigate, integrate, keep combined uncorrected, analyze separately, or
+describe the experiment. This is guidance-led interaction, not a required tool-order pipeline.
+
+If they choose investigation, use the gene-first matched-population science. Find sample-enriched regions;
+compute each region versus the rest of its own sample; nominate analogous regions in other samples;
+confirm them by overlap of their identity DEG signatures; and use direct pair DE only as supporting
+detail. Composition, mixing, recurrence, and design checks remain context rather than decision
+gates. The five `batch_diagnostic_*.csv` files and their README are the durable evidence packet.
+
+After presenting the evidence, put the concrete action options back to the user. The decision tool
+captures the newest post-evidence user answer directly from the session; do not search for or
+invent a turn id. Similar identity DEGs plus sample-specific separation establish sample-associated
+structure, but only the experimental context says whether correcting it is appropriate. Until the
+user answers, `request_guidance` is pending and finalization remains open. A decision is current
+only for the cell/count/representation/clustering identities it evaluated.
 
 For many batches, prefer readable heatmaps or bounded legends and always retain the underlying
-tables. Do not claim visual separation from an artifact whose labels cannot be read.
+tables. Do not claim visual separation from an artifact whose labels cannot be read — and do not
+put a question to the user on the strength of a figure they cannot read either.
 
 ## Annotation
 

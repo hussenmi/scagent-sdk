@@ -142,7 +142,9 @@ class _Harness:
 
     def matrix_path(self, execution_id: str) -> str:
         return str(
-            self.session.directory / "artifacts" / "capabilities" / execution_id / "matrix.h5ad"
+            self.session.directory
+            / self.session.store.state.artifacts[execution_id]["path"]
+            / "matrix.h5ad"
         )
 
     @property
@@ -345,7 +347,7 @@ def test_switching_moves_the_head_and_the_facts_together(tmp_path: Path) -> None
     assert active_head(harness.lineage) == branch
     assert harness.facts["analysis"]["clustering"]["id"] == "clust:alt"
     assert harness.facts["analysis"]["dataset_revision"]["prepared_path"] == (
-        f"artifacts/capabilities/{branch}/matrix.h5ad"
+        f"{harness.session.store.state.artifacts[branch]['path']}/matrix.h5ad"
     )
     assert harness.facts["cluster_qc"] == {"status": "alt-evidence"}
     # Global facts equal the newly active version's resolved view.

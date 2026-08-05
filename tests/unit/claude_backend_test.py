@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from scagent_sdk.errors import ContextRolloverRequired
+from scagent_sdk.errors import ContextRolloverRequired, RuntimeExecutionError
 from scagent_sdk.models.profile import ModelProfile
 from scagent_sdk.models.thinking import ThinkingSettings
 from scagent_sdk.runtime.claude import ClaudeAgentSDKBackend, ClaudeRuntimeExtensions
+from scagent_sdk.runtime.observer import NullRuntimeObserver
 from scagent_sdk.runtime.protocol import RuntimeRequest
 
 
@@ -147,6 +148,7 @@ def test_claude_backend_builds_isolated_resumable_sdk_options(tmp_path: Path) ->
     assert options.strict_mcp_config is True
     assert options.skills == []
     assert options.env["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
+    assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "183500"
     assert response.runtime_session_id == "sdk-session"
     assert [message.kind for message in response.messages] == ["thinking", "text", "tool_use"]
     assert response.context_usage == {
@@ -157,6 +159,7 @@ def test_claude_backend_builds_isolated_resumable_sdk_options(tmp_path: Path) ->
         "percentage": pytest.approx(38.14697),
         "model": "Qwen3.6-27B",
         "auto_compact_enabled": True,
+        "auto_compact_threshold_tokens": None,
         "source": "claude-agent-sdk:get_context_usage",
         "context_window_source": "upstream:models",
     }
@@ -448,7 +451,7 @@ def test_skill_plugins_are_passed_through_without_enabling_project_settings(
     assert options.setting_sources == []
 
 
-def test_exact_resume_preflight_uses_advertised_context_window_before_query(
+def test_exact_resume_preflight_uses_most_conservative_live_limit_before_query(
     tmp_path: Path,
 ) -> None:
     class ContextClient(FakeClient):
@@ -456,7 +459,7 @@ def test_exact_resume_preflight_uses_advertised_context_window_before_query(
 
         async def get_context_usage(self):
             return {
-                "totalTokens": 230_145,
+                "totalTokens": 203_613,
                 "maxTokens": 200_000,
                 "rawMaxTokens": 262_144,
             }
@@ -480,7 +483,115 @@ def test_exact_resume_preflight_uses_advertised_context_window_before_query(
     with pytest.raises(ContextRolloverRequired) as captured:
         asyncio.run(ClaudeAgentSDKBackend(sdk_module=sdk).execute(request))
 
-    assert captured.value.context_window_tokens == 262_144
-    assert captured.value.total_tokens == 230_145
-    assert captured.value.source == "upstream:models"
+    assert captured.value.context_window_tokens == 200_000
+    assert captured.value.total_tokens == 203_613
+    assert captured.value.source == "claude-agent-sdk:maxTokens"
     assert ContextClient.queried is False
+
+
+def test_embedded_reasoning_is_separated_from_visible_final_text(tmp_path: Path) -> None:
+    class ReasoningClient(FakeClient):
+        async def receive_response(self):
+            text = "<think>private reasoning</think>\n\nVisible answer"
+            yield AssistantMessage([TextBlock(text)])
+            yield ResultMessage(result=text)
+
+    sdk = _sdk()
+    sdk.ClaudeSDKClient = ReasoningClient
+
+    response = asyncio.run(ClaudeAgentSDKBackend(sdk_module=sdk).execute(_plain_request(tmp_path)))
+
+    assert response.final_text == "Visible answer"
+    assert [(item.kind, item.content) for item in response.messages] == [
+        ("thinking", "private reasoning"),
+        ("text", "Visible answer"),
+    ]
+    assert "<think>" not in response.to_dict()["final_text"]
+
+
+def test_textual_tool_call_is_retried_natively_instead_of_becoming_final_text(
+    tmp_path: Path,
+) -> None:
+    class RecoveryClient(FakeClient):
+        prompts: list[str] = []
+        query_count = 0
+
+        async def query(self, prompt):
+            type(self).prompts.append(prompt)
+            type(self).query_count += 1
+
+        async def receive_response(self):
+            if type(self).query_count == 1:
+                raw = (
+                    "<think>need the table</think>"
+                    "<tool_call><function=mcp__workspace__read_text_file>"
+                    "<parameter=path>/tmp/table.csv</parameter></function></tool_call>"
+                )
+                yield AssistantMessage([TextBlock(raw)])
+                yield ResultMessage(result=raw)
+                return
+            yield AssistantMessage([TextBlock("Review continued after the native call.")])
+            yield ResultMessage(result="Review continued after the native call.")
+
+    sdk = _sdk()
+    sdk.ClaudeSDKClient = RecoveryClient
+
+    response = asyncio.run(ClaudeAgentSDKBackend(sdk_module=sdk).execute(_plain_request(tmp_path)))
+
+    assert response.final_text == "Review continued after the native call."
+    assert len(RecoveryClient.prompts) == 2
+    assert "native tool interface" in RecoveryClient.prompts[1]
+    assert all("<tool_call>" not in str(item.content) for item in response.messages)
+    assert any(item.kind == "textual_tool_call" for item in response.messages)
+
+
+def test_repeated_textual_tool_call_fails_closed(tmp_path: Path) -> None:
+    class BrokenClient(FakeClient):
+        query_count = 0
+
+        async def query(self, prompt):
+            type(self).query_count += 1
+
+        async def receive_response(self):
+            raw = "<tool_call>{\"name\":\"inspect\",\"arguments\":{}}</tool_call>"
+            yield AssistantMessage([TextBlock(raw)])
+            yield ResultMessage(result=raw)
+
+    sdk = _sdk()
+    sdk.ClaudeSDKClient = BrokenClient
+
+    with pytest.raises(RuntimeExecutionError, match="repeatedly emitted"):
+        asyncio.run(ClaudeAgentSDKBackend(sdk_module=sdk).execute(_plain_request(tmp_path)))
+
+    assert BrokenClient.query_count == 2
+
+
+def test_recoverable_context_error_is_not_rendered_as_a_final_response(
+    tmp_path: Path,
+) -> None:
+    class ContextErrorClient(FakeClient):
+        async def receive_response(self):
+            yield ResultMessage(
+                result="API Error: input length exceeds maximum context length",
+                is_error=True,
+            )
+
+    class Observer(NullRuntimeObserver):
+        def __init__(self):
+            self.finished = []
+
+        def on_runtime_finished(self, response):
+            self.finished.append(response)
+
+    sdk = _sdk()
+    sdk.ClaudeSDKClient = ContextErrorClient
+    observer = Observer()
+
+    response = asyncio.run(
+        ClaudeAgentSDKBackend(sdk_module=sdk, observer=observer).execute(
+            _plain_request(tmp_path)
+        )
+    )
+
+    assert response.is_error is True
+    assert observer.finished == []

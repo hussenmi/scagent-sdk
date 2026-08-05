@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +18,35 @@ _SYMBOL_COLUMNS = (
     "hgnc_symbol",
     "symbol",
 )
+
+
+def unreviewed_figures(required: Any, reviewed: Any) -> list[str]:
+    """Return the required figures the review did not name, matching on the file name.
+
+    The requirement is that the model looked at each figure, not that it can transcribe a 90-
+    character artifact path. Demanding exact full paths turned a scientific gate into a copying
+    exercise: a real session failed this check twice in a row on the same assessment, retried with
+    the paths copied out of the error text, and the review that finally landed was no better for it.
+    A basename, a path suffix, or the full relative path all identify the same figure unambiguously
+    here, so all three are accepted; naming a figure that was never required is ignored rather than
+    treated as an error.
+    """
+
+    def keys(value: str) -> set[str]:
+        cleaned = str(value).strip().strip("'\"").replace("\\", "/").rstrip("/")
+        parts = [part for part in cleaned.split("/") if part and part != "."]
+        # Every trailing sub-path, so "leiden/umap.png" matches ".../cluster-qc/leiden/umap.png".
+        return {"/".join(parts[index:]) for index in range(len(parts))} or {cleaned}
+
+    named: set[str] = set()
+    for value in reviewed or ():
+        named |= keys(str(value))
+    missing = []
+    for value in required or ():
+        path = str(value)
+        if not keys(path) & named:
+            missing.append(path)
+    return sorted(missing)
 
 
 def _identity(kind: str, value: Any) -> str:
@@ -84,6 +114,125 @@ def _symbols(adata: Any) -> list[str]:
     return original
 
 
+# Gene-removal class prefixes, matched case-insensitively on the resolved gene symbols (so Ensembl-
+# or Entrez-indexed matrices still match via the symbol column). The ribosomal set intentionally
+# includes the mitochondrial-ribosomal genes (MRPS/MRPL) alongside the cytoplasmic ones (RPS/RPL),
+# matching the legacy removal set; the per-cell ``pct_counts_ribo`` metric stays on RPS/RPL only, so
+# the removal set is deliberately the broader of the two.
+_RIBO_REMOVAL_PREFIXES = ("rps", "rpl", "mrps", "mrpl")
+_MITO_REMOVAL_PREFIX = "mt-"
+
+# Legacy's guaranteed low-detection filter scales with dataset size: keep genes detected in at least
+# 2% of cells, capped at 100 absolute cells so a large dataset does not demand a huge count and
+# delete rare-cell-type markers. Small datasets are governed by the fraction; the cap takes over on
+# big ones. An absolute count overrides both, and a fraction of 0 disables the filter entirely.
+_DEFAULT_MIN_CELL_FRACTION = 0.02
+_DEFAULT_MAX_CELLS_CAP = 100
+
+
+def low_detection_threshold(
+    n_cells: int,
+    *,
+    min_cells: int | None,
+    min_cell_fraction: float,
+    max_cells: int,
+) -> tuple[int, str, bool]:
+    """Resolve the minimum-cells-per-gene threshold, dataset-size-aware by default.
+
+    Returns ``(threshold, basis, capped)``. An explicit ``min_cells`` overrides the fraction; a
+    fraction of 0 disables the filter (threshold 0). The fraction is rounded up, then capped.
+    """
+
+    import math
+
+    if min_cells is not None:
+        return max(0, int(min_cells)), "absolute_min_cells", False
+    if min_cell_fraction <= 0:
+        return 0, "disabled", False
+    from_fraction = int(math.ceil(min_cell_fraction * n_cells))
+    if max_cells > 0 and from_fraction > max_cells:
+        return max_cells, "fraction_of_cells_capped", True
+    return from_fraction, "fraction_of_cells", False
+
+
+def is_ribosomal_gene(symbol: str) -> bool:
+    return symbol.casefold().startswith(_RIBO_REMOVAL_PREFIXES)
+
+
+def is_mitochondrial_gene(symbol: str) -> bool:
+    return symbol.casefold().startswith(_MITO_REMOVAL_PREFIX)
+
+
+def _restamped(marker_holder: dict[str, Any]) -> None:
+    """Record on a carried-forward evidence dict that it was carried, not recomputed."""
+
+    marker = marker_holder.get("carried_through")
+    existing = marker if isinstance(marker, list) else []
+    marker_holder["carried_through"] = existing + ["gene_filter"]
+
+
+def carry_cell_qc_through_gene_filter(
+    fact: Any,
+    *,
+    cell_set_id: str,
+    parent_count_representation_id: str | None,
+    new_count_representation_id: str,
+) -> dict[str, Any] | None:
+    """Carry a cell-QC review across a gene-only change.
+
+    Gene filtering removes genes, not cells, so a cell-quality decision made on the full matrix
+    stays valid. Re-stamp the review's count-representation identity onto the filtered matrix and
+    record that it was carried rather than recomputed (recomputing would read a false ~0% ribosomal,
+    since those genes are gone). Returns None when there is no review, it is about different cells,
+    or it was not current for the artifact being filtered -- so the floor still asks for a fresh
+    review in those cases. The cell set is unchanged, so cell_set_id is preserved as-is.
+    """
+
+    if not isinstance(fact, dict) or fact.get("cell_set_id") != cell_set_id:
+        return None
+    if (
+        parent_count_representation_id is not None
+        and fact.get("count_representation_id") != parent_count_representation_id
+    ):
+        return None
+    carried = copy.deepcopy(fact)
+    carried["count_representation_id"] = new_count_representation_id
+    review = carried.get("review")
+    if isinstance(review, dict):
+        review["count_representation_id"] = new_count_representation_id
+    _restamped(carried)
+    return carried
+
+
+def carry_doublets_through_gene_filter(
+    fact: Any,
+    *,
+    cell_set_id: str,
+    parent_count_representation_id: str | None,
+    new_count_representation_id: str,
+) -> dict[str, Any] | None:
+    """Carry complete doublet evidence across a gene-only change.
+
+    Scrublet scores are a per-cell property; removing genes does not change which cells are
+    doublets. Same currency guard as the cell-QC carry: same cells, current for the input artifact.
+    """
+
+    if not isinstance(fact, dict):
+        return None
+    evidence = fact.get("evidence")
+    if not isinstance(evidence, dict) or evidence.get("cell_set_id") != cell_set_id:
+        return None
+    if (
+        parent_count_representation_id is not None
+        and evidence.get("count_representation_id") != parent_count_representation_id
+    ):
+        return None
+    carried = copy.deepcopy(fact)
+    carried["evidence"]["count_representation_id"] = new_count_representation_id
+    _restamped(carried["evidence"])
+    return carried
+
+
 HISTOGRAM_BINS = 60
 # Per-cell points drawn over a violin body; past this the strip is solid ink and the extra
 # points only cost render time.
@@ -91,39 +240,94 @@ VIOLIN_JITTER_CELLS = 20000
 VIOLIN_JITTER_WIDTH = 0.2
 
 
-def positive_span(values: list[float]) -> tuple[float, float, int]:
-    """Smallest and largest strictly positive value, and how many were not positive.
+def log10_positive(values: Any, np: Any) -> tuple[Any, int]:
+    """The strictly positive values as log10, and how many could not be transformed.
 
-    The dropped count is returned rather than discarded: a log axis cannot draw a zero, and
-    "1,204 cells have zero counts" is QC evidence, not a rendering detail.
+    Plotting the logarithm is not the same as log-*scaling* raw values. On a log-scaled axis the
+    numbers printed are not the numbers being drawn, so a distribution's spread and symmetry cannot
+    be read off it and equal spacing carries no fixed meaning. Transforming first makes the axis
+    read in decades, makes histogram bins uniform by construction, and makes equal distances equal
+    fold-changes -- which is also the space library-size and gene-count cutoffs are chosen in.
+
+    Zero has no logarithm, so those cells are dropped and counted rather than folded in by a log1p
+    shift that would present them as ordinary small values. "1,204 cells have zero counts" is QC
+    evidence, not a rendering detail.
+
+    Kept identical to the copy in `visualize-single-cell` on purpose. A skill's scripts directory is
+    the only thing on its import path, so a shared plotting convention has to be duplicated rather
+    than imported; the copies must not drift.
     """
 
-    positive = [float(value) for value in values if float(value) > 0.0]
-    dropped = len(values) - len(positive)
-    if not positive:
-        raise ValueError("no positive values to plot on a log scale")
-    return min(positive), max(positive), dropped
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    positive = finite[finite > 0.0]
+    return np.log10(positive), int(finite.size - positive.size)
 
 
-def log_spaced_bins(minimum: float, maximum: float, count: int = HISTOGRAM_BINS) -> list[float]:
-    """Bin edges uniform in log space, for a metric drawn on a log axis.
+def raw_reference_ticks(low: float, high: float) -> list[float]:
+    """Raw values to mark opposite a log10 axis spanning ``[low, high]``, both given raw.
 
-    Linear bins under `set_xscale("log")` draw the leftmost bar hundreds of times wider than the
-    rightmost, which compresses the low end of a library-size distribution into two or three
-    blocks and hides the shape a threshold is chosen from.
+    The mantissa set widens as the range narrows. One mark per decade is too sparse to place a
+    value against and a mark per integer collides, so 1/2/5 is the default -- but a metric confined
+    to a third of a decade would get one mark or none from it, which is no reference at all.
     """
 
     import math
 
-    if count < 1:
-        raise ValueError("count must be at least 1")
-    if minimum <= 0.0:
-        raise ValueError("log-spaced bins need a positive minimum; drop non-positive values first")
-    if maximum <= minimum:
-        maximum = minimum * 10.0
-    low, high = math.log10(minimum), math.log10(maximum)
-    step = (high - low) / count
-    return [10.0 ** (low + step * index) for index in range(count + 1)]
+    if not low > 0.0 or not high > low:
+        return []
+    decades = math.log10(high) - math.log10(low)
+    if decades >= 1.5:
+        mantissas: tuple[float, ...] = (1.0, 2.0, 5.0)
+    elif decades >= 0.6:
+        mantissas = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+    else:
+        mantissas = (1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
+    ticks: list[float] = []
+    for exponent in range(math.floor(math.log10(low)), math.ceil(math.log10(high)) + 1):
+        for mantissa in mantissas:
+            value = mantissa * 10.0**exponent
+            if low <= value <= high:
+                ticks.append(value)
+    return sorted(ticks)
+
+
+def label_log10_axis(
+    axis: Any, which: str, label: str, np: Any, *, raw_label: str = "raw value"
+) -> None:
+    """Name an axis carrying log10 values and mirror the raw magnitudes opposite it.
+
+    The mirror is what keeps the change honest: a reader still has to act in raw counts, and the
+    log-scaled axis this replaces was previously the only place those numbers appeared.
+    """
+
+    from matplotlib.ticker import FuncFormatter
+
+    formatter = FuncFormatter(lambda value, _: compact_tick(value))
+    forward_inverse = (
+        lambda value: 10.0**value,
+        lambda value: np.log10(np.clip(value, 1e-12, None)),
+    )
+    if which == "x":
+        axis.set_xlabel(f"{label} (log10)")
+        low, high = axis.get_xlim()
+        mirror = axis.secondary_xaxis("top", functions=forward_inverse)
+        ticks = raw_reference_ticks(10.0**low, 10.0**high)
+        if ticks:
+            mirror.set_xticks(ticks)
+        mirror.xaxis.set_major_formatter(formatter)
+        # No axis label on the top mirror: it would only repeat the metric the primary label
+        # already names, and with sparse marks a centred label lands on top of a tick.
+    else:
+        axis.set_ylabel(f"{label} (log10)")
+        low, high = axis.get_ylim()
+        mirror = axis.secondary_yaxis("right", functions=forward_inverse)
+        ticks = raw_reference_ticks(10.0**low, 10.0**high)
+        if ticks:
+            mirror.set_yticks(ticks)
+        mirror.yaxis.set_major_formatter(formatter)
+        mirror.set_ylabel(raw_label, fontsize=8, labelpad=2)
+    mirror.tick_params(labelsize=8)
 
 
 def compact_tick(value: float) -> str:
@@ -263,6 +467,23 @@ def _render_qc_figures(
         result = np.asarray(adata.obs[column], dtype=float)
         return result[np.isfinite(result)]
 
+    def paired(*columns: str, positive: tuple[str, ...] = ()) -> tuple[Any, ...]:
+        """Columns masked together, keeping only rows usable in every one of them.
+
+        A per-column filter is fine for a marginal histogram but wrong for a scatter: a cell with
+        zero counts has an undefined mitochondrial percent, so filtering each column on its own
+        leaves two arrays of different lengths that no longer describe the same cells. Columns
+        needing a logarithm are additionally required to be positive.
+        """
+
+        raw = [np.asarray(adata.obs[column], dtype=float) for column in columns]
+        mask = np.ones(raw[0].shape, dtype=bool)
+        for column, series in zip(columns, raw, strict=True):
+            mask &= np.isfinite(series)
+            if column in positive:
+                mask &= series > 0.0
+        return tuple(series[mask] for series in raw)
+
     def save(fig: Any, name: str) -> dict[str, str]:
         relative = f"qc/{name}"
         fig.savefig(context.staging_dir / relative, dpi=160, bbox_inches="tight")
@@ -281,25 +502,35 @@ def _render_qc_figures(
 
     rng = np.random.default_rng(0)
 
-    def log_histogram(axis: Any, series: Any, label: str) -> None:
-        """Histogram on a log axis with bins that are uniform *on that axis*."""
+    def log_histogram(axis: Any, series: Any, label: str, unit: str) -> None:
+        """Histogram of the metric's log10 values, so the bins are uniform in what is plotted."""
 
-        low, high, dropped = positive_span([float(item) for item in series.tolist()])
-        axis.hist(
-            series[series > 0], bins=log_spaced_bins(low, high), edgecolor="black", linewidth=0.3
+        logged, dropped = log10_positive(series, np)
+        axis.hist(logged, bins=HISTOGRAM_BINS, edgecolor="black", linewidth=0.3)
+        axis.set_ylabel("Cells")
+        label_log10_axis(axis, "x", label, np, raw_label=unit)
+        # Padded clear of the raw-magnitude mirror that now runs along the top spine.
+        axis.set_title(
+            label if not dropped else f"{label} ({dropped:,} zero-count omitted)", pad=26
         )
-        axis.set_xscale("log")
-        _plain_log_ticks(axis)
-        axis.set(xlabel=f"{label} (log scale)", ylabel="Cells")
-        axis.set_title(label if not dropped else f"{label} ({dropped:,} zero-count omitted)")
 
-    fig, axes = plt.subplots(1, 5, figsize=(24, 4.5))
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4.8))
     ranked = np.sort(total)[::-1]
-    axes[0].plot(np.arange(1, ranked.size + 1), ranked)
-    axes[0].set(xscale="log", yscale="log", xlabel="Cell rank", ylabel="Total counts")
-    axes[0].set_title("UMI rank (knee)")
-    log_histogram(axes[1], total, "Library size")
-    log_histogram(axes[2], genes, "Genes per cell")
+    logged_ranks, _ = log10_positive(np.arange(1, ranked.size + 1), np)
+    logged_counts, dropped_ranks = log10_positive(ranked, np)
+    # `ranked` is sorted descending, so any zero-count cells are its tail and the surviving counts
+    # still line up with the leading ranks.
+    axes[0].plot(logged_ranks[: logged_counts.size], logged_counts)
+    label_log10_axis(axes[0], "x", "Cell rank", np, raw_label="cell rank")
+    label_log10_axis(axes[0], "y", "Total counts", np, raw_label="counts")
+    axes[0].set_title(
+        "UMI rank (knee)"
+        if not dropped_ranks
+        else f"UMI rank (knee) ({dropped_ranks:,} zero-count omitted)",
+        pad=26,
+    )
+    log_histogram(axes[1], total, "Library size", "counts")
+    log_histogram(axes[2], genes, "Genes per cell", "genes")
     axes[3].hist(mito, bins=HISTOGRAM_BINS, edgecolor="black", linewidth=0.3)
     if thresholds["max_pct_mito"] is not None:
         axes[3].axvline(
@@ -316,22 +547,25 @@ def _render_qc_figures(
     fig.tight_layout()
     figures.append(save(fig, "qc_distributions.png"))
 
+    # log10 rather than the recorded log1p_* columns, so every logged panel in this figure set reads
+    # in one unit: a decade is a decade and 3.7 is recognisably "a few thousand", where natural-log
+    # 8.5 has to be converted before it means anything.
     violin_columns = [
-        ("log1p_total_counts", "log1p_total_counts"),
-        ("log1p_n_genes_by_counts", "log1p_n_genes_by_counts"),
-        ("pct_counts_mt", "pct_counts_mt"),
-        ("pct_counts_ribo", "pct_counts_ribo"),
+        (log10_positive(total, np)[0], "total counts (log10)"),
+        (log10_positive(genes, np)[0], "genes per cell (log10)"),
+        (mito, "pct_counts_mt"),
+        (ribo, "pct_counts_ribo"),
     ]
     fig, axes = plt.subplots(1, len(violin_columns), figsize=(4.2 * len(violin_columns), 4.6))
-    for axis, (column, label) in zip(axes, violin_columns, strict=True):
-        _violin_panel(axis, values(column), label, rng)
+    for axis, (series, label) in zip(axes, violin_columns, strict=True):
+        _violin_panel(axis, series, label, rng)
     fig.suptitle(f"QC metric distributions ({adata.n_obs:,} cells)")
     fig.tight_layout()
     figures.append(save(fig, "qc_violin_metrics.png"))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    log_histogram(axes[0], total, "Library size")
-    log_histogram(axes[1], genes, "Genes per cell")
+    log_histogram(axes[0], total, "Library size", "counts")
+    log_histogram(axes[1], genes, "Genes per cell", "genes")
     fig.tight_layout()
     figures.append(save(fig, "qc_histograms.png"))
 
@@ -349,23 +583,26 @@ def _render_qc_figures(
     fig.tight_layout()
     figures.append(save(fig, "qc_mt_histogram.png"))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].scatter(total, genes, s=8, alpha=0.55)
-    axes[0].set(xscale="log", yscale="log", xlabel="Total counts", ylabel="Genes detected")
-    _plain_log_ticks(axes[0], "x")
-    _plain_log_ticks(axes[0], "y")
-    axes[0].set_title("Genes versus counts")
-    axes[1].scatter(total, mito, s=8, alpha=0.55)
-    axes[1].set(xscale="log", xlabel="Total counts", ylabel="Mitochondrial percent")
-    _plain_log_ticks(axes[1], "x")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.4))
+    joint_total, joint_genes = paired(
+        "total_counts", "n_genes_by_counts", positive=("total_counts", "n_genes_by_counts")
+    )
+    axes[0].scatter(np.log10(joint_total), np.log10(joint_genes), s=8, alpha=0.55)
+    label_log10_axis(axes[0], "x", "Total counts", np, raw_label="counts")
+    label_log10_axis(axes[0], "y", "Genes detected", np, raw_label="genes")
+    axes[0].set_title("Genes versus counts", pad=26)
+    mito_total, mito_paired = paired("total_counts", "pct_counts_mt", positive=("total_counts",))
+    axes[1].scatter(np.log10(mito_total), mito_paired, s=8, alpha=0.55)
+    label_log10_axis(axes[1], "x", "Total counts", np, raw_label="counts")
+    axes[1].set_ylabel("Mitochondrial percent")
     if thresholds["max_pct_mito"] is not None:
         axes[1].axhline(float(thresholds["max_pct_mito"]), color="crimson", linestyle="--")
-    axes[1].set_title("Mitochondrial percent versus counts")
+    axes[1].set_title("Mitochondrial percent versus counts", pad=26)
     fig.tight_layout()
     figures.append(save(fig, "qc_scatter.png"))
 
     fig, axis = plt.subplots(figsize=(6, 5))
-    axis.scatter(mito, ribo, s=8, alpha=0.55)
+    axis.scatter(*paired("pct_counts_mt", "pct_counts_ribo"), s=8, alpha=0.55)
     if thresholds["max_pct_mito"] is not None:
         axis.axvline(float(thresholds["max_pct_mito"]), color="crimson", linestyle="--")
     axis.set(
@@ -541,13 +778,13 @@ def review_qc(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     rationale = str(arguments["rationale"]).strip()
     if not rationale:
         raise ValueError("rationale must not be empty")
-    reviewed = {str(value) for value in arguments.get("reviewed_artifacts", [])}
-    required = {str(value) for value in evidence.get("required_visual_artifacts", [])}
-    missing = sorted(required - reviewed)
+    missing = unreviewed_figures(
+        evidence.get("required_visual_artifacts", []), arguments.get("reviewed_artifacts", [])
+    )
     if missing:
         raise ValueError(
-            "visual review is incomplete; inspect and include every required artifact: "
-            + ", ".join(missing)
+            "visual review is incomplete. Look at these figures, then name them (the file name "
+            "alone is enough) in reviewed_artifacts: " + ", ".join(missing)
         )
     decision = str(arguments["decision"])
     resolved = decision in {"keep_all", "not_applicable"}
@@ -557,7 +794,11 @@ def review_qc(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "decision": decision,
         "rationale": rationale,
         "visual_findings": [str(value) for value in arguments.get("visual_findings", [])],
-        "reviewed_artifacts": sorted(reviewed),
+        # The canonical paths, not the shorthand the model used to name them, so the record says
+        # which files were reviewed rather than how they happened to be referred to.
+        "reviewed_artifacts": sorted(
+            str(value) for value in evidence.get("required_visual_artifacts", [])
+        ),
         "cell_set_id": evidence.get("cell_set_id"),
         "count_representation_id": evidence.get("count_representation_id"),
     }
@@ -687,15 +928,92 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         raise FileNotFoundError(path)
     layer_arg = arguments.get("counts_layer", "auto")
     layer = str(layer_arg) if layer_arg is not None else None
-    min_cells = int(arguments.get("min_cells", 3))
+    organism = str(arguments.get("organism", "human"))
+
+    # Threshold knobs. An explicit ``min_cells`` is an absolute override; otherwise the dataset-size
+    # fraction (default 2%) capped at ``max_cells`` (default 100) governs, and fraction 0 disables.
+    override_arg = arguments.get("min_cells")
+    min_cells_override = int(override_arg) if override_arg is not None else None
+    try:
+        min_cell_fraction = max(
+            0.0, float(arguments.get("min_cell_fraction", _DEFAULT_MIN_CELL_FRACTION))
+        )
+    except (TypeError, ValueError):
+        min_cell_fraction = _DEFAULT_MIN_CELL_FRACTION
+    try:
+        max_cells = max(0, int(arguments.get("max_cells", _DEFAULT_MAX_CELLS_CAP)))
+    except (TypeError, ValueError):
+        max_cells = _DEFAULT_MAX_CELLS_CAP
+    remove_ribosomal = bool(arguments.get("remove_ribosomal", True))
+    remove_mitochondrial = bool(arguments.get("remove_mitochondrial", False))
+
     adata = sc.read_h5ad(path)
     layer = _resolve_layer(adata, layer)
     counts = _matrix(adata, layer)
-    detected = np.asarray((counts > 0).sum(axis=0)).ravel()
     before = int(adata.n_vars)
-    filtered = adata[:, detected >= min_cells].copy()
+    n_cells_total = int(adata.n_obs)
+    symbols = _symbols(adata)
+
+    # Compute per-cell mitochondrial/ribosomal percentages on the full matrix *before* any gene
+    # removal, so they survive as obs columns and the QC, embedding, and cluster-QC ribosomal
+    # figures keep their data source. Only fill what is missing: a prior calculate_single_cell_qc
+    # already wrote these, and its values are the ones to preserve.
+    if "pct_counts_ribo" not in adata.obs or "pct_counts_mt" not in adata.obs:
+        metrics = adata.copy()
+        metrics.X = counts.copy()
+        if organism == "mouse":
+            mt_flag = [name.startswith(("mt-", "Mt-", "MT-")) for name in symbols]
+        else:
+            mt_flag = [name.upper().startswith("MT-") for name in symbols]
+        metrics.var["mt"] = np.asarray(mt_flag, dtype=bool)
+        metrics.var["ribo"] = np.asarray(
+            [name.upper().startswith(("RPS", "RPL")) for name in symbols], dtype=bool
+        )
+        sc.pp.calculate_qc_metrics(
+            metrics, qc_vars=["mt", "ribo"], percent_top=None, log1p=True, inplace=True
+        )
+        for column in ("pct_counts_mt", "pct_counts_ribo"):
+            if column not in adata.obs and column in metrics.obs:
+                adata.obs[column] = metrics.obs[column].to_numpy()
+
+    # Build the keep mask. Each removed gene is attributed to the first reason it fails, so the
+    # per-category counts are disjoint and sum to the total removed.
+    detected = np.asarray((counts > 0).sum(axis=0)).ravel()
+    threshold, threshold_basis, fraction_capped = low_detection_threshold(
+        n_cells_total,
+        min_cells=min_cells_override,
+        min_cell_fraction=min_cell_fraction,
+        max_cells=max_cells,
+    )
+    remove_low = ~(detected >= threshold) if threshold > 0 else np.zeros(before, dtype=bool)
+    if remove_ribosomal:
+        remove_ribo = np.asarray([is_ribosomal_gene(name) for name in symbols]) & ~remove_low
+    else:
+        remove_ribo = np.zeros(before, dtype=bool)
+    if remove_mitochondrial:
+        remove_mito = (
+            np.asarray([is_mitochondrial_gene(name) for name in symbols])
+            & ~remove_low
+            & ~remove_ribo
+        )
+    else:
+        remove_mito = np.zeros(before, dtype=bool)
+
+    keep = ~(remove_low | remove_ribo | remove_mito)
+    removed_low = int(remove_low.sum())
+    removed_ribosomal = int(remove_ribo.sum())
+    removed_mitochondrial = int(remove_mito.sum())
+    filtered = adata[:, keep].copy()
     if filtered.n_vars == 0:
-        raise ValueError("requested threshold would remove every gene")
+        raise ValueError("requested filters would remove every gene")
+
+    filter_identity = {
+        "operation": "filter-genes",
+        "min_cells": threshold,
+        "threshold_basis": threshold_basis,
+        "remove_ribosomal": remove_ribosomal,
+        "remove_mitochondrial": remove_mitochondrial,
+    }
     metadata = _base_metadata(filtered)
     cell_set_id = metadata.get("cell_set_id") or _identity(
         "cells", sorted(map(str, filtered.obs_names))
@@ -706,12 +1024,7 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     )
     count_id = _identity(
         "count-representation",
-        {
-            "matrix_id": matrix_id,
-            "cell_set_id": cell_set_id,
-            "operation": "filter-genes",
-            "min_cells": min_cells,
-        },
+        {"matrix_id": matrix_id, "cell_set_id": cell_set_id, **filter_identity},
     )
     revision_id = _identity(
         "dataset-revision",
@@ -719,8 +1032,7 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
             "parent_path": str(path),
             "genes": sorted(map(str, filtered.var_names)),
             "count_representation_id": count_id,
-            "operation": "filter-genes",
-            "min_cells": min_cells,
+            **filter_identity,
         },
     )
     metadata.update(
@@ -738,6 +1050,26 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     ):
         metadata.pop(key, None)
     filtered.uns["scagent_sdk"] = metadata
+
+    # Gene filtering preserves the cell set, so a current cell-QC review and complete doublet
+    # evidence remain valid for the same cells; carry them forward re-stamped to the new count
+    # representation instead of nulling them. Everything gene-dependent (representation, clustering,
+    # cluster QC, annotation, batch) is correctly invalidated below.
+    state_facts = getattr(context, "state_facts", {}) or {}
+    parent_count_representation_id = _base_metadata(adata).get("count_representation_id")
+    carried_cell_qc = carry_cell_qc_through_gene_filter(
+        state_facts.get("cell_qc"),
+        cell_set_id=cell_set_id,
+        parent_count_representation_id=parent_count_representation_id,
+        new_count_representation_id=count_id,
+    )
+    carried_doublets = carry_doublets_through_gene_filter(
+        state_facts.get("doublets"),
+        cell_set_id=cell_set_id,
+        parent_count_representation_id=parent_count_representation_id,
+        new_count_representation_id=count_id,
+    )
+
     output_name = "genes-filtered.h5ad"
     filtered.write_h5ad(context.staging_dir / output_name, compression="gzip")
     report = {
@@ -745,15 +1077,36 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
         "before_genes": before,
         "after_genes": int(filtered.n_vars),
         "removed_genes": before - int(filtered.n_vars),
-        "min_cells": min_cells,
+        "min_cells": threshold,
+        "threshold_basis": threshold_basis,
+        "min_cell_fraction": min_cell_fraction if threshold_basis.startswith("fraction") else None,
+        "max_cells_cap": max_cells if threshold_basis.startswith("fraction") else None,
+        "fraction_capped": fraction_capped,
+        "n_cells_total": n_cells_total,
+        "removed_low_detection": removed_low,
+        "remove_ribosomal": remove_ribosomal,
+        "removed_ribosomal": removed_ribosomal,
+        "remove_mitochondrial": remove_mitochondrial,
+        "removed_mitochondrial": removed_mitochondrial,
     }
     (context.staging_dir / "gene-filter-summary.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    threshold_text = (
+        f"detected in <{threshold} cells"
+        if threshold > 0
+        else "no low-detection threshold"
+    )
+    parts = [f"{removed_low:,} low-detection ({threshold_text})"]
+    if remove_ribosomal:
+        parts.append(f"{removed_ribosomal:,} ribosomal")
+    if remove_mitochondrial:
+        parts.append(f"{removed_mitochondrial:,} mitochondrial")
     return {
         "summary": (
-            f"Filtered {before - filtered.n_vars:,} of {before:,} genes; "
-            f"{filtered.n_vars:,} remain."
+            f"Removed {before - filtered.n_vars:,} of {before:,} genes "
+            f"({', '.join(parts)}); {filtered.n_vars:,} remain. "
+            "Per-cell mitochondrial/ribosomal percentages are preserved in obs."
         ),
         "details": report,
         "facts_patch": {
@@ -773,7 +1126,10 @@ def filter_genes(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
                 "representation": None,
                 "clustering": None,
             },
-            "cell_qc": None,
+            # Per-cell evidence carried forward re-stamped (None when there was nothing current to
+            # carry, which correctly leaves the floor asking for it).
+            "cell_qc": carried_cell_qc,
+            "doublets": carried_doublets,
             "batch": None,
             "cluster_qc": None,
             "annotation": None,

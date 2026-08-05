@@ -264,6 +264,15 @@ def test_successful_envelope_emits_state_and_artifacts(
         "caveats": [],
         "final_path": "artifacts/capabilities/execution-1/final-annotated.h5ad",
         "report_path": "artifacts/capabilities/execution-1/analysis-report.md",
+        "deliverables": {
+            "final_dataset": str(tmp_path / "session/data/final-annotated.h5ad"),
+            "final_labels": str(tmp_path / "session/tables/final-labels.csv"),
+            "report": str(tmp_path / "session/reports/final-analysis-report.md"),
+            "recipe": str(tmp_path / "session/code/analysis-recipe.py"),
+            "output_index": str(tmp_path / "session/outputs.md"),
+            "final_annotation_umap": None,
+            "final_label_counts": str(tmp_path / "session/figures/final-label-counts.png"),
+        },
         "n_obs": 1000,
         "n_clusters": 2,
         "artifacts": [
@@ -287,4 +296,5 @@ def test_successful_envelope_emits_state_and_artifacts(
     assert result["facts_patch"]["annotation"]["final"]["labels"] == labels
     assert result["decisions_patch"]["final_labels"] == labels
     assert result["artifacts"][0]["relative_path"] == "final-annotated.h5ad"
-    assert "Finalized 2 cluster labels across 1,000 cells." == result["summary"]
+    assert result["summary"].startswith("Finalized 2 cluster labels across 1,000 cells.")
+    assert result["details"]["deliverables"]["output_index"].endswith("outputs.md")

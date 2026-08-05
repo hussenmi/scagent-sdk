@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +194,88 @@ def _auto_caveats(facts: dict[str, Any], confidence: dict[str, str]) -> list[str
     return caveats
 
 
+def _name_contains(*needles: str) -> Callable[[str], bool]:
+    return lambda name: any(needle in name for needle in needles)
+
+
+def _name_equals(*names: str) -> Callable[[str], bool]:
+    return lambda name: name in names
+
+
+def _important_figures(session_dir: Path) -> list[dict[str, str]]:
+    """Select the latest high-level scientific views from the human output index."""
+
+    index_path = session_dir / "outputs.json"
+    try:
+        value = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    categories = value.get("categories", {}) if isinstance(value, dict) else {}
+    entries = categories.get("figures", []) if isinstance(categories, dict) else []
+    if not isinstance(entries, list):
+        return []
+    # Selection matches the artifact NAME, which is the stable identifier a skill promises not to
+    # change -- never the projected filename, which is deliberately descriptive and free to move.
+    # "embedding" needs exact matching or it would also claim every "embedding-grid-*" companion.
+    selectors = (
+        (
+            "qc overview",
+            _name_contains("qc-distributions", "qc-histograms"),
+            "Cell-level QC distributions",
+        ),
+        (
+            "PCA variance",
+            _name_contains("pca-variance"),
+            "Variance explained by principal components",
+        ),
+        (
+            "batch composition",
+            _name_contains("batch-composition"),
+            "Sample representation across cell groups before batch handling",
+        ),
+        (
+            "sample embedding",
+            _name_contains("embedding-grid-sample"),
+            "Analysis embedding shown separately for each sample",
+        ),
+        (
+            "cluster embedding",
+            _name_contains("embedding-grid-leiden"),
+            "Analysis embedding shown separately for each cluster",
+        ),
+        (
+            "integrated embedding",
+            _name_equals("embedding"),
+            "Current analysis embedding after the recorded representation decision",
+        ),
+        (
+            "cluster QC overview",
+            _name_contains("cluster-qc-umap", "cluster-qc-metrics"),
+            "Cluster-level quality-control overview",
+        ),
+    )
+    selected: list[dict[str, str]] = []
+    for label, matcher, description in selectors:
+        matches = [
+            item
+            for item in entries
+            if isinstance(item, dict) and matcher(str(item.get("artifact_name", "")).casefold())
+        ]
+        if not matches:
+            continue
+        latest = max(matches, key=lambda item: int(item.get("commit_sequence", 0)))
+        view_path = latest.get("view_path")
+        if isinstance(view_path, str):
+            selected.append(
+                {
+                    "name": label,
+                    "description": description,
+                    "path": str((session_dir / view_path).resolve()),
+                }
+            )
+    return selected
+
+
 def _render_report(
     *,
     summary: str,
@@ -207,6 +290,9 @@ def _render_report(
     rationales: dict[str, str],
     evidence_summaries: dict[str, str],
     caveats: list[str],
+    session_dir: Path,
+    execution_id: str,
+    important_figures: list[dict[str, str]],
 ) -> str:
     dataset = facts.get("dataset", {})
     analysis = facts.get("analysis", {})
@@ -350,6 +436,24 @@ def _render_report(
         )
     lines.extend(["", "## Caveats and limitations", ""])
     lines.extend(f"- {item}" for item in caveats)
+    lines.extend(["", "## Important figures", ""])
+    for figure in important_figures:
+        lines.append(
+            f"- **{figure['name']}** — {figure['description']}: `{figure['path']}`"
+        )
+    final_root = session_dir / "artifacts" / "capabilities" / execution_id / "final"
+    if "X_umap" in adata.obsm:
+        lines.append(
+            "- **Final annotation UMAP** — final cell-type labels on the analysis embedding: "
+            f"`{final_root / 'final-annotation-umap.png'}`"
+        )
+    lines.append(
+        "- **Final label counts** — number of cells assigned to each final cell type: "
+        f"`{final_root / 'final-label-counts.png'}`"
+    )
+    lines.append(
+        f"- Complete named figure and artifact index: `{session_dir / 'outputs.md'}`"
+    )
     lines.extend(
         [
             "",
@@ -357,7 +461,10 @@ def _render_report(
             "",
             f"- Source artifact used for finalization: `{path}`",
             f"- Clustering identity: `{clustering_id}`",
-            "- Exact committed capability calls are saved in `code/analysis-recipe.py`.",
+            f"- Final annotated dataset: `{session_dir / 'data/final-annotated.h5ad'}`",
+            f"- Final label table: `{session_dir / 'tables/final-labels.csv'}`",
+            f"- Final analysis report: `{session_dir / 'reports/final-analysis-report.md'}`",
+            f"- Exact replay recipe: `{session_dir / 'code/analysis-recipe.py'}`",
             "- For a step-by-step reading version, with each step's arguments, decision "
             "rationale, and figures inline, ask for an analysis notebook; it can be rebuilt at "
             "any time and will include any work done after this report.",
@@ -470,7 +577,7 @@ def _execute_finalization(arguments: dict[str, Any], context: Any) -> dict[str, 
         {
             "tool": "finalize_analysis",
             "skill": "finalize-analysis",
-            "skill_version": "0.4.0",
+            "skill_version": "0.5.0",
             "arguments": arguments,
         }
     )
@@ -490,6 +597,9 @@ def _execute_finalization(arguments: dict[str, Any], context: Any) -> dict[str, 
         rationales=rationales,
         evidence_summaries=evidence_summaries,
         caveats=caveats,
+        session_dir=context.session_dir,
+        execution_id=context.execution_id,
+        important_figures=_important_figures(context.session_dir),
     )
     (context.staging_dir / "analysis-report.md").write_text(
         report, encoding="utf-8"
@@ -534,6 +644,32 @@ def _execute_finalization(arguments: dict[str, Any], context: Any) -> dict[str, 
     )
     final_path = f"artifacts/capabilities/{context.execution_id}/final-annotated.h5ad"
     report_path = f"artifacts/capabilities/{context.execution_id}/analysis-report.md"
+    session_dir = context.session_dir.resolve()
+    deliverables = {
+        "final_dataset": str(session_dir / "data/final-annotated.h5ad"),
+        "final_labels": str(session_dir / "tables/final-labels.csv"),
+        "report": str(session_dir / "reports/final-analysis-report.md"),
+        "recipe": str(session_dir / "code/analysis-recipe.py"),
+        "output_index": str(session_dir / "outputs.md"),
+        "final_annotation_umap": (
+            str(
+                session_dir
+                / "artifacts"
+                / "capabilities"
+                / context.execution_id
+                / "final/final-annotation-umap.png"
+            )
+            if "X_umap" in adata.obsm
+            else None
+        ),
+        "final_label_counts": str(
+            session_dir
+            / "artifacts"
+            / "capabilities"
+            / context.execution_id
+            / "final/final-label-counts.png"
+        ),
+    }
     artifacts = [
         {
             "name": "final-annotated-anndata",
@@ -566,6 +702,7 @@ def _execute_finalization(arguments: dict[str, Any], context: Any) -> dict[str, 
         "caveats": caveats,
         "final_path": final_path,
         "report_path": report_path,
+        "deliverables": deliverables,
         "n_obs": int(adata.n_obs),
         "n_clusters": len(clusters),
         "artifacts": artifacts,
@@ -580,7 +717,9 @@ def _result_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     label_key = payload["label_key"]
     return {
         "summary": (
-            f"Finalized {payload['n_clusters']} cluster labels across {payload['n_obs']:,} cells."
+            f"Finalized {payload['n_clusters']} cluster labels across {payload['n_obs']:,} cells. "
+            f"Final dataset, labels, report, recipe, and annotation figures are listed in "
+            f"{payload['deliverables']['output_index']}."
         ),
         "details": {
             "clustering_id": clustering_id,
@@ -594,6 +733,8 @@ def _result_envelope(payload: dict[str, Any]) -> dict[str, Any]:
             "overrides": payload["overrides"],
             "caveats": payload["caveats"],
             "final_path": payload["final_path"],
+            "report_path": payload["report_path"],
+            "deliverables": payload["deliverables"],
         },
         "facts_patch": {
             "annotation": {

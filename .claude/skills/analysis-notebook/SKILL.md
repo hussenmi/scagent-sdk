@@ -26,12 +26,18 @@ tied to any particular stage:
 Do not silently generate a notebook as a side effect of finishing something. Do not tell a user
 their notebook is stale and unfixable; rebuild it.
 
-## What it is not
+## Two kinds of code cell
 
-The code cells record capability calls faithfully, but they are **not runnable scanpy**.
-Capabilities need the runtime's floors, staging, and artifact commits. Never tell a user they can
-execute the notebook as a standalone pipeline. A `call` stub raises an explanatory error so pressing
-shift-enter explains itself instead of failing obscurely.
+A `call(...)` cell records which capability ran with which parameters. It is a faithful record, not
+runnable scanpy: capabilities need the runtime's floors, staging, and artifact commits. A `call`
+stub raises an explanatory error so shift-enter explains itself instead of failing obscurely.
+
+Where a step ran real code — `run_analysis_code` or `run_shell_command` — the cell instead holds
+**that code verbatim**, recovered from the committed artifact rather than reassembled, and labelled
+with the runtime it ran in. Shell commands become `%%bash` cells and stay genuinely executable.
+
+Never tell a user the whole notebook is a runnable pipeline, and never tell them the code cells are
+all illustrative either. The distinction is the point.
 
 For the exact machine-replayable call list, `finalize-analysis` writes `code/analysis-recipe.py`.
 For narrative findings and caveats, it writes `reports/final-analysis-report.md`. Those three

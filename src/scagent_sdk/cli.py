@@ -19,7 +19,7 @@ from scagent_sdk.capabilities.readiness import probe_packages
 from scagent_sdk.capabilities.registry import CapabilityRegistry
 from scagent_sdk.doctor.agent import AVAILABLE_PROBES, AgentCompatibilityDoctor
 from scagent_sdk.doctor.model import GatewayDoctor
-from scagent_sdk.errors import ScagentSDKError
+from scagent_sdk.errors import RetentionError, ScagentSDKError
 from scagent_sdk.execution import EnvironmentBroker, EnvironmentRegistry
 from scagent_sdk.models.limits import ModelLimitResolver
 from scagent_sdk.models.profile import ModelProfileRegistry
@@ -29,7 +29,14 @@ from scagent_sdk.runtime.interrupts import TurnInterrupter
 from scagent_sdk.runtime.resume import ResumePreference
 from scagent_sdk.runtime.service import AgentRuntimeService
 from scagent_sdk.session import AnalysisSession
-from scagent_sdk.state.retention import propose_prune, read_state_without_opening
+from scagent_sdk.state.pruning import (
+    ARTIFACT_ROLES,
+    BRANCH_DISPOSITIONS,
+    DEFAULT_GRACE_HOURS,
+    RetentionManager,
+    build_prune_plan,
+)
+from scagent_sdk.state.retention import account, propose_prune, read_state_without_opening
 from scagent_sdk.state.store import SessionStore
 
 
@@ -148,15 +155,70 @@ def _cmd_session_storage(args: argparse.Namespace) -> int:
     )
     reports = []
     for session_id in session_ids:
-        state = read_state_without_opening(root.expanduser() / session_id)
-        reports.append(
-            propose_prune(
-                root.expanduser() / session_id,
-                session_id=session_id,
-                lineage=state.get("lineage") or {},
-                artifacts=state.get("artifacts") or {},
-            ).to_dict()
-        )
+        session_dir = root.expanduser() / session_id
+        state = read_state_without_opening(session_dir)
+        if not state:
+            raise RetentionError(
+                f"session {session_id} checkpoint is missing or malformed; storage is unknown"
+            )
+        report = propose_prune(
+            session_dir,
+            session_id=session_id,
+            lineage=state.get("lineage") or {},
+            artifacts=state.get("artifacts") or {},
+        ).to_dict()
+        report["policy_prune"] = build_prune_plan(
+            session_dir,
+            session_id=session_id,
+            state=state,
+            grace_seconds=DEFAULT_GRACE_HOURS * 3600,
+        ).to_dict()
+        raw_artifacts = state.get("artifacts")
+        raw_artifacts = raw_artifacts if isinstance(raw_artifacts, dict) else {}
+        committed_paths = [
+            session_dir
+            / str(
+                record.get(
+                    "path", f"artifacts/capabilities/{execution_id}"
+                )
+            )
+            for execution_id, record in raw_artifacts.items()
+            if isinstance(record, dict)
+        ]
+        committed_names = {path.name for path in committed_paths}
+        artifact_root = session_dir / "artifacts" / "capabilities"
+        try:
+            artifact_children = list(artifact_root.iterdir()) if artifact_root.is_dir() else []
+        except OSError as exc:
+            raise RetentionError(
+                f"cannot enumerate artifact store for session {session_id}: {exc}"
+            ) from exc
+        untracked_paths = [
+            child for child in artifact_children if child.name not in committed_names
+        ]
+        trash_root = session_dir / ".trash" / "retention"
+        # Trash still occupies bytes. Keep canonical and trash views separate, and also report
+        # their inode-deduplicated physical union so a rename into grace-period trash never looks
+        # like disk space was freed.
+        report["trash_total"] = account([trash_root]).to_dict()
+        # Paths not named by state.artifacts are visible but never deletion candidates. They may
+        # be crash debris or external copies; only explicit recovery/adoption can decide.
+        report["untracked_artifacts_total"] = account(
+            untracked_paths,
+            retained=[*committed_paths, trash_root],
+        ).to_dict()
+        report["untracked_artifacts"] = [
+            {
+                "path": str(child.relative_to(session_dir)),
+                **account(
+                    [child],
+                    retained=[*committed_paths, trash_root],
+                ).to_dict(),
+            }
+            for child in sorted(untracked_paths)
+        ]
+        report["managed_physical_total"] = account([artifact_root, trash_root]).to_dict()
+        reports.append(report)
     if args.session_id:
         _print_json(reports[0])
         return 0
@@ -166,17 +228,40 @@ def _cmd_session_storage(args: argparse.Namespace) -> int:
 
     trusted = [row for row in reports if row["notes"].get("topology_reliable")]
     untrusted = [row for row in reports if not row["notes"].get("topology_reliable")]
+    authorized = [row["policy_prune"] for row in reports if row["policy_prune"]["applicable"]]
     _print_json(
         {
             "sessions": reports,
-            "totals": _sum(
-                reports, "session_total", "apparent_bytes", "unique_bytes", "files"
+            # Backward-compatible name: committed canonical artifacts only.
+            "totals": _sum(reports, "session_total", "apparent_bytes", "unique_bytes", "files"),
+            "trash_totals": _sum(reports, "trash_total", "apparent_bytes", "unique_bytes", "files"),
+            "untracked_artifact_totals": _sum(
+                reports,
+                "untracked_artifacts_total",
+                "apparent_bytes",
+                "unique_bytes",
+                "shared_bytes",
+                "reclaimable_bytes",
+                "files",
             ),
-            # The only figure a prune may act on.
-            "verified_reclaimable": _sum(
+            "managed_physical_totals": _sum(
+                reports,
+                "managed_physical_total",
+                "apparent_bytes",
+                "unique_bytes",
+                "files",
+            ),
+            # A topology measurement, not deletion authorization.
+            "topology_verified_unreachable": _sum(
                 trusted, "candidate_total", "apparent_bytes", "shared_bytes", "reclaimable_bytes"
             )
             | {"sessions": len(trusted)},
+            # The only figure the mutating prune command may act on: explicit dispositions/roles,
+            # trustworthy topology, and current file fingerprints all passed.
+            "policy_authorized_prune": _sum(
+                authorized, "accounting", "apparent_bytes", "shared_bytes", "reclaimable_bytes"
+            )
+            | {"sessions": len(authorized)},
             # Reported separately and never added to the above: these sessions' topology cannot
             # identify abandoned work, so their candidates are not evidence of anything.
             "unverified_excluded": _sum(
@@ -188,6 +273,94 @@ def _cmd_session_storage(args: argparse.Namespace) -> int:
             },
         }
     )
+    return 0
+
+
+def _retention_manager(args: argparse.Namespace) -> RetentionManager:
+    return RetentionManager(SessionStore.open(_sessions_root(args), args.session_id))
+
+
+def _refresh_after_retention(manager: RetentionManager) -> None:
+    AnalysisSession(manager.store).refresh_outputs_best_effort()
+
+
+def _cmd_session_branch_disposition(args: argparse.Namespace) -> int:
+    manager = _retention_manager(args)
+    value = None if args.disposition == "unclassified" else args.disposition
+    event = manager.set_branch_disposition(args.execution_id, value, reason=args.reason)
+    _print_json(
+        {
+            "event": event,
+            "branch": manager.store.state.retention["branches"].get(args.execution_id),
+        }
+    )
+    return 0
+
+
+def _cmd_session_artifact_role(args: argparse.Namespace) -> int:
+    manager = _retention_manager(args)
+    value = None if args.role == "unclassified" else args.role
+    event = manager.set_artifact_role(
+        args.execution_id,
+        args.relative_path,
+        value,
+        reason=args.reason,
+    )
+    roles = manager.store.state.retention["artifact_roles"].get(args.execution_id, {})
+    _print_json({"event": event, "artifact_role": roles.get(args.relative_path)})
+    return 0
+
+
+def _grace_seconds(args: argparse.Namespace) -> int:
+    if args.grace_hours < 1:
+        raise RetentionError("CLI prune grace period must be at least one hour")
+    return int(args.grace_hours) * 3600
+
+
+def _cmd_session_prune(args: argparse.Namespace) -> int:
+    root = _sessions_root(args).expanduser()
+    grace_seconds = _grace_seconds(args)
+    if args.apply is None:
+        state = read_state_without_opening(root / args.session_id)
+        if not state:
+            raise RetentionError(
+                "session checkpoint is missing or malformed; refusing to construct a prune plan"
+            )
+        plan = build_prune_plan(
+            root / args.session_id,
+            session_id=args.session_id,
+            state=state,
+            grace_seconds=grace_seconds,
+        )
+        _print_json(plan.to_dict())
+        return 0
+    manager = _retention_manager(args)
+    result = manager.apply(args.apply, grace_seconds=grace_seconds)
+    _refresh_after_retention(manager)
+    _print_json(result)
+    return 0
+
+
+def _cmd_session_restore(args: argparse.Namespace) -> int:
+    manager = _retention_manager(args)
+    result = manager.restore(args.operation_id, confirmation=args.confirm)
+    _refresh_after_retention(manager)
+    _print_json(result)
+    return 0
+
+
+def _cmd_session_purge(args: argparse.Namespace) -> int:
+    manager = _retention_manager(args)
+    result = manager.purge(args.operation_id, confirmation=args.confirm)
+    _print_json(result)
+    return 0
+
+
+def _cmd_session_retention_recover(args: argparse.Namespace) -> int:
+    manager = _retention_manager(args)
+    recovered = manager.recover()
+    _refresh_after_retention(manager)
+    _print_json({"recovered": recovered, "count": len(recovered)})
     return 0
 
 
@@ -655,11 +828,85 @@ def _parser() -> argparse.ArgumentParser:
     storage = actions.add_parser(
         "storage", help="report artifact storage and what a prune would reclaim (read-only)"
     )
-    storage.add_argument(
-        "session_id", nargs="?", help="one session; omit to report every session"
-    )
+    storage.add_argument("session_id", nargs="?", help="one session; omit to report every session")
     _add_sessions_root(storage)
     storage.set_defaults(handler=_cmd_session_storage)
+
+    branch_disposition = actions.add_parser(
+        "branch-disposition",
+        help="classify one lineage branch for retention (never deletes)",
+    )
+    branch_disposition.add_argument("session_id")
+    branch_disposition.add_argument("execution_id")
+    branch_disposition.add_argument(
+        "disposition", choices=sorted(BRANCH_DISPOSITIONS | {"unclassified"})
+    )
+    branch_disposition.add_argument("--reason", required=True)
+    _add_sessions_root(branch_disposition)
+    branch_disposition.set_defaults(handler=_cmd_session_branch_disposition)
+
+    artifact_role = actions.add_parser(
+        "artifact-role",
+        help="classify one exact committed artifact for retention (never deletes)",
+    )
+    artifact_role.add_argument("session_id")
+    artifact_role.add_argument("execution_id")
+    artifact_role.add_argument("relative_path")
+    artifact_role.add_argument("role", choices=sorted(ARTIFACT_ROLES | {"unclassified"}))
+    artifact_role.add_argument("--reason", required=True)
+    _add_sessions_root(artifact_role)
+    artifact_role.set_defaults(handler=_cmd_session_artifact_role)
+
+    prune = actions.add_parser(
+        "prune",
+        help="plan safely by default; apply an exact plan by moving artifacts to trash",
+    )
+    prune.add_argument("session_id")
+    prune.add_argument(
+        "--grace-hours",
+        type=int,
+        default=DEFAULT_GRACE_HOURS,
+        help=f"trash grace period before purge (default: {DEFAULT_GRACE_HOURS})",
+    )
+    prune.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="apply the exact plan id printed by a prior read-only invocation",
+    )
+    _add_sessions_root(prune)
+    prune.set_defaults(handler=_cmd_session_prune)
+
+    restore = actions.add_parser("restore", help="restore one trashed retention operation")
+    restore.add_argument("session_id")
+    restore.add_argument("operation_id")
+    restore.add_argument(
+        "--confirm",
+        required=True,
+        help="must exactly repeat OPERATION_ID",
+    )
+    _add_sessions_root(restore)
+    restore.set_defaults(handler=_cmd_session_restore)
+
+    purge = actions.add_parser(
+        "purge", help="permanently unlink a trashed operation after its grace period"
+    )
+    purge.add_argument("session_id")
+    purge.add_argument("operation_id")
+    purge.add_argument(
+        "--confirm",
+        required=True,
+        help="must exactly repeat OPERATION_ID",
+    )
+    _add_sessions_root(purge)
+    purge.set_defaults(handler=_cmd_session_purge)
+
+    recover = actions.add_parser(
+        "retention-recover",
+        help="finish event-authorized trash, restore, or purge work after a crash",
+    )
+    recover.add_argument("session_id")
+    _add_sessions_root(recover)
+    recover.set_defaults(handler=_cmd_session_retention_recover)
 
     resume = actions.add_parser("resume", help="plan exact or reconstructed continuation")
     resume.add_argument("session_id")

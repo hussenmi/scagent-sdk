@@ -125,6 +125,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "summary": prepared["summary"],
     }
 
+    # A user turn before the investigation, so the recorded anchor is non-zero. This also proves the
+    # turn index survives the broker -> worker JSON boundary: the anchor is computed inside the
+    # isolated compute environment from the index the broker serialized.
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "live-pre-evidence-turn", "user_prompt": "investigate the samples"},
+        actor="user",
+    )
     batch_env = await _execute(
         executor,
         batch,
@@ -132,21 +140,86 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "path": str(prepared_path),
             "batch_key": args.batch_key,
+            # Must be the clustering the fixture just produced. This input also carries a legacy
+            # "leiden" column, so the tool's default key would silently investigate the wrong one.
+            "cluster_key": "leiden_res_0_8",
         },
     )
-    decision_env = await _execute(
+    evidence_id = batch_env["details"]["evidence_id"]
+    recommendation = str(batch_env["details"]["recommendation"])
+    evaluator_pre = FloorEvaluator()
+    consultation_required = recommendation in (
+        "cannot_determine_technical_vs_biological",
+        "integration_optional_for_confirmed_replicates",
+    )
+
+    # A substantive decision must be refused while the user has said nothing, so the frictionless
+    # path cannot record an unresolved question as resolved.
+    unconsulted_ok, unconsulted_message = await _try_execute(
         executor,
         batch,
         "decide_batch_handling",
         {
-            "evidence_id": batch_env["details"]["evidence_id"],
+            "evidence_id": evidence_id,
             "decision": "keep_uncorrected",
-            "rationale": (
-                "Bounded live acceptance: keep the uncorrected representation and verify "
-                "identity-bound decision freshness."
-            ),
+            "rationale": "Bounded live acceptance: attempt to keep uncorrected without asking.",
         },
     )
+
+    # request_guidance records the open question but must leave the decision floor failing.
+    pending_ok, pending_message = await _try_execute(
+        executor,
+        batch,
+        "decide_batch_handling",
+        {
+            "evidence_id": evidence_id,
+            "decision": "request_guidance",
+            "rationale": "Bounded live acceptance: the batch question is with the user.",
+        },
+    )
+    pending_floor = evaluator_pre.evaluate(session.store.state, "batch_decision")
+
+    # The user answers in a real turn; only then does a substantive decision validate.
+    session.store.record(
+        "runtime.turn_started",
+        payload={
+            "turn_id": "live-consultation-turn",
+            "user_prompt": "they are unrelated donors, keep them uncorrected",
+        },
+        actor="user",
+    )
+    consulted_ok, consulted_message = await _try_execute(
+        executor,
+        batch,
+        "decide_batch_handling",
+        {
+            "evidence_id": evidence_id,
+            "decision": "keep_uncorrected",
+            "rationale": "Bounded live acceptance: recorded the user's own answer.",
+            "user_consultation": {
+                "turn_id": "live-consultation-turn",
+                "question_asked": "Keep the samples combined uncorrected, integrate, or separate?",
+                "user_answer": "they are unrelated donors, keep them uncorrected",
+            },
+        },
+    )
+    report["consultation"] = {
+        "recommendation": recommendation,
+        "consultation_required": consultation_required,
+        "anchor_crossed_the_worker_boundary": (
+            int(batch_env["details"].get("consultation_anchor_sequence") or 0) > 0
+        ),
+        "anchor_sequence": batch_env["details"].get("consultation_anchor_sequence"),
+        "unconsulted_decision_refused": (not unconsulted_ok) if consultation_required else None,
+        "unconsulted_message": unconsulted_message if not unconsulted_ok else None,
+        "request_guidance_recorded": pending_ok,
+        "request_guidance_message": pending_message if not pending_ok else None,
+        "pending_blocks_finalization": pending_floor is not None,
+        "pending_floor_reason": pending_floor.reason if pending_floor else None,
+        "consulted_decision_accepted": consulted_ok,
+        "consulted_message": consulted_message if not consulted_ok else None,
+    }
+    decision_env = {"summary": consulted_message}
     facts = session.store.state.facts
     analysis = facts["analysis"]
     batch_fact = facts["batch"]

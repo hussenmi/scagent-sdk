@@ -163,17 +163,8 @@ def test_dense_figure_preview_is_downscaled_and_reencoded_when_png_is_wasteful(
 
 def test_directive_names_every_attached_figure_and_forbids_deferring_the_reading() -> None:
     from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
-    from scagent_sdk.capabilities.results import CapabilityResult, ModelMedia
 
-    result = CapabilityResult(
-        summary="two figures",
-        model_media=(
-            ModelMedia(name="qc-violins", relative_path="qc-violins.png", media_type="image/png"),
-            ModelMedia(name="qc-scatter", relative_path="qc-scatter.png", media_type="image/png"),
-        ),
-    )
-
-    directive = Executor._figure_directive(result)
+    directive = Executor._figure_directive(["qc-violins", "qc-scatter"], [])
 
     assert "2 figures are attached" in directive
     assert "qc-violins" in directive and "qc-scatter" in directive
@@ -187,16 +178,95 @@ def test_directive_names_every_attached_figure_and_forbids_deferring_the_reading
 
 def test_directive_is_singular_for_one_figure() -> None:
     from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
-    from scagent_sdk.capabilities.results import CapabilityResult, ModelMedia
 
-    result = CapabilityResult(
-        summary="one figure",
-        model_media=(
-            ModelMedia(name="embedding", relative_path="embedding.png", media_type="image/png"),
-        ),
+    assert "1 figure is attached" in Executor._figure_directive(["embedding"], [])
+
+
+def test_directive_names_unattached_figures_so_absence_is_not_mistaken_for_review() -> None:
+    from scagent_sdk.capabilities.executor import CapabilityExecutor as Executor
+
+    directive = Executor._figure_directive(
+        ["qc-violins"], [("cluster-qc/leiden/umap.png", "too large to attach even downscaled")]
     )
 
-    assert "1 figure is attached" in Executor._figure_directive(result)
+    assert "1 figure is attached" in directive
+    assert "NOT attached" in directive
+    assert "cluster-qc/leiden/umap.png" in directive
+    assert "inspect-media" in directive
+    # Re-running cannot change a figure's size; three consecutive identical retries is exactly
+    # what the old hard failure produced.
+    assert "do not re-run this tool" in directive
+
+
+def test_oversized_figure_is_attached_downscaled_instead_of_failing_the_execution(
+    tmp_path: Path,
+) -> None:
+    """A capability whose science completed must never be discarded over its preview size.
+
+    The regression: a 2.1 MiB cluster-QC UMAP made `evaluate_cluster_qc` raise after every axis
+    had been computed, so `review_cluster_qc` was unreachable and finalization stayed blocked on
+    evidence that had already been produced.
+    """
+
+    import random
+
+    skill = tmp_path / "skills" / "huge-figure"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: huge-figure\ndescription: d\n---\n", "utf-8")
+    (skill / "capability.yaml").write_text(
+        "schema_version: 1\n"
+        "skill:\n  id: huge-figure\n  version: '0.1.0'\n  description: d\n"
+        "tools:\n"
+        "  - name: draw_huge\n"
+        "    description: d\n"
+        "    entrypoint: scripts/run.py:run\n"
+        "    environment: current\n"
+        "    input_schema: {type: object, properties: {}, additionalProperties: false}\n",
+        encoding="utf-8",
+    )
+    # Noise defeats PNG compression, so the figure is genuinely over the per-image ceiling.
+    generator = random.Random(0)
+    image = Image.new(
+        "RGB",
+        (3000, 2400),
+        "white",
+    )
+    pixels = image.load()
+    assert pixels is not None
+    for x in range(0, 3000, 2):
+        for y in range(0, 2400, 2):
+            pixels[x, y] = (generator.randrange(256), generator.randrange(256), 90)
+    source = tmp_path / "huge.png"
+    image.save(source)
+    assert source.stat().st_size > 2 * 1024 * 1024
+    (skill / "scripts" / "run.py").write_text(
+        "import shutil\n"
+        "def run(arguments, context):\n"
+        f"    shutil.copy({str(source)!r}, context.staging_dir / 'huge.png')\n"
+        "    return {'summary': 'drew a very large figure',\n"
+        "            'artifacts': [{'name': 'huge', 'relative_path': 'huge.png',\n"
+        "                           'media_type': 'image/png'}],\n"
+        "            'model_media': [{'name': 'huge', 'relative_path': 'huge.png',\n"
+        "                             'media_type': 'image/png'}]}\n",
+        encoding="utf-8",
+    )
+    package = CapabilityRegistry(skill.parent).discover()[0]
+    session = AnalysisSession.create(tmp_path / "sessions", title="huge figure")
+    executor = CapabilityExecutor(session)
+
+    response = asyncio.run(executor.execute(package, package.manifest.tools[0], {}))
+
+    assert response.get("is_error") is not True
+    assert [item["type"] for item in response["content"]] == ["text", "image", "text"]
+    attached = base64.b64decode(response["content"][1]["data"])
+    assert len(attached) <= 2 * 1024 * 1024
+    assert "NOT attached" not in response["content"][2]["text"]
+    # The staged artifact keeps its full resolution; only the transported copy shrank.
+    execution_id = response["structuredContent"]["scagent_execution_id"]
+    staged = executor.pending_root / execution_id / "huge.png"
+    assert staged.stat().st_size == source.stat().st_size
+    with Image.open(staged) as full:
+        assert max(full.size) == 3000
 
 
 def test_no_directive_is_emitted_when_a_result_carries_no_pixels(tmp_path: Path) -> None:

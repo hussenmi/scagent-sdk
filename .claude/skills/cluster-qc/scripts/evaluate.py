@@ -94,6 +94,27 @@ _BROAD_CONTEXT_GENES = frozenset(
 )
 
 
+def unreviewed_figures(required: Any, reviewed: Any) -> list[str]:
+    """Return the required figures the review did not name, matching on the file name.
+
+    The requirement is that the model looked at each figure, not that it can transcribe a 90-
+    character artifact path. A basename, a path suffix, or the full relative path identify the same
+    figure unambiguously here, so all three are accepted, and naming a figure that was not required
+    is ignored rather than treated as an error. This matters most for this skill, whose review set
+    is one heatmap per cluster: a 28-cluster run required 30 exact paths in one argument.
+    """
+
+    def keys(value: str) -> set[str]:
+        cleaned = str(value).strip().strip("'\"").replace("\\", "/").rstrip("/")
+        parts = [part for part in cleaned.split("/") if part and part != "."]
+        return {"/".join(parts[index:]) for index in range(len(parts))} or {cleaned}
+
+    named: set[str] = set()
+    for value in reviewed or ():
+        named |= keys(str(value))
+    return sorted(str(value) for value in required or () if not keys(str(value)) & named)
+
+
 def gene_class(gene: str) -> str:
     """Classify a gene symbol as ``nuisance``, ``broad``, or ``discriminating``."""
     symbol = str(gene).upper()
@@ -596,6 +617,7 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
         frac_high_corr: float | None = None
         n_struct_genes = 0
         heatmap_rel: str | None = None
+        heatmap_inputs: tuple[Any, Any, int] | None = None
         if n_cluster >= min_cells_structure and structure_pool.size >= 10:
             cell_idx = np.where(cluster_mask)[0]
             if cell_idx.size > max_cells_structure:
@@ -603,7 +625,12 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
             block = adata[cell_idx][:, structure_pool].X
             block = np.asarray(block.todense()) if hasattr(block, "todense") else np.asarray(block)
             variances = block.var(axis=0)
-            keep = np.where(variances > 0)[0]
+            # A floor, not just "greater than zero": a gene whose variance is 1e-30 survives a
+            # `> 0` test and then makes np.corrcoef divide by ~0, so its correlations come back
+            # NaN. Zeroing those NaNs drives mean |r| to exactly 0 and the cluster is called
+            # unstructured on undefined evidence rather than on genes that genuinely vary
+            # independently. Below this floor a gene carries no usable covariance signal.
+            keep = np.where(np.isfinite(variances) & (variances > 1e-12))[0]
             if keep.size > n_structure_genes:
                 keep = keep[np.argsort(variances[keep])[::-1][:n_structure_genes]]
             n_struct_genes = int(keep.size)
@@ -614,31 +641,42 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
                 offdiag = corr[~np.eye(corr.shape[0], dtype=bool)]
                 mean_abs_corr = float(np.abs(offdiag).mean())
                 frac_high_corr = float((np.abs(offdiag) >= corr_threshold).mean())
-                if max_heatmaps is None or rendered_heatmaps < max_heatmaps:
-                    heatmap_rel = _render_heatmap(
-                        corr,
-                        structure_pool[keep],
-                        adata.var_names,
-                        cluster,
-                        heatmap_dir,
-                        output_prefix,
-                        plt,
-                        np,
-                        linkage,
-                        leaves_list,
-                    )
-                    if heatmap_rel is not None:
-                        rendered_heatmaps += 1
-                        heatmap_artifacts.append(
-                            {
-                                "name": f"cluster-structure-{cluster}",
-                                "relative_path": heatmap_rel,
-                                "media_type": "image/png",
-                            }
-                        )
+                heatmap_inputs = (corr, structure_pool[keep], int(cell_idx.size))
         structure = classify_structure(
             mean_abs_corr, frac_high_corr, n_cluster, n_struct_genes, min_cells=min_cells_structure
         )
+        # The verdict is computed before the figure but deliberately not passed to it: this heatmap
+        # is what the covariance call is read from, so printing the answer on it would let a review
+        # agree with the label without inspecting the pattern.
+        room_for_heatmap = max_heatmaps is None or rendered_heatmaps < max_heatmaps
+        if heatmap_inputs is not None and room_for_heatmap:
+            corr, heatmap_genes, n_heatmap_cells = heatmap_inputs
+            heatmap_rel = _render_heatmap(
+                corr,
+                heatmap_genes,
+                adata.var_names,
+                cluster,
+                heatmap_dir,
+                output_prefix,
+                plt,
+                np,
+                linkage,
+                leaves_list,
+                cluster_key=cluster_key,
+                n_cells=n_cluster,
+                n_cells_sampled=n_heatmap_cells,
+                mean_abs_corr=mean_abs_corr,
+            )
+            if heatmap_rel is not None:
+                rendered_heatmaps += 1
+                heatmap_artifacts.append(
+                    {
+                        "name": f"cluster-structure-{cluster}",
+                        "relative_path": heatmap_rel,
+                        "media_type": "image/png",
+                        "title": f"cluster {cluster} gene correlation",
+                    }
+                )
         moran_mt = float(moran_local["mt"][cluster_mask].mean()) if "mt" in moran_local else None
         moran_lib = float(moran_local["lib"][cluster_mask].mean()) if "lib" in moran_local else None
         structure_rows.append(
@@ -724,6 +762,7 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
         output_prefix,
         plt,
         pd,
+        np,
     )
     umap_media = _render_umap(adata, cluster_key, context, output_prefix, plt, sc)
 
@@ -846,6 +885,16 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
     # can open them with `inspect-media` instead of silently reviewing from their absence.
     unattached = [item["relative_path"] for item in heatmap_artifacts[attachable:]]
 
+    documentation = _documentation(
+        output_prefix=output_prefix,
+        cluster_key=cluster_key,
+        evidence=common_details,
+        decisions=decision_rows,
+        n_heatmaps=len(heatmap_artifacts),
+        has_metric_figure=metric_figure is not None,
+        umap_names=[str(item["name"]) for item in umap_media],
+    )
+
     if cleanup["applied"]:
         return _apply_cleanup(
             adata=adata,
@@ -859,6 +908,7 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
             base_artifacts=base_artifacts,
             model_media=model_media,
             report_rows=decision_rows,
+            documentation=documentation,
             np=np,
             pd=pd,
         )
@@ -869,6 +919,7 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
             "name": "cluster-qc-report",
             "relative_path": f"{output_prefix}/cluster-qc-report.md",
             "media_type": "text/markdown",
+            "include_in_output_view": False,
         }
     )
     return {
@@ -916,6 +967,330 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: C90
         },
         "artifacts": base_artifacts,
         "model_media": model_media,
+        "documentation": documentation,
+    }
+
+
+def _documentation(
+    *,
+    output_prefix: str,
+    cluster_key: str,
+    evidence: dict[str, Any],
+    decisions: list[dict[str, Any]],
+    n_heatmaps: int,
+    has_metric_figure: bool,
+    umap_names: list[str],
+) -> dict[str, Any]:
+    """Explain this cluster check to someone who did not run it and does not know the vocabulary.
+
+    Written from the same decision table the analysis used, so the account cannot drift from the
+    numbers. Findings name the actual clusters: a reader who has to re-derive which cluster was
+    flagged from four CSVs and thirty heatmaps has not been told anything.
+    """
+
+    counted: dict[str, list[str]] = {}
+    for row in decisions:
+        counted.setdefault(str(row["action"]), []).append(str(row["cluster"]))
+    # These three membership tests must use the same vocabulary `synthesize_decision` does, or the
+    # README reports a different finding than the decision table it claims to summarize. "weak"
+    # counts as adverse covariance there, so it counts here too.
+    metric_flagged = [
+        str(row["cluster"])
+        for row in decisions
+        if row.get("metric_severity") in {"ambiguous", "obvious"}
+    ]
+    junk_identity = [
+        str(row["cluster"]) for row in decisions if row.get("deg_verdict") == "junk_markers"
+    ]
+    unstructured = [
+        str(row["cluster"]) for row in decisions if row.get("structure") in {"unstructured", "weak"}
+    ]
+    cleanup = evidence["cleanup"]
+    n_clusters = int(evidence["n_clusters"])
+
+    def listed(clusters: list[str]) -> str:
+        """Name clusters so a list of them cannot be misread as a count.
+
+        Clusters are labelled 0, 1, 2..., so a bare "0" after a colon reads as "zero clusters"
+        when it means "cluster 0" -- the opposite conclusion.
+        """
+
+        ordered = sorted(clusters, key=_natural_cluster_key)
+        if not ordered:
+            return "none"
+        if len(ordered) == 1:
+            return f"cluster {ordered[0]}"
+        return f"clusters {', '.join(ordered[:-1])} and {ordered[-1]}"
+
+    findings = [
+        f"{n_clusters} clusters were checked in `{cluster_key}`.",
+        (
+            f"Quality measurements (how many genes and reads per cell, how much mitochondrial and "
+            f"ribosomal content) singled out: {listed(metric_flagged)}."
+        ),
+        (
+            "Marker genes gave no cell-identity signal — only stress, housekeeping, or too few "
+            f"distinguishing genes — for: {listed(junk_identity)}."
+        ),
+        (
+            "Gene co-variation found no coherent transcriptional program, or only a weak one — "
+            "which is what a noise or doublet mixture looks like — for: "
+            f"{listed(unstructured)}."
+        ),
+    ]
+    if cleanup["confirmed_junk"]:
+        share = f"{cleanup['removal_fraction'] * 100:.1f}% of cells"
+        if cleanup["applied"]:
+            findings.append(
+                f"All three checks agreed on {listed(cleanup['confirmed_junk'])}, so those cells "
+                f"were removed here ({cleanup['removed_cells']:,} cells, {share}). The cells "
+                "before removal remain in the earlier saved dataset."
+            )
+        else:
+            findings.append(
+                f"All three checks agreed on {listed(cleanup['confirmed_junk'])}, but nothing was "
+                f"removed: {cleanup['held_reason']} (this would have dropped {share})."
+            )
+    else:
+        findings.append(
+            "No cluster failed all three checks together, which is the only case that removes "
+            "cells automatically, so the cell set is unchanged."
+        )
+    if evidence["review_clusters"]:
+        findings.append(
+            f"Left for a person to decide: {listed(list(evidence['review_clusters']))}. These "
+            "failed some checks but not all, so removing them is a judgement call, not a rule."
+        )
+    if evidence["doublet_signal_missing"]:
+        findings.append(
+            "No doublet scores were available, so nothing here can flag a cluster for being two "
+            "cells stuck together on that basis. The gene co-variation check is the only evidence "
+            "of that kind in this pass."
+        )
+    if evidence["doublet_enriched_clusters"]:
+        findings.append(
+            "Unusually many cells already called doublets sit in: "
+            f"{listed(list(evidence['doublet_enriched_clusters']))}."
+        )
+
+    return {
+        "name": "cluster-qc-guide",
+        "title": f"{cluster_key} cluster check explained",
+        "directory": output_prefix,
+        "overview": (
+            "Clustering always returns groups, including groups that are not cell types — debris, "
+            "dying cells, two cells captured as one, or plain noise. This step asks of every "
+            f"cluster in `{cluster_key}`, one cluster at a time, whether it looks like a real "
+            "population, using three checks that can fail independently:\n\n"
+            "1. **Are the cells healthy and normal-looking?** Reads and genes per cell, "
+            "mitochondrial and ribosomal content, compared against the rest of the dataset.\n"
+            "2. **Does the cluster have its own identity genes?** Genes higher here than "
+            "everywhere else, and whether those genes actually name a cell type rather than "
+            "describing stress or housekeeping activity.\n"
+            "3. **Do its genes turn on together?** Real cell types run coordinated programs, so "
+            "their genes co-vary. A mixture of unrelated cells does not.\n\n"
+            "Keeping the three apart matters, because each is blind to something. Cells can look "
+            "perfectly healthy and still be a mixture; a cluster can have strong marker genes and "
+            "poor quality metrics at once. Cells are removed automatically only where all three "
+            "agree, which is deliberately hard to reach."
+        ),
+        "what_was_done": [
+            f"Read the clustering `{cluster_key}` and measured every cluster's size.",
+            "Compared each cluster's quality measurements against the dataset as a whole, in "
+            "standard deviations, so 'unusual' is relative to this dataset rather than a "
+            "borrowed cutoff.",
+            "Ranked genes for each cluster against all other cells, then sorted the significant "
+            "ones into genes that name a cell type and genes that only report stress, "
+            "housekeeping, or ribosomal activity.",
+            "Measured how strongly each cluster's most variable genes co-vary with each other, "
+            "and saved one correlation picture per cluster.",
+            "Combined the three verdicts into one recommendation per cluster: keep, review, or "
+            "remove.",
+        ],
+        "findings": findings,
+        "parameters": dict(evidence["effective_parameters"]),
+        "files": [
+            {
+                "filename": "cluster-qc-decision-table.csv",
+                "purpose": (
+                    "The summary to read first: one row per cluster with all three verdicts and "
+                    "the recommendation they produced."
+                ),
+                "how_to_read": (
+                    "`action` is the recommendation. `keep` means nothing was wrong. `review` "
+                    "means some evidence was adverse but not all of it, so a person decides. "
+                    "`remove` means all three checks agreed the cluster is not a real population."
+                ),
+                "columns": {
+                    "cluster": "Cluster label in the clustering that was checked.",
+                    "n_cells": "How many cells are in this cluster.",
+                    "metric_severity": (
+                        "How unusual the quality measurements are: clean, ambiguous, or obvious."
+                    ),
+                    "deg_verdict": (
+                        "Whether the cluster's top genes name a cell type (`identity`), only "
+                        "report stress or housekeeping activity (`junk`), or were too few to say."
+                    ),
+                    "structure": (
+                        "Whether the genes co-vary as a coherent program (`structured`) or vary "
+                        "independently the way noise and mixtures do (`unstructured`)."
+                    ),
+                    "synthesis": "The three verdicts combined into one description.",
+                    "action": "The recommendation: keep, review, or remove.",
+                    "reasons": "The evidence behind the recommendation, one item per check.",
+                },
+            },
+            {
+                "filename": "cluster-metric-evidence.csv",
+                "purpose": "The quality measurements behind check 1, per cluster.",
+                "how_to_read": (
+                    "The `_z` columns are distances from the dataset average measured in standard "
+                    "deviations: 0 is typical, +2 is unusually high, -2 unusually low. "
+                    "`mean_silhouette` below zero means the cluster's cells sit closer to another "
+                    "cluster than to their own."
+                ),
+                "columns": {
+                    "mt_z": "Mitochondrial content versus the dataset average.",
+                    "ribo_z": "Ribosomal content versus the dataset average.",
+                    "lib_z": "Total reads per cell versus the dataset average.",
+                    "genes_z": "Genes detected per cell versus the dataset average.",
+                    "mean_silhouette": "How well-separated this cluster is from the others.",
+                    "doublet_enriched": (
+                        "Whether cells already called doublets are concentrated here."
+                    ),
+                    "severity": "The check-1 verdict for this cluster.",
+                    "adverse_signals": "Which individual measurements were off.",
+                },
+            },
+            {
+                "filename": "cluster-deg-identity.csv",
+                "purpose": "The marker genes behind check 2, per cluster.",
+                "how_to_read": (
+                    "A cluster with many `discriminating` genes has its own identity. A cluster "
+                    "whose genes are mostly `nuisance` is reporting cell state or stress, not a "
+                    "cell type, and is a candidate for removal if the other checks agree."
+                ),
+                "columns": {
+                    "verdict": "The check-2 result for this cluster.",
+                    "n_discriminating": "How many genes actually distinguish this cluster.",
+                    "n_significant": "How many genes were statistically significant at all.",
+                    "discriminating": "The genes that name a cell type, most distinctive first.",
+                    "nuisance": "Mitochondrial, ribosomal, and heat-shock genes found instead.",
+                    "broad": "Genes expressed widely enough to identify nothing on their own.",
+                },
+            },
+            {
+                "filename": "cluster-structure-evidence.csv",
+                "purpose": "The gene co-variation measurements behind check 3, per cluster.",
+                "how_to_read": (
+                    "`mean_abs_corr` near zero means genes vary independently of one another — no "
+                    "shared program. The `moran_local_*` columns ask whether technical quality "
+                    "varies smoothly across the map, which is a sign that a cluster boundary "
+                    "follows quality rather than biology."
+                ),
+                "columns": {
+                    "n_structure_genes": "How many variable genes went into the correlation.",
+                    "mean_abs_corr": "Average strength of correlation between gene pairs.",
+                    "frac_pairs_above_threshold": "Share of gene pairs that correlate strongly.",
+                    "structure": "The check-3 verdict for this cluster.",
+                    "moran_local_mt": "Whether mitochondrial content clumps spatially here.",
+                    "moran_local_lib": "Whether read depth clumps spatially here.",
+                    "heatmap_path": "The correlation picture for this cluster.",
+                },
+            },
+            {
+                "filename": "cluster-qc-evidence.json",
+                "purpose": (
+                    "The complete machine-readable record, including the identity fingerprints "
+                    "that tie these decisions to this exact cell set and clustering."
+                ),
+                "how_to_read": (
+                    "Read the CSVs instead unless you are checking provenance or re-running "
+                    "programmatically."
+                ),
+            },
+            *(
+                [
+                    {
+                        "filename": "cluster-qc-metrics.png",
+                        "purpose": (
+                            "Quality measurements per cluster, one row of boxes per measurement."
+                        ),
+                        "how_to_read": (
+                            "Each box covers the middle half of the cells in one cluster. Red "
+                            "boxes and red labels are the clusters check 1 flagged; the flagged "
+                            "cluster numbers are also written out under the figure."
+                        ),
+                    }
+                ]
+                if has_metric_figure
+                else []
+            ),
+            *(
+                [
+                    {
+                        "filename": "cluster-qc-umap.png",
+                        "purpose": (
+                            "The cell map coloured by cluster and by each quality measurement."
+                        ),
+                        "how_to_read": (
+                            "Compare the cluster panel with the quality panels: a cluster that "
+                            "lights up in the mitochondrial or read-depth panel is separated by "
+                            "quality rather than by cell type."
+                        ),
+                    }
+                ]
+                if any(name == "cluster-qc-umap" for name in umap_names)
+                else []
+            ),
+            *(
+                [
+                    {
+                        "filename": "cluster-qc-umap-grid.png",
+                        "purpose": "The same map with one small panel per cluster.",
+                        "how_to_read": (
+                            "Small clusters are invisible in the combined map because larger "
+                            "clusters draw over them; here each gets its own panel."
+                        ),
+                    }
+                ]
+                if any(name == "cluster-qc-umap-grid" for name in umap_names)
+                else []
+            ),
+            *(
+                [
+                    {
+                        "filename": "cluster-structure/cluster_<id>_correlation.png",
+                        "purpose": (
+                            f"One gene-correlation picture per cluster ({n_heatmaps} saved), which "
+                            "is the visual evidence for check 3."
+                        ),
+                        "how_to_read": (
+                            "Each square shows how every pair of the cluster's most variable genes "
+                            "moves together, from -1 (opposite) through 0 (unrelated) to +1 "
+                            "(identical); genes are ordered so that ones behaving alike sit next "
+                            "to each other. Red blocks along the diagonal are groups of genes "
+                            "switching on together — a real program. An even pale wash means the "
+                            "genes vary independently. The title carries the average pair strength "
+                            "(`mean_abs_corr`) but deliberately not the verdict: the picture is "
+                            "the evidence that verdict comes from, so it has to be read rather "
+                            "than confirmed. Clusters that passed are kept here on purpose — they "
+                            "are the comparison that makes a failing one obvious."
+                        ),
+                    }
+                ]
+                if n_heatmaps
+                else []
+            ),
+        ],
+        "caveats": [
+            "These checks judge whether a cluster is a coherent population, not what cell type it "
+            "is. Naming cell types is a separate step.",
+            "A `review` cluster is genuinely undecided. Nothing here says it should be removed, "
+            "and it is equally wrong to read it as confirmed good.",
+            "Removal thresholds are conventions, not measurements. A cluster just inside a cutoff "
+            "and one just outside are not meaningfully different.",
+        ],
     }
 
 
@@ -930,7 +1305,24 @@ def _render_heatmap(
     np: Any,
     linkage: Any,
     leaves_list: Any,
+    *,
+    cluster_key: str,
+    n_cells: int,
+    n_cells_sampled: int,
+    mean_abs_corr: float | None,
 ) -> str | None:
+    """One clustered gene-gene correlation heatmap: identification and measurement, nothing more.
+
+    The figure deliberately does NOT state the covariance verdict. This heatmap is the evidence the
+    verdict is read *from*, and a title announcing "moderate" lets a reviewer agree with the label
+    without ever looking at the pattern -- which defeats the visual review the floor requires. For
+    the same reason there is no prose explaining how to read a correlation block: that guidance is
+    stable across every run and belongs in the folder's README, not burned into every image.
+
+    What stays is what a reader opening the file cold cannot reconstruct: which clustering and
+    cluster this is, how many genes and cells went in, and the one number the axis cannot show.
+    """
+
     try:
         heatmap_dir.mkdir(parents=True, exist_ok=True)
         order = np.arange(corr.shape[0])
@@ -940,23 +1332,114 @@ def _render_heatmap(
             condensed = np.clip(condensed, 0.0, None)
             order = leaves_list(linkage(condensed, method="average"))
         ordered = corr[np.ix_(order, order)]
-        fig, ax = plt.subplots(figsize=(6, 5))
-        image = ax.imshow(ordered, vmin=-1, vmax=1, cmap="RdBu_r", interpolation="nearest")
-        ax.set_title(f"Cluster {cluster} gene-gene correlation")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-        relative = f"{output_prefix}/cluster-structure/cluster_{cluster}_correlation.png"
-        fig.savefig(
-            heatmap_dir / f"cluster_{cluster}_correlation.png",
-            dpi=140,
-            bbox_inches="tight",
+        n_genes = int(corr.shape[0])
+        # Square, and widened with the gene count the way the legacy figures were, so a 150-gene
+        # block pattern is not squeezed into the same box as a 20-gene one.
+        side = max(5.0, min(9.0, n_genes / 20.0))
+        fig, ax = plt.subplots(figsize=(side, side))
+        image = ax.imshow(ordered, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
+        cells = (
+            f"{n_cells:,} cells"
+            if n_cells_sampled >= n_cells
+            else f"{n_cells_sampled:,} of {n_cells:,} cells"
         )
+        # A correlation is undefined where a gene barely varies, and those entries arrive here as
+        # zeros. Reporting mean |r| = 0.000 for them would present absent evidence as a measurement,
+        # so the degenerate case is named as such -- a fact about the data, not an interpretation.
+        if not bool(np.isclose(np.diag(ordered), 1.0).all()):
+            measured = "mean_abs_corr=undefined (genes do not vary)"
+        elif mean_abs_corr is not None:
+            measured = f"mean_abs_corr={mean_abs_corr:.3f}"
+        else:
+            measured = "mean_abs_corr=not computed"
+        ax.set_title(
+            f"{cluster_key} / cluster {cluster}\n{n_genes} genes x {cells} | {measured}",
+            fontsize=10,
+        )
+        # Gene names are the whole point of the figure when there are few enough to read; past that
+        # they become an unreadable smear and the block pattern is what carries the information.
+        if n_genes <= 60:
+            names = [str(var_names[int(index)]) for index in np.asarray(gene_indices)[order]]
+            ax.set_xticks(range(n_genes))
+            ax.set_yticks(range(n_genes))
+            ax.set_xticklabels(names, rotation=90, fontsize=5)
+            ax.set_yticklabels(names, fontsize=5)
+        else:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        relative = f"{output_prefix}/cluster-structure/cluster_{cluster}_correlation.png"
+        fig.savefig(heatmap_dir / f"cluster_{cluster}_correlation.png", dpi=180)
         plt.close(fig)
         return relative
     except Exception:
         plt.close("all")
         return None
+
+
+def _log10_positive(values: Any, np: Any) -> Any:
+    """The strictly positive values as log10; non-positive ones have no logarithm and are dropped.
+
+    Plotting the logarithm is not the same as log-*scaling* raw values: on a log-scaled axis the
+    numbers printed are not the numbers drawn, so a box's height is not a spread in anything a
+    reader can name. Mirrors the helper of the same purpose in `single-cell-qc` and
+    `visualize-single-cell` -- a skill's own scripts directory is the only thing on its import path,
+    so the convention is duplicated rather than shared, and the copies must not drift.
+    """
+
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return np.log10(finite[finite > 0.0])
+
+
+def _raw_reference_ticks(low: float, high: float) -> list[float]:
+    """Raw values to mark opposite a log10 axis spanning ``[low, high]``, both given raw."""
+
+    import math
+
+    if not low > 0.0 or not high > low:
+        return []
+    decades = math.log10(high) - math.log10(low)
+    if decades >= 1.5:
+        mantissas: tuple[float, ...] = (1.0, 2.0, 5.0)
+    elif decades >= 0.6:
+        mantissas = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+    else:
+        mantissas = (1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
+    ticks: list[float] = []
+    for exponent in range(math.floor(math.log10(low)), math.ceil(math.log10(high)) + 1):
+        for mantissa in mantissas:
+            value = mantissa * 10.0**exponent
+            if low <= value <= high:
+                ticks.append(value)
+    return sorted(ticks)
+
+
+def _label_log10_axis(axis: Any, label: str, np: Any, *, raw_label: str) -> None:
+    """Name a y axis carrying log10 values and mirror the raw magnitudes on the right."""
+
+    from matplotlib.ticker import FuncFormatter
+
+    axis.set_ylabel(f"{label} (log10)")
+    low, high = axis.get_ylim()
+    mirror = axis.secondary_yaxis(
+        "right",
+        functions=(
+            lambda value: 10.0**value,
+            lambda value: np.log10(np.clip(value, 1e-12, None)),
+        ),
+    )
+    ticks = _raw_reference_ticks(10.0**low, 10.0**high)
+    if ticks:
+        mirror.set_yticks(ticks)
+    mirror.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"{value / 1000:g}k" if value >= 1000 else f"{value:g}")
+    )
+    mirror.set_ylabel(raw_label, fontsize=8, labelpad=2)
+    mirror.tick_params(labelsize=8)
 
 
 def _render_metric_boxplots(
@@ -968,6 +1451,7 @@ def _render_metric_boxplots(
     output_prefix: str,
     plt: Any,
     pd: Any,
+    np: Any,
 ) -> dict[str, str] | None:
     metrics = [
         ("total_counts", "Library size", True),
@@ -991,11 +1475,16 @@ def _render_metric_boxplots(
         figsize=(max(10, len(clusters) * 0.75), 3.2 * len(available)),
         squeeze=False,
     )
-    for axis, (column, title, log_scale) in zip(axes[:, 0], available, strict=True):
+    for axis, (column, title, logged) in zip(axes[:, 0], available, strict=True):
         values = pd.to_numeric(adata.obs[column], errors="coerce")
         grouped = [
             values[labels.astype(str) == cluster].dropna().to_numpy() for cluster in clusters
         ]
+        # Taken here rather than applied to the axis: with the logarithm plotted, each box's height
+        # is a spread in fold-change and two clusters an equal distance apart differ by an equal
+        # factor, neither of which can be read off a log-scaled axis of raw counts.
+        if logged:
+            grouped = [_log10_positive(group, np) for group in grouped]
         boxes = axis.boxplot(
             grouped,
             tick_labels=clusters,
@@ -1005,25 +1494,35 @@ def _render_metric_boxplots(
         for cluster, box in zip(clusters, boxes["boxes"], strict=True):
             box.set_facecolor("#d9534f" if cluster in flagged else "#8dbbd8")
             box.set_alpha(0.85)
-        if log_scale and all((group > 0).all() for group in grouped if group.size):
-            axis.set_yscale("log")
-            # Default log labels over a two-decade range collide into "2 x 10^3 3 x 10^3 ...";
-            # plain numbers at 1/2/5 per decade stay readable at this panel height.
-            from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
-
-            axis.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
-            axis.yaxis.set_major_formatter(
-                FuncFormatter(
-                    lambda value, _: f"{value / 1000:g}k" if value >= 1000 else f"{value:g}"
-                )
-            )
-            axis.yaxis.set_minor_formatter(NullFormatter())
-        axis.set_ylabel(title)
+        # The colour alone does not survive a reader skimming, or a vision model downsampling the
+        # image: a flagged cluster's index has to be legible as text, not inferred from a hue.
+        for label, cluster in zip(axis.get_xticklabels(), clusters, strict=True):
+            if cluster in flagged:
+                label.set_color("#b22222")
+                label.set_fontweight("bold")
+        if logged:
+            _label_log10_axis(axis, title, np, raw_label="counts" if "size" in title else "genes")
+        else:
+            axis.set_ylabel(title)
         axis.grid(axis="y", alpha=0.2)
     axes[-1, 0].set_xlabel(cluster_key)
+    flagged_ordered = sorted(flagged, key=_natural_cluster_key)
     fig.suptitle(
         f"Per-cluster QC metrics — {cluster_key} "
-        "(red = metric-flagged; distributions shown without outlier points)"
+        f"({len(clusters)} clusters; distributions shown without outlier points)"
+    )
+    # Name the flagged clusters in text rather than leaving the reader to match a shade of red
+    # against an axis. Which marks carry it is self-evident from the figure and is not restated.
+    caption = "Metric-flagged clusters: " + (", ".join(flagged_ordered) or "none")
+    fig.text(
+        0.5,
+        0.0,
+        caption,
+        ha="center",
+        va="top",
+        fontsize=11,
+        color="#b22222" if flagged_ordered else "#2e6b2e",
+        fontweight="bold",
     )
     fig.tight_layout()
     relative = f"{output_prefix}/cluster-qc-metrics.png"
@@ -1034,6 +1533,7 @@ def _render_metric_boxplots(
         "name": "cluster-qc-metrics",
         "relative_path": relative,
         "media_type": "image/png",
+        "title": f"{cluster_key} qc metrics per cluster",
     }
 
 
@@ -1138,6 +1638,7 @@ def _render_cluster_grid(
         "name": "cluster-qc-umap-grid",
         "relative_path": relative,
         "media_type": "image/png",
+        "title": f"{cluster_key} umap grid per cluster",
     }
 
 
@@ -1184,6 +1685,7 @@ def _render_umap(
             "name": "cluster-qc-umap",
             "relative_path": relative,
             "media_type": "image/png",
+            "title": f"{cluster_key} umap with qc metrics",
         }
     ]
     grid = _render_cluster_grid(adata, cluster_key, context, output_prefix, plt)
@@ -1236,13 +1738,13 @@ def review(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     evidence_id = str(arguments["evidence_id"])
     if evidence_id != evidence.get("evidence_id"):
         raise ValueError("evidence_id does not match the current cluster-QC evidence")
-    reviewed = {str(value) for value in arguments.get("reviewed_artifacts", [])}
-    required = {str(value) for value in evidence.get("required_visual_artifacts", [])}
-    missing = sorted(required - reviewed)
+    missing = unreviewed_figures(
+        evidence.get("required_visual_artifacts", []), arguments.get("reviewed_artifacts", [])
+    )
     if missing:
         raise ValueError(
-            "cluster-QC visual review is incomplete; inspect and include every required "
-            "artifact: " + ", ".join(missing)
+            "cluster-QC visual review is incomplete. Look at these figures, then name them (the "
+            "file name alone is enough) in reviewed_artifacts: " + ", ".join(missing)
         )
     expected_clusters = {str(value) for value in evidence.get("review_clusters", [])}
     supplied = arguments.get("cluster_reviews", {})
@@ -1278,11 +1780,14 @@ def review(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     findings = [str(value).strip() for value in arguments.get("visual_findings", [])]
     if not findings or any(not value for value in findings):
         raise ValueError("visual_findings must contain at least one non-empty observation")
+    # The canonical paths, not the shorthand the model used to name them, so the record says which
+    # files were reviewed rather than how they happened to be referred to.
+    reviewed = sorted(str(value) for value in evidence.get("required_visual_artifacts", []))
     review_fact = {
         "status": "resolved" if not unresolved else "action_required",
         "evidence_id": evidence_id,
         "clustering_id": evidence.get("clustering_id"),
-        "reviewed_artifacts": sorted(reviewed),
+        "reviewed_artifacts": reviewed,
         "visual_findings": findings,
         "cluster_reviews": normalized,
         "unresolved_clusters": sorted(unresolved, key=_natural_cluster_key),
@@ -1441,6 +1946,7 @@ def _apply_cleanup(
     base_artifacts: list[dict[str, str]],
     model_media: list[dict[str, str]],
     report_rows: list[dict[str, Any]],
+    documentation: dict[str, Any],
     np: Any,
     pd: Any,
 ) -> dict[str, Any]:
@@ -1520,6 +2026,7 @@ def _apply_cleanup(
             "name": "cluster-qc-report",
             "relative_path": "cluster-qc-report.md",
             "media_type": "text/markdown",
+            "include_in_output_view": False,
         },
         {
             "name": "cluster-qc-filtered-raw-counts",
@@ -1545,4 +2052,5 @@ def _apply_cleanup(
         "decisions_patch": lineage["decisions_patch"],
         "artifacts": artifacts,
         "model_media": model_media,
+        "documentation": documentation,
     }

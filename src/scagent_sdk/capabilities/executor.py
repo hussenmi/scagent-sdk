@@ -10,21 +10,26 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from scagent_sdk.capabilities.documentation import render_readme
 from scagent_sdk.capabilities.manifest import CapabilityTool
 from scagent_sdk.capabilities.registry import SkillPackage
 from scagent_sdk.capabilities.results import (
     INLINE_RESULT_LIMIT_BYTES,
+    MODEL_MEDIA_DOWNSCALE_EDGES,
     MODEL_MEDIA_LIMIT_BYTES,
     MODEL_MEDIA_TOTAL_BYTES,
     CapabilityContext,
     CapabilityResult,
+    ProducedArtifact,
+    capability_artifact_directory_name,
 )
 from scagent_sdk.contracts.state import SessionState
 from scagent_sdk.errors import CapabilityExecutionError, CapabilityInterrupted
@@ -49,6 +54,7 @@ from scagent_sdk.state.lineage import (
     resolve_node_reference,
     with_prepared_path,
 )
+from scagent_sdk.state.pruning import execution_unavailable_reason
 from scagent_sdk.state.store import apply_merge_patch
 
 _EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning):\s+(.*)$")
@@ -65,12 +71,58 @@ _BRANCH_ARGUMENT = "branch_from"
 _ADOPT_UNTRACKED_ARGUMENT = "adopt_untracked"
 # How long a forced stop waits for a signalled worker to unwind before giving up on it.
 _WORKER_STOP_SECONDS = 15.0
+_PROGRESS_POLL_SECONDS = 0.25
+_PROGRESS_FILENAME = ".capability-progress.jsonl"
 _PATH_ARGUMENT_NAMES = frozenset({"cwd", "path"})
 _PATH_ARGUMENT_SUFFIXES = ("_dir", "_directory", "_file", "_path")
 
 
 class _AlreadyCommitted(Exception):
     """Internal signal for a duplicate commit observed only after the store reloads state."""
+
+
+def _normalize_progress(value: Any) -> dict[str, Any] | None:
+    try:
+        data = dict(value)
+    except (TypeError, ValueError):
+        return None
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    progress: dict[str, Any] = {"message": message.strip()}
+    for key in ("current", "total"):
+        number = data.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            progress[key] = number
+    return progress
+
+
+def _read_progress_updates(
+    path: Path, after_line: int = 0
+) -> tuple[list[dict[str, Any]], int]:
+    """Read unseen worker progress events, ignoring incomplete or malformed lines."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return [], after_line
+    updates: list[dict[str, Any]] = []
+    for line in lines[after_line:]:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        normalized = _normalize_progress(value)
+        if normalized is not None:
+            updates.append(normalized)
+    return updates, len(lines)
+
+
+def _read_progress(path: Path) -> dict[str, Any] | None:
+    """Compatibility helper returning the newest valid progress event."""
+
+    updates, _line_count = _read_progress_updates(path)
+    return updates[-1] if updates else None
 
 
 def _concise_capability_error(message: str) -> str:
@@ -109,12 +161,10 @@ def _resolve_session_paths(
         }
     if isinstance(value, list):
         return [
-            _resolve_session_paths(item, session_dir, argument_name=argument_name)
-            for item in value
+            _resolve_session_paths(item, session_dir, argument_name=argument_name) for item in value
         ]
     is_path_argument = argument_name is not None and (
-        argument_name in _PATH_ARGUMENT_NAMES
-        or argument_name.endswith(_PATH_ARGUMENT_SUFFIXES)
+        argument_name in _PATH_ARGUMENT_NAMES or argument_name.endswith(_PATH_ARGUMENT_SUFFIXES)
     )
     if not is_path_argument or not isinstance(value, str) or not value.strip():
         return value
@@ -212,6 +262,59 @@ def _find_execution_id(value: Any) -> str | None:
     return None
 
 
+def execution_id_from_hook(input_data: dict[str, Any]) -> str | None:
+    """Return the exact staged execution referenced by one PostToolUse event."""
+
+    return _find_execution_id(input_data.get("tool_response", input_data))
+
+
+def _rewrite_capability_paths(value: Any, old: str, new: str) -> Any:
+    """Rewrite executor-owned paths in JSON-shaped capability results."""
+
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_capability_paths(item, old, new)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_capability_paths(item, old, new) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_capability_paths(item, old, new) for item in value)
+    return value
+
+
+def _rewrite_staged_text_artifacts(
+    context: CapabilityContext,
+    result: CapabilityResult,
+    *,
+    old: str,
+    new: str,
+) -> None:
+    """Keep human-readable reports consistent with executor-owned canonical paths."""
+
+    text_media = {
+        "application/json",
+        "text/csv",
+        "text/markdown",
+        "text/plain",
+        "text/tab-separated-values",
+        "text/x-python",
+    }
+    for artifact in result.artifacts:
+        if artifact.media_type not in text_media:
+            continue
+        path = context.staging_dir / artifact.relative_path
+        try:
+            value = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        rewritten = value.replace(old, new)
+        if rewritten != value:
+            path.write_text(rewritten, encoding="utf-8")
+
+
 class CapabilityExecutor:
     def __init__(
         self, session: AnalysisSession, *, environment_broker: EnvironmentBroker | None = None
@@ -223,11 +326,76 @@ class CapabilityExecutor:
         self.pending_root.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
 
+    def migrate_legacy_artifact_directories(self) -> dict[str, str]:
+        """Rename UUID-only directories and update durable paths in one atomic state event.
+
+        This is an explicit migration helper, not an automatic open-time mutation. New executions
+        already use descriptive canonical directories; old sessions remain readable until a caller
+        deliberately migrates them.
+        """
+
+        state = self.session.store.state
+        moves: list[tuple[Path, Path, str, str]] = []
+        for execution_id, record in state.artifacts.items():
+            if not isinstance(record, dict):
+                continue
+            recorded = record.get("path")
+            tool_name = record.get("tool_name")
+            if not isinstance(recorded, str) or not isinstance(tool_name, str):
+                continue
+            source = self.session.directory / recorded
+            if source.name != str(execution_id) or not source.is_dir():
+                continue
+            target_relative = (
+                "artifacts/capabilities/"
+                + capability_artifact_directory_name(tool_name, str(execution_id))
+            )
+            target = self.session.directory / target_relative
+            if target.exists():
+                raise CapabilityExecutionError(
+                    f"cannot migrate {recorded}: target already exists at {target_relative}"
+                )
+            moves.append((source, target, recorded, target_relative))
+        if not moves:
+            return {}
+
+        completed: list[tuple[Path, Path]] = []
+        try:
+            for source, target, _old, _new in moves:
+                os.replace(source, target)
+                completed.append((source, target))
+            sections: dict[str, Any] = {
+                "facts": state.facts,
+                "artifacts": state.artifacts,
+                "decisions": state.decisions,
+                "runtime": state.runtime,
+                "lineage": state.lineage,
+                "retention": state.retention,
+            }
+            for _source, _target, old, new in moves:
+                sections = _rewrite_capability_paths(sections, old, new)
+            mapping = {old: new for _source, _target, old, new in moves}
+            self.session.store.record(
+                "capability.directories_migrated",
+                payload={"paths": mapping},
+                state_patch=sections,
+            )
+        except Exception:
+            for source, target in reversed(completed):
+                if target.exists() and not source.exists():
+                    with suppress(OSError):
+                        os.replace(target, source)
+            raise
+        self.session.refresh_outputs_best_effort()
+        return mapping
+
     async def execute(
         self,
         package: SkillPackage,
         tool: CapabilityTool,
         arguments: dict[str, Any],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         execution_id = str(uuid4())
         staging_dir = self.pending_root / execution_id
@@ -242,6 +410,7 @@ class CapabilityExecutor:
             state_revision=self.session.store.state.revision,
             state_facts=deepcopy(self.session.store.state.facts),
             state_lineage=deepcopy(self.session.store.state.lineage),
+            user_turns=tuple(self.session.store.user_turns()),
         )
         resolved_arguments = _resolve_session_paths(arguments, self.session.directory)
         try:
@@ -261,7 +430,11 @@ class CapabilityExecutor:
                 environment = {"name": "current", "python": sys.executable}
             elif self.environment_broker is not None:
                 execution = await self._execute_in_environment(
-                    package, tool, resolved_arguments, context
+                    package,
+                    tool,
+                    resolved_arguments,
+                    context,
+                    progress_callback=progress_callback,
                 )
                 value = execution.value
                 environment = execution.provenance
@@ -270,6 +443,24 @@ class CapabilityExecutor:
                     f"environment {tool.environment!r} requires the environment broker"
                 )
             result = CapabilityResult.from_value(value)
+            result = self._write_documentation(context, result)
+            legacy = f"artifacts/capabilities/{context.execution_id}"
+            current = context.artifact_relative_dir
+            _rewrite_staged_text_artifacts(
+                context,
+                result,
+                old=legacy,
+                new=current,
+            )
+            result = replace(
+                result,
+                summary=str(_rewrite_capability_paths(result.summary, legacy, current)),
+                details=_rewrite_capability_paths(result.details, legacy, current),
+                facts_patch=_rewrite_capability_paths(result.facts_patch, legacy, current),
+                decisions_patch=_rewrite_capability_paths(
+                    result.decisions_patch, legacy, current
+                ),
+            )
             model_content = self._model_content(context, result)
             envelope = self._stage_result(
                 package,
@@ -352,9 +543,7 @@ class CapabilityExecutor:
             branch_from = None
         adopt_value = resolved_arguments.pop(_ADOPT_UNTRACKED_ARGUMENT, False)
         if not isinstance(adopt_value, bool):
-            raise CapabilityExecutionError(
-                f"{_ADOPT_UNTRACKED_ARGUMENT} must be true or false"
-            )
+            raise CapabilityExecutionError(f"{_ADOPT_UNTRACKED_ARGUMENT} must be true or false")
         adopt_untracked = adopt_value
         if adopt_untracked and not continues_lineage:
             raise CapabilityExecutionError(
@@ -413,6 +602,15 @@ class CapabilityExecutor:
             if requested
             else None
         )
+        if resolved_node is not None:
+            unavailable = execution_unavailable_reason(
+                self.session.store.state.retention, resolved_node
+            )
+            if unavailable:
+                raise CapabilityExecutionError(
+                    f"recorded version {resolved_node} is unavailable because {unavailable}; "
+                    "restore the retention operation before using it"
+                )
         relation = classify_input(lineage, resolved_node) if requested else None
         if continues_lineage and branch_from is None and relation in {"ancestor", "sibling"}:
             current = head_path(lineage) or "(none)"
@@ -457,6 +655,8 @@ class CapabilityExecutor:
         tool: CapabilityTool,
         arguments: dict[str, Any],
         context: CapabilityContext,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
         """Run a compute capability off the event loop so the turn stays interruptible.
 
@@ -472,7 +672,24 @@ class CapabilityExecutor:
         worker = asyncio.ensure_future(
             asyncio.to_thread(broker.execute, package, tool, arguments, context)
         )
+        progress_path = context.staging_dir / _PROGRESS_FILENAME
+        previous_progress: dict[str, Any] | None = None
+        progress_line = 0
         try:
+            while not worker.done():
+                await asyncio.sleep(_PROGRESS_POLL_SECONDS)
+                updates, progress_line = _read_progress_updates(progress_path, progress_line)
+                if progress_callback is not None:
+                    for progress in updates:
+                        if progress != previous_progress:
+                            progress_callback(progress)
+                            previous_progress = progress
+            updates, progress_line = _read_progress_updates(progress_path, progress_line)
+            if progress_callback is not None:
+                for progress in updates:
+                    if progress != previous_progress:
+                        progress_callback(progress)
+                        previous_progress = progress
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
             broker.cancel(context.execution_id)
@@ -502,7 +719,7 @@ class CapabilityExecutor:
             )
 
     @staticmethod
-    def _figure_directive(result: CapabilityResult) -> str:
+    def _figure_directive(attached: list[str], unattached: list[tuple[str, str]]) -> str:
         """The instruction that turns attached pixels into an actual reading of them.
 
         Attaching an image only guarantees the model *received* it. Nothing obliges it to say
@@ -515,31 +732,133 @@ class CapabilityExecutor:
 
         Deliberately generic: what a given figure *means* is the skill's business, and the
         runtime package holds no biology.
+
+        Any figure the transport could not carry is named here with its path. Silence about it
+        would be the worst outcome: the model would review a set it believes is complete.
         """
 
-        names = [media.name for media in result.model_media]
-        count = len(names)
-        listed = ", ".join(names)
-        return (
-            f"{count} figure{'s are' if count != 1 else ' is'} attached above ({listed}).\n\n"
-            "Read them now, before your next tool call. For each one, state what it actually "
-            "shows, what it implies for the decision in front of you, and anything that needs "
-            "acting on. Reference what you can see in the pixels — not what the summary or the "
-            "table behind the figure says.\n\n"
-            "If a panel is empty, a legend is unreadable, categories share a color, or the data "
-            "occupies a sliver of the axes, say so and treat the visual review as incomplete: "
-            "regenerate a legible view or read the underlying table instead of guessing. If you "
-            "are mid-pipeline and no genuine decision point has been reached, keep this brief "
-            "and carry on with the next step — but do not skip it, and do not defer it to a "
-            "later review call."
+        blocks: list[str] = []
+        if attached:
+            count = len(attached)
+            blocks.append(
+                f"{count} figure{'s are' if count != 1 else ' is'} attached above "
+                f"({', '.join(attached)}).\n\n"
+                "Read them now, before your next tool call. For each one, state what it actually "
+                "shows, what it implies for the decision in front of you, and anything that needs "
+                "acting on. Reference what you can see in the pixels — not what the summary or "
+                "the table behind the figure says.\n\n"
+                "If a panel is empty, a legend is unreadable, categories share a color, or the "
+                "data occupies a sliver of the axes, say so and treat the visual review as "
+                "incomplete: regenerate a legible view or read the underlying table instead of "
+                "guessing. If you are mid-pipeline and no genuine decision point has been "
+                "reached, keep this brief and carry on with the next step — but do not skip it, "
+                "and do not defer it to a later review call."
+            )
+        if unattached:
+            listed = "\n".join(f"- {path} ({why})" for path, why in unattached)
+            blocks.append(
+                f"{len(unattached)} figure(s) were written but NOT attached above:\n{listed}\n\n"
+                "They are committed with the other artifacts. Open each one with the "
+                "`inspect-media` skill before any review that requires it, and say what you saw. "
+                "Do not treat an unattached figure as reviewed, and do not re-run this tool to "
+                "try to get it attached — the result is complete and re-running will not change "
+                "the figure's size."
+            )
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _write_documentation(
+        context: CapabilityContext, result: CapabilityResult
+    ) -> CapabilityResult:
+        """Render a declared documentation block into the staged folder it describes.
+
+        Registering it as an ordinary artifact is the point: the README is then committed, hashed,
+        retained, and projected into the review surface on exactly the same terms as the figures and
+        tables it explains, instead of being a loose file nothing accounts for.
+        """
+
+        doc = result.documentation
+        if doc is None:
+            return result
+        target = (context.staging_dir / doc.relative_path).resolve()
+        try:
+            target.relative_to(context.staging_dir.resolve())
+        except ValueError as exc:
+            raise CapabilityExecutionError(
+                f"documentation escapes staging directory: {doc.relative_path}"
+            ) from exc
+        if any(artifact.relative_path == doc.relative_path for artifact in result.artifacts):
+            raise CapabilityExecutionError(
+                f"documentation would overwrite a declared artifact: {doc.relative_path}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render_readme(doc), encoding="utf-8")
+        documented = ProducedArtifact(
+            name=doc.name,
+            relative_path=doc.relative_path,
+            media_type="text/markdown",
+            title=doc.title,
         )
+        return replace(result, artifacts=(*result.artifacts, documented))
+
+    @staticmethod
+    def _fit_to_transport(
+        source: Path, declared_type: str, limit: int
+    ) -> tuple[bytes, str] | None:
+        """Return ``(bytes, media_type)`` for ``source`` fitting ``limit``, downscaling if needed.
+
+        Returns ``None`` when no downscale gets it under the ceiling, or when Pillow is absent.
+        The file on disk is never modified: the committed artifact stays full resolution and only
+        the copy sent to the model is reduced, which is why the returned media type can differ from
+        the declared one.
+        """
+
+        original = source.read_bytes()
+        if len(original) <= limit:
+            return original, declared_type
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+        except ImportError:
+            return None
+        for edge in MODEL_MEDIA_DOWNSCALE_EDGES:
+            try:
+                with Image.open(BytesIO(original)) as image:
+                    image.load()
+                    if max(image.size) <= edge:
+                        continue
+                    scale = edge / max(image.size)
+                    reduced = image.convert("RGB").resize(
+                        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+                    buffer = BytesIO()
+                    reduced.save(buffer, format="PNG", optimize=True)
+            except (OSError, ValueError):
+                return None
+            candidate = buffer.getvalue()
+            if len(candidate) <= limit:
+                return candidate, "image/png"
+        return None
 
     @staticmethod
     def _model_content(
         context: CapabilityContext, result: CapabilityResult
     ) -> list[dict[str, Any]]:
+        """Attach the figures a capability produced, degrading rather than failing.
+
+        Transport ceilings are a property of the channel, not of the science. A figure that will not
+        fit is downscaled; one that still will not fit is named as unattached so the model opens it
+        with `inspect-media` instead of reviewing from its absence. Nothing here raises on size:
+        every artifact is already written and committed, and discarding a finished execution over
+        its preview is how a presentational limit turns into an unsatisfiable scientific floor.
+        """
+
         content: list[dict[str, Any]] = []
         declared = {artifact.relative_path for artifact in result.artifacts}
+        attached: list[str] = []
+        unattached: list[tuple[str, str]] = []
         total = 0
         for media in result.model_media:
             if media.relative_path not in declared:
@@ -555,26 +874,34 @@ class CapabilityExecutor:
                 ) from exc
             if not source.is_file():
                 raise CapabilityExecutionError(f"declared model_media does not exist: {source}")
-            size = source.stat().st_size
-            if size > MODEL_MEDIA_LIMIT_BYTES:
-                raise CapabilityExecutionError(
-                    f"model_media exceeds {MODEL_MEDIA_LIMIT_BYTES} bytes: {media.relative_path}"
+            fitted = CapabilityExecutor._fit_to_transport(
+                source, media.media_type, MODEL_MEDIA_LIMIT_BYTES
+            )
+            if fitted is None:
+                unattached.append((media.relative_path, "too large to attach even downscaled"))
+                continue
+            payload, media_type = fitted
+            if total + len(payload) > MODEL_MEDIA_TOTAL_BYTES:
+                unattached.append(
+                    (media.relative_path, "the result's total figure budget was already spent")
                 )
-            total += size
-            if total > MODEL_MEDIA_TOTAL_BYTES:
-                raise CapabilityExecutionError(
-                    f"model_media totals more than {MODEL_MEDIA_TOTAL_BYTES} bytes; attach fewer "
-                    "or smaller figures"
-                )
+                continue
+            total += len(payload)
+            attached.append(media.name)
             content.append(
                 {
                     "type": "image",
-                    "data": base64.b64encode(source.read_bytes()).decode("ascii"),
-                    "mimeType": media.media_type,
+                    "mimeType": media_type,
+                    "data": base64.b64encode(payload).decode("ascii"),
                 }
             )
-        if content:
-            content.append({"type": "text", "text": CapabilityExecutor._figure_directive(result)})
+        if content or unattached:
+            content.append(
+                {
+                    "type": "text",
+                    "text": CapabilityExecutor._figure_directive(attached, unattached),
+                }
+            )
         return content
 
     def _stage_result(
@@ -615,14 +942,19 @@ class CapabilityExecutor:
                 ) from exc
             if not source.is_file():
                 raise CapabilityExecutionError(f"declared artifact does not exist: {source}")
-            files.append(
-                {
-                    "name": produced.name,
-                    "relative_path": produced.relative_path,
-                    "media_type": produced.media_type,
-                    "size_bytes": source.stat().st_size,
-                }
-            )
+            record: dict[str, Any] = {
+                "name": produced.name,
+                "relative_path": produced.relative_path,
+                "media_type": produced.media_type,
+                "size_bytes": source.stat().st_size,
+            }
+            # Only recorded when the skill said something; an empty title would add a key to every
+            # historical artifact record for no gain.
+            if produced.title.strip():
+                record["title"] = produced.title.strip()
+            if not produced.include_in_output_view:
+                record["include_in_output_view"] = False
+            files.append(record)
         dispatch_lineage = dict(dispatch or {})
         # Validate here, while the result is still only staged, so a contract breach surfaces as an
         # ordinary tool error the model can act on rather than as a PostToolUse hook failure after
@@ -642,14 +974,17 @@ class CapabilityExecutor:
             if isinstance(requested, str) and not isinstance(parent, str):
                 raise CapabilityExecutionError(
                     "a read-only tool returned node-scoped facts for an untracked matrix; those "
-                    "facts cannot be attached to the active analysis. Adopt the matrix through a "
-                    "transforming tool first, or return only session-scoped provenance."
+                    "facts cannot be attached to the active analysis. Either omit the path so "
+                    "this runs on the active artifact, or bring the matrix into the analysis "
+                    f"first by passing {_ADOPT_UNTRACKED_ARGUMENT}=true to a tool that "
+                    "transforms the dataset."
                 )
             if requested is None and dispatch_lineage.get("base_head_execution_id") is None:
                 raise CapabilityExecutionError(
                     "a read-only tool returned node-scoped facts before an analysis version "
                     "existed, so there is no lineage node to attach them to"
                 )
+        artifact_relative_path = context.artifact_relative_dir
         persisted = {
             "schema_version": result.schema_version,
             "execution_id": context.execution_id,
@@ -658,6 +993,7 @@ class CapabilityExecutor:
             "skill_version": package.manifest.version,
             "skill_fingerprint": package.fingerprint,
             "tool_name": tool.name,
+            "artifact_relative_path": artifact_relative_path,
             "environment": environment,
             "input_state_revision": context.state_revision,
             "arguments": arguments,
@@ -685,6 +1021,7 @@ class CapabilityExecutor:
                 "skill_version": package.manifest.version,
                 "skill_fingerprint": package.fingerprint,
                 "tool_name": tool.name,
+                "artifact_relative_path": artifact_relative_path,
                 "environment": environment,
                 "input_state_revision": context.state_revision,
                 "arguments": arguments,
@@ -692,7 +1029,6 @@ class CapabilityExecutor:
                 "lineage": dispatch_lineage,
             },
         )
-        artifact_relative_path = f"artifacts/capabilities/{context.execution_id}"
         artifact_path = (self.session.directory / artifact_relative_path).resolve()
         model_files = [
             {
@@ -740,8 +1076,6 @@ class CapabilityExecutor:
         dispatch = data.get("lineage")
         if not isinstance(dispatch, Mapping) or not dispatch.get("matrix_output"):
             return
-        if dispatch.get("branch_intent"):
-            return
         base_value = dispatch.get("base_head_execution_id")
         base = base_value if isinstance(base_value, str) else None
         current = active_head(state.lineage)
@@ -749,9 +1083,18 @@ class CapabilityExecutor:
         parent = dispatch.get("resolved_input_execution_id")
         parent = parent if isinstance(parent, str) else None
         if parent is None and isinstance(requested, str):
-            parent = node_for_path(
-                state.lineage, requested, session_dir=self.session.directory
-            )
+            parent = node_for_path(state.lineage, requested, session_dir=self.session.directory)
+        if parent is not None:
+            unavailable = execution_unavailable_reason(state.retention, parent)
+            if unavailable:
+                raise CapabilityExecutionError(
+                    f"cannot commit {execution_id}: input version {parent} became unavailable "
+                    f"because {unavailable}"
+                )
+        # Branch intent permits a stale *active head* by design. It never permits deriving a new
+        # artifact from an input whose exact matrix has entered a retention transaction.
+        if dispatch.get("branch_intent"):
+            return
         # Recovery may stage a child before its parent is committed. Once ordered recovery has
         # committed that parent, the recorded input resolves to the current head and is safe.
         if current != base and parent != current:
@@ -781,12 +1124,15 @@ class CapabilityExecutor:
             raise CapabilityExecutionError(
                 "a checkout capability must report details.target_execution_id"
             )
+        unavailable = execution_unavailable_reason(state.retention, target)
+        if unavailable:
+            raise CapabilityExecutionError(
+                f"cannot check out {target}: its matrix is unavailable because {unavailable}"
+            )
         lineage = state.lineage
         switched = checkout(lineage, target)
         roots = node_scoped_roots()
-        current_view = {
-            key: value for key, value in state.facts.items() if key in roots
-        }
+        current_view = {key: value for key, value in state.facts.items() if key in roots}
         target_view = resolve_node_facts(lineage, target, merge=apply_merge_patch)
         visible = dict(session_facts)
         visible.update(merge_diff(current_view, target_view))
@@ -828,9 +1174,7 @@ class CapabilityExecutor:
             # Crash recovery stages several executions before any of them commits, so the forest
             # was empty when their inputs were resolved at dispatch. The path was still recorded,
             # so resolve it against the forest as it stands now.
-            parent = node_for_path(
-                lineage, requested, session_dir=self.session.directory
-            )
+            parent = node_for_path(lineage, requested, session_dir=self.session.directory)
         head = active_head(lineage)
 
         if not isinstance(matrix_output, str) or not matrix_output:
@@ -839,8 +1183,10 @@ class CapabilityExecutor:
             if requested is not None and parent is None and node_facts:
                 raise CapabilityExecutionError(
                     "a read-only tool returned node-scoped facts for an untracked matrix; those "
-                    "facts cannot be attached to the active analysis. Adopt the matrix through a "
-                    "transforming tool first, or return only session-scoped provenance."
+                    "facts cannot be attached to the active analysis. Either omit the path so "
+                    "this runs on the active artifact, or bring the matrix into the analysis "
+                    f"first by passing {_ADOPT_UNTRACKED_ARGUMENT}=true to a tool that "
+                    "transforms the dataset."
                 )
             target = parent if requested is not None else head
             if target is None and node_facts:
@@ -850,6 +1196,12 @@ class CapabilityExecutor:
                 )
             if target is None:
                 return {}, dict(session_facts)
+            unavailable = execution_unavailable_reason(state.retention, target)
+            if unavailable:
+                raise CapabilityExecutionError(
+                    f"cannot attach evidence to {target}: its matrix is unavailable because "
+                    f"{unavailable}"
+                )
             lineage_patch = attach_patch(lineage, target, node_facts) if node_facts else {}
             visible = dict(session_facts)
             # Global facts are the active head's resolved view. A patch on the head, or on any
@@ -863,9 +1215,7 @@ class CapabilityExecutor:
         # Matrix-producing: a new node whose parent is the artifact actually consumed.
         node_head_path = f"{artifact_relative}/{matrix_output}"
         node_facts = with_prepared_path(node_facts, node_head_path)
-        inherited = (
-            resolve_node_facts(lineage, parent, merge=apply_merge_patch) if parent else {}
-        )
+        inherited = resolve_node_facts(lineage, parent, merge=apply_merge_patch) if parent else {}
         node_view = apply_merge_patch(inherited, node_facts)
         node = LineageNode(
             execution_id=execution_id,
@@ -898,25 +1248,48 @@ class CapabilityExecutor:
                 # than merged. Without this, evidence from the abandoned line lingers in global
                 # facts and floors evaluate against a matrix the session is no longer on.
                 roots = node_scoped_roots()
-                current_view = {
-                    key: value
-                    for key, value in state.facts.items()
-                    if key in roots
-                }
+                current_view = {key: value for key, value in state.facts.items() if key in roots}
                 visible.update(merge_diff(current_view, node_view))
         return lineage_patch, visible
 
     def commit(self, execution_id: str) -> bool:
         pending = self.pending_root / execution_id
-        final = self.artifact_root / execution_id
         if execution_id in self.session.store.state.artifacts:
             return False
-        source = pending if pending.is_dir() else final
+        source = pending
+        if not source.is_dir():
+            matches = [
+                item
+                for item in self.artifact_root.iterdir()
+                if item.is_dir()
+                and (item.name == execution_id or item.name.endswith(f"--{execution_id}"))
+                and (item / "result.json").is_file()
+            ]
+            if len(matches) != 1:
+                raise CapabilityExecutionError(
+                    f"pending capability result not found: {execution_id}"
+                )
+            source = matches[0]
         result_path = source / "result.json"
         if not result_path.is_file():
             raise CapabilityExecutionError(f"pending capability result not found: {execution_id}")
         data = json.loads(result_path.read_text(encoding="utf-8"))
-        artifact_relative = str(final.relative_to(self.session.directory))
+        raw_relative = data.get("artifact_relative_path")
+        artifact_relative = (
+            str(raw_relative)
+            if isinstance(raw_relative, str) and raw_relative
+            else f"artifacts/capabilities/{execution_id}"
+        )
+        final = self.session.directory / artifact_relative
+        if (
+            final.parent.resolve() != self.artifact_root.resolve()
+            or not (
+                final.name == execution_id or final.name.endswith(f"--{execution_id}")
+            )
+        ):
+            raise CapabilityExecutionError(
+                f"unsafe capability artifact directory: {artifact_relative}"
+            )
         artifact_record = {
             "kind": "capability-result",
             "skill_id": data["skill_id"],
@@ -927,11 +1300,12 @@ class CapabilityExecutor:
             "input_state_revision": data.get("input_state_revision"),
             "arguments": data.get("arguments", {}),
             "summary": data["summary"],
-            "path": str(final.relative_to(self.session.directory)),
+            "path": artifact_relative,
             "files": data["files"],
             "model_media": data.get("model_media", []),
             "lineage": data.get("lineage", {}),
         }
+
         def prepare_commit(state: SessionState) -> Mapping[str, Any]:
             # The store invokes this after reloading state while holding the session lock. Checking
             # earlier is racy across two processes: both can observe one head and then commit in
@@ -966,7 +1340,7 @@ class CapabilityExecutor:
         return True
 
     def commit_from_hook(self, input_data: dict[str, Any]) -> bool:
-        execution_id = _find_execution_id(input_data.get("tool_response", input_data))
+        execution_id = execution_id_from_hook(input_data)
         if execution_id is None:
             raise CapabilityExecutionError("PostToolUse response has no execution ID")
         return self.commit(execution_id)
@@ -1022,14 +1396,25 @@ class CapabilityExecutor:
         for path in candidates:
             if not path.is_dir() or not (path / "result.json").is_file():
                 continue
-            sequence = order.get(path.name)
+            try:
+                value = json.loads((path / "result.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                unsequenced.append(path)
+                continue
+            execution_id = value.get("execution_id")
+            if not isinstance(execution_id, str):
+                unsequenced.append(path)
+                continue
+            sequence = order.get(execution_id)
             if sequence is None:
                 unsequenced.append(path)
             else:
                 pending.append((sequence, path))
         for _, path in sorted(pending, key=lambda item: (item[0], item[1].name)):
-            if self.commit(path.name):
-                recovered.append(path.name)
+            value = json.loads((path / "result.json").read_text(encoding="utf-8"))
+            execution_id = str(value["execution_id"])
+            if self.commit(execution_id):
+                recovered.append(execution_id)
         for path in sorted(unsequenced):
             self._quarantine(path)
         return recovered

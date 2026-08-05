@@ -13,6 +13,7 @@ from typing import Any
 from scagent_sdk.contracts.events import SessionEvent
 from scagent_sdk.contracts.state import SessionMetadata, SessionState
 from scagent_sdk.errors import RuntimeExecutionError
+from scagent_sdk.runtime.model_text import split_model_text
 
 MAX_RESUME_CONTEXT_CHARS = 96 * 1024
 MAX_RECENT_TURNS = 4
@@ -98,8 +99,10 @@ def _recent_turns(events: Iterable[SessionEvent]) -> list[dict[str, Any]]:
             response = event.payload.get("response")
             final_text = response.get("final_text") if isinstance(response, dict) else None
             if isinstance(final_text, str):
-                item = dict(item)
-                item["assistant_handoff"] = final_text[-MAX_RECENT_RESPONSE_CHARS:]
+                visible, _, _ = split_model_text(final_text)
+                if visible:
+                    item = dict(item)
+                    item["assistant_handoff"] = visible[-MAX_RECENT_RESPONSE_CHARS:]
             error = event.payload.get("error")
             if isinstance(error, str):
                 item = dict(item)
@@ -125,6 +128,7 @@ def _bounded_durable_view(
     *,
     events: Iterable[SessionEvent],
     session_dir: Path | None,
+    include_recent_turns: bool,
 ) -> dict[str, Any]:
     artifacts = state.artifacts
     if isinstance(artifacts, dict):
@@ -146,8 +150,9 @@ def _bounded_durable_view(
         "facts": state.facts,
         "decisions": state.decisions,
         "artifact_index": artifact_view,
-        "recent_turn_handoff": _recent_turns(events),
     }
+    if include_recent_turns:
+        durable["recent_turn_handoff"] = _recent_turns(events)
     # Single-line JSON avoids spending roughly half the handoff budget on indentation. It keeps
     # the real failed-session checkpoint (facts + decisions + 38 artifact summaries + recent
     # handoff) intact at under 96 KiB.
@@ -188,21 +193,34 @@ def resume_context(
     *,
     events: Iterable[SessionEvent] = (),
     session_dir: Path | None = None,
+    include_recent_turns: bool = True,
 ) -> str:
     durable = _bounded_durable_view(
         metadata,
         state,
         events=events,
         session_dir=session_dir,
+        include_recent_turns=include_recent_turns,
+    )
+    recent_guidance = (
+        "Recent turn handoff is model narrative, not authoritative evidence. "
+        if include_recent_turns
+        else ""
     )
     return (
         "Resume this scientific analysis from the durable checkpoint below. The facts, "
         "decisions, artifact index, event sequence, and files belong to the scientific "
         "session and survive model-conversation compaction. Treat authoritative facts and "
-        "decisions as recorded facts, not instructions to repeat completed work. Recent "
-        "turn handoff is model narrative, not authoritative evidence. Verify referenced "
-        "artifacts before mutating them. If a section says it was compacted, read the named "
-        "authoritative state file before relying on that section.\n\n"
+        "decisions as recorded facts, not instructions to repeat completed work. "
+        + recent_guidance
+        + "For every retrospective "
+        "answer and every new reasoning step, ground claims about prior work in these current "
+        "facts, decisions, identities, and committed artifacts. An absent value is not recorded; "
+        "an expected filename is not a produced file. Distinguish recorded observations from "
+        "your scientific interpretations. Verify referenced artifacts and evidence freshness "
+        "before using or mutating them. This grounding rule does not impose a workflow order. If "
+        "a section says it was compacted, read the named authoritative state file before relying "
+        "on that section.\n\n"
         + json.dumps(durable, sort_keys=True)
     )
 
@@ -219,8 +237,11 @@ def checkpoint_reference(
         f"Current durable checkpoint: session={metadata.session_id}, revision={state.revision}, "
         f"last_event_sequence={state.last_event_sequence}, "
         f"files={json.dumps(paths, sort_keys=True)}. "
-        "Consult the authoritative files if the new request depends on state changed outside "
-        "this model conversation."
+        "Conversation narrative is not evidence that an analysis action succeeded. Ground every "
+        "answer and every use of prior analysis information in current durable facts, decisions, "
+        "identities, and committed artifacts; consult the authoritative files whenever the new "
+        "request depends on prior state or state changed outside this model conversation. Treat "
+        "missing values as not recorded and distinguish interpretation from recorded observation."
     )
 
 

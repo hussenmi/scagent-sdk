@@ -307,48 +307,59 @@ def test_ribosomal_genes_are_recognized_case_insensitively() -> None:
     assert [is_ribo(symbol) for symbol in ("CD3D", "RPTOR", "MT-CO1")] == [False, False, False]
 
 
-# --- log scaling -------------------------------------------------------------
+# --- log values --------------------------------------------------------------
 
 
-def test_log_bins_are_uniform_on_the_axis_they_are_drawn_on() -> None:
-    bins = _g("log_spaced_bins")
+def test_the_logarithm_is_plotted_rather_than_the_axis_being_log_scaled() -> None:
+    """The values handed to the renderer are already logged, so bins are uniform in what is drawn.
 
-    edges = bins(100.0, 100000.0, count=3)
+    A log-*scaled* axis of raw values draws numbers that are not the numbers plotted: spread and
+    symmetry cannot be read off it, and equal distances carry no fixed meaning.
+    """
 
-    assert len(edges) == 4
-    assert edges[0] == pytest.approx(100.0)
-    assert edges[-1] == pytest.approx(100000.0)
-    # Equal ratios, not equal differences: that is what makes the drawn bars equal width.
-    ratios = [edges[index + 1] / edges[index] for index in range(3)]
-    assert ratios == pytest.approx([10.0, 10.0, 10.0])
+    import numpy as np
 
+    logged, dropped = _g("log10_positive")([100.0, 1000.0, 10000.0], np)
 
-def test_log_bins_refuse_a_non_positive_minimum_rather_than_silently_clamping() -> None:
-    bins = _g("log_spaced_bins")
-
-    with pytest.raises(ValueError, match="positive minimum"):
-        bins(0.0, 1000.0)
-    with pytest.raises(ValueError, match="count must be"):
-        bins(1.0, 10.0, count=0)
+    assert list(logged) == pytest.approx([2.0, 3.0, 4.0])
+    assert dropped == 0
+    # Equal ratios in the raw metric became equal distances in what is plotted.
+    assert float(logged[1] - logged[0]) == pytest.approx(float(logged[2] - logged[1]))
 
 
-def test_log_bins_still_produce_usable_edges_for_a_degenerate_span() -> None:
-    bins = _g("log_spaced_bins")
+def test_cells_with_no_logarithm_are_counted_not_quietly_shifted_into_the_data() -> None:
+    import numpy as np
 
-    edges = bins(5.0, 5.0, count=2)
+    logged, dropped = _g("log10_positive")([0.0, 3.0, 250.0, 0.0, -1.0, np.nan], np)
 
-    assert edges[0] == pytest.approx(5.0)
-    assert edges[-1] > edges[0]
+    assert dropped == 3
+    assert list(logged) == pytest.approx([np.log10(3.0), np.log10(250.0)])
+    # A log1p shift would have reported five plotted cells and hidden that three were unusable.
+    empty, all_dropped = _g("log10_positive")([0.0, 0.0], np)
+    assert empty.size == 0 and all_dropped == 2
 
 
-def test_positive_span_reports_the_cells_a_log_axis_cannot_draw() -> None:
-    span = _g("positive_span")
+def test_raw_reference_marks_span_the_range_at_one_two_five_per_decade() -> None:
+    ticks = _g("raw_reference_ticks")(400.0, 60000.0)
 
-    low, high, dropped = span([0.0, 3.0, 250.0, 0.0, 17.0])
+    assert ticks == pytest.approx([500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0])
 
-    assert (low, high, dropped) == (3.0, 250.0, 2)
-    with pytest.raises(ValueError, match="no positive values"):
-        span([0.0, 0.0])
+
+def test_a_narrow_range_still_gets_enough_raw_marks_to_be_a_reference() -> None:
+    """1/2/5 per decade would leave a third-of-a-decade metric with one mark or none."""
+
+    ticks = _g("raw_reference_ticks")(180.0, 310.0)
+
+    assert len(ticks) >= 3
+    assert min(ticks) >= 180.0 and max(ticks) <= 310.0
+
+
+def test_a_degenerate_or_non_positive_range_yields_no_marks_rather_than_raising() -> None:
+    reference = _g("raw_reference_ticks")
+
+    assert reference(0.0, 100.0) == []
+    assert reference(5.0, 5.0) == []
+    assert reference(-2.0, -1.0) == []
 
 
 def test_compact_ticks_stay_short_enough_not_to_collide() -> None:
@@ -436,3 +447,47 @@ def test_figure_slug_makes_an_obs_column_safe_as_a_filename() -> None:
     assert slug("leiden_res_1.0") == "leiden-res-1-0"
     assert slug("qc_flag_low_lib") == "qc-flag-low-lib"
     assert slug("///") == "panel"
+
+
+# --- figure naming -----------------------------------------------------------
+
+
+def test_embedding_figure_title_says_which_embedding_and_what_it_shows() -> None:
+    title = _g("embedding_figure_title")
+
+    # A session plots the same dataset's embedding many times; the only things that tell two
+    # figures apart are the basis and the columns coloured on it.
+    assert title("X_umap", ["leiden_int"]) == "umap by leiden-int"
+    assert title("X_scVI", ["sample"]) == "scvi by sample"
+    assert title("X_umap", ["leiden", "sample"]) == "umap by leiden sample"
+
+
+def test_long_panel_sets_are_summarised_so_the_basis_survives_the_filename() -> None:
+    title = _g("embedding_figure_title")
+
+    assert title(
+        "X_umap",
+        [
+            "total_counts",
+            "n_genes_by_counts",
+            "pct_counts_mt",
+            "pct_counts_ribo",
+            "doublet_score",
+            "predicted_doublet",
+        ],
+    ) == "umap by total-counts n-genes-by-counts pct-counts-mt and 3 more"
+
+
+def test_a_figure_with_no_colouring_is_still_named_for_its_basis() -> None:
+    title = _g("embedding_figure_title")
+
+    assert title("X_umap", []) == "umap"
+    assert _g("basis_label")("X_umap") == "umap"
+
+
+def test_figure_records_carry_both_the_stable_name_and_the_readable_title() -> None:
+    record = _g("_figure")(None, "embedding", "umap by leiden")
+
+    assert record["name"] == "embedding"
+    assert record["relative_path"] == "embedding.png"
+    assert record["title"] == "umap by leiden"

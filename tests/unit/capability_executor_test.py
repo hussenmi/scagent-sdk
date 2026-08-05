@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from scagent_sdk.capabilities.executor import CapabilityExecutor
 from scagent_sdk.capabilities.registry import CapabilityRegistry
@@ -31,7 +32,9 @@ def test_capability_result_is_staged_then_committed_by_hook(tmp_path: Path) -> N
     execution_id = envelope["scagent_execution_id"]
     assert envelope["status"] == "validated"
     assert envelope["state_commit"] == "PostToolUse"
-    assert envelope["artifact_relative_path"] == f"artifacts/capabilities/{execution_id}"
+    assert envelope["artifact_relative_path"] == (
+        f"artifacts/capabilities/inspect-dataset--{execution_id}"
+    )
     assert envelope["artifact_path"] == str(
         (session.directory / envelope["artifact_relative_path"]).resolve()
     )
@@ -46,7 +49,10 @@ def test_capability_result_is_staged_then_committed_by_hook(tmp_path: Path) -> N
     artifact = session.store.state.artifacts[execution_id]
     assert artifact["skill_id"] == "inspect-dataset"
     assert artifact["arguments"] == {"path": str(dataset), "hash_mode": "full"}
-    assert (session.directory / artifact["path"] / "inspection.json").is_file()
+    canonical = session.directory / artifact["path"]
+    assert (canonical / "inspection.json").is_file()
+    assert canonical.name == f"inspect-dataset--{execution_id}"
+    assert not canonical.is_symlink()
     kinds = [event.kind for event in session.store.events()]
     assert kinds[-2:] == ["capability.result_staged", "capability.result_committed"]
 
@@ -86,6 +92,57 @@ def test_session_relative_artifact_path_is_resolved_for_the_next_tool(
     assert consumed.get("is_error") is not True
     details = consumed["structuredContent"]["details"]
     assert details["path"] == produced["structuredContent"]["files"][0]["path"]
+
+
+def test_explicit_migration_replaces_legacy_uuid_directory_and_durable_paths(
+    tmp_path: Path,
+) -> None:
+    skills_root = Path(__file__).parents[2] / ".claude" / "skills"
+    package = next(
+        item
+        for item in CapabilityRegistry(skills_root).discover()
+        if item.manifest.skill_id == "inspect-dataset"
+    )
+    tool = package.manifest.tools[0]
+    dataset = tmp_path / "sample.h5ad"
+    dataset.write_bytes(b"\x89HDF\r\n\x1a\n" + b"data")
+    session = AnalysisSession.create(tmp_path / "sessions", title="legacy migration")
+    executor = CapabilityExecutor(session)
+    response = asyncio.run(
+        executor.execute(package, tool, {"path": str(dataset), "hash_mode": "full"})
+    )
+    execution_id = response["structuredContent"]["scagent_execution_id"]
+    assert executor.commit_from_hook({"tool_response": response})
+
+    descriptive = session.directory / session.store.state.artifacts[execution_id]["path"]
+    legacy_relative = f"artifacts/capabilities/{execution_id}"
+    legacy = session.directory / legacy_relative
+    descriptive.rename(legacy)
+    current_relative = str(descriptive.relative_to(session.directory))
+    session.store.record(
+        "test.recreate_legacy_layout",
+        payload={},
+        state_patch={
+            "artifacts": {execution_id: {"path": legacy_relative}},
+            "facts": {
+                "dataset_contents": {
+                    "artifact_path": f"{legacy_relative}/inspection.json"
+                }
+            },
+        },
+    )
+
+    migrated = executor.migrate_legacy_artifact_directories()
+
+    assert migrated == {legacy_relative: current_relative}
+    assert descriptive.is_dir()
+    assert not legacy.exists()
+    assert session.store.state.artifacts[execution_id]["path"] == current_relative
+    assert (
+        session.store.state.facts["dataset_contents"]["artifact_path"]
+        == f"{current_relative}/inspection.json"
+    )
+    assert session.store.events()[-1].kind == "capability.directories_migrated"
 
 
 def test_large_details_spill_and_finalized_uncommitted_result_recovers(
@@ -219,3 +276,44 @@ tools:
     assert mirrored[0].name.startswith("inspect-the-reyfman-dataset-")
     assert mirrored[0].is_symlink()
     assert mirrored[0].read_text() == "print(1)\n"
+
+
+def test_executor_supplies_the_user_turn_index_to_capabilities(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A decision that is only legitimate once a human has been consulted must be able to verify the
+    # consultation against real user turns, so the index has to reach the handler.
+    skills_root = Path(__file__).parents[2] / ".claude" / "skills"
+    package = next(
+        item
+        for item in CapabilityRegistry(skills_root).discover()
+        if item.manifest.skill_id == "inspect-dataset"
+    )
+    tool = package.manifest.tools[0]
+    dataset = tmp_path / "sample.h5ad"
+    dataset.write_bytes(b"\x89HDF\r\n\x1a\n" + b"data")
+    session = AnalysisSession.create(tmp_path / "sessions", title="turn index")
+    session.store.record(
+        "runtime.turn_started",
+        payload={"turn_id": "t-answer", "user_prompt": "keep the donors uncorrected"},
+        actor="user",
+    )
+    seen: dict[str, Any] = {}
+
+    real_loader = type(package).load_handler
+
+    def capturing_loader(self: Any, requested: Any) -> Any:
+        handler = real_loader(self, requested)
+
+        def wrapper(arguments: dict[str, Any], context: Any) -> Any:
+            seen["user_turns"] = context.user_turns
+            return handler(arguments, context)
+
+        return wrapper
+
+    monkeypatch.setattr(type(package), "load_handler", capturing_loader)
+    executor = CapabilityExecutor(session)
+    asyncio.run(executor.execute(package, tool, {"path": str(dataset), "hash_mode": "full"}))
+
+    assert [turn["turn_id"] for turn in seen["user_turns"]] == ["t-answer"]
+    assert seen["user_turns"][0]["user_prompt"] == "keep the donors uncorrected"

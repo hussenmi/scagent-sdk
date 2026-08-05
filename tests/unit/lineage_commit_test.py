@@ -138,11 +138,15 @@ class _Harness:
         return execution_id
 
     def matrix_path(self, execution_id: str) -> str:
+        record = self.session.store.state.artifacts.get(execution_id)
+        artifact_path = (
+            record["path"]
+            if isinstance(record, dict)
+            else f"artifacts/capabilities/make-matrix--{execution_id}"
+        )
         return str(
             self.session.directory
-            / "artifacts"
-            / "capabilities"
-            / execution_id
+            / artifact_path
             / "matrix.h5ad"
         )
 
@@ -166,9 +170,10 @@ def test_first_matrix_creates_a_root_node_and_becomes_the_head(tmp_path: Path) -
     assert active_head(harness.lineage) == first
     # Optional fields are omitted rather than stored as null: a merge patch deletes null keys.
     assert node.get("parent_execution_id") is None
-    assert node["head_path"] == f"artifacts/capabilities/{first}/matrix.h5ad"
+    expected = f"{harness.session.store.state.artifacts[first]['path']}/matrix.h5ad"
+    assert node["head_path"] == expected
     assert node["identity_signature"].startswith("identity:v1:sha256:")
-    prepared = f"artifacts/capabilities/{first}/matrix.h5ad"
+    prepared = expected
     assert harness.facts["analysis"]["dataset_revision"]["prepared_path"] == prepared
     assert resolve_node_facts(harness.lineage, first, merge=apply_merge_patch)["analysis"][
         "dataset_revision"

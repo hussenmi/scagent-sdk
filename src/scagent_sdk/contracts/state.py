@@ -16,12 +16,12 @@ from .events import utc_now
 # Metadata and state are versioned independently: adding a materialized-view field such as
 # ``lineage`` changes state.json only, and must not force an unrelated session.json migration.
 SESSION_METADATA_SCHEMA_VERSION = 1
-SESSION_STATE_SCHEMA_VERSION = 2
+SESSION_STATE_SCHEMA_VERSION = 3
 # Retained as the metadata version so existing importers keep working.
 SESSION_SCHEMA_VERSION = SESSION_METADATA_SCHEMA_VERSION
 # State revisions this process can materialize. v1 sessions predate the lineage forest and open
 # with an empty one, so they are readable without a rewrite.
-SUPPORTED_STATE_SCHEMA_VERSIONS = frozenset({1, SESSION_STATE_SCHEMA_VERSION})
+SUPPORTED_STATE_SCHEMA_VERSIONS = frozenset({1, 2, SESSION_STATE_SCHEMA_VERSION})
 
 
 @dataclass
@@ -92,6 +92,16 @@ class SessionState:
     lineage: dict[str, Any] = field(
         default_factory=lambda: {"active_execution_id": None, "nodes": {}}
     )
+    # Executor-owned retention policy and recoverable trash operations. Skills cannot patch this
+    # field; only explicit session-management commands may classify or remove artifacts.
+    retention: dict[str, Any] = field(
+        default_factory=lambda: {
+            "schema_version": 1,
+            "branches": {},
+            "artifact_roles": {},
+            "operations": {},
+        }
+    )
     schema_version: int = SESSION_STATE_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -107,6 +117,7 @@ class SessionState:
         ensure_jsonable(self.decisions, name="decisions")
         ensure_jsonable(self.runtime, name="runtime")
         ensure_jsonable(self.lineage, name="lineage")
+        ensure_jsonable(self.retention, name="retention")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -122,6 +133,7 @@ class SessionState:
             "decisions": self.decisions,
             "runtime": self.runtime,
             "lineage": self.lineage,
+            "retention": self.retention,
         }
 
     @classmethod
@@ -144,6 +156,18 @@ class SessionState:
                 lineage=require_mapping(
                     data.get("lineage") or {"active_execution_id": None, "nodes": {}},
                     name="state.lineage",
+                ),
+                # Absent before v3. Retention is policy rather than reconstructed science, so an
+                # empty fail-closed registry is the only safe migration default.
+                retention=require_mapping(
+                    data.get("retention")
+                    or {
+                        "schema_version": 1,
+                        "branches": {},
+                        "artifact_roles": {},
+                        "operations": {},
+                    },
+                    name="state.retention",
                 ),
             )
         except KeyError as exc:

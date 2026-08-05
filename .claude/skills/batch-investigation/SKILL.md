@@ -1,48 +1,97 @@
 ---
 name: batch-investigation
-description: Produce gene-first batch evidence (sample-enriched regions, within-sample identity DEGs, cross-sample population matches, direct comparisons, recurring programs, and design confounding) with a two-axis verdict, then record an explicit keep/integrate/separate/request-guidance/not-applicable decision as a separate step. Use before integration and before finalization whenever samples, donors, libraries, lanes, or batches may affect the representation.
+description: Investigate sample-associated structure with matched-population, within-sample DEGs, then record the user's explicit keep/integrate/separate decision. Use before integration and whenever samples, donors, libraries, lanes, or batches may organize the uncorrected representation.
 ---
 
 # Batch Investigation
 
-This is a two-step, evidence-before-decision capability.
+Keep this conversational. It is an investigation followed by a user choice, not a workflow DAG.
 
-1. **`investigate_batch`** accepts any H5AD with expression values, cluster labels, and a
-   meaningful batch column, then produces evidence and records **no** decision. It derives
-   portable identities from the artifact. This region-comparison method uses the supplied
-   clustering and is **gene-first**:
-   - finds **sample-enriched cluster regions** by enrichment over each batch's dataset-wide
-     frequency (not raw purity — a region that is 42% of one sample when that sample is 9% of the
-     data is caught);
-   - runs a **within-sample identity DEG** for each region (that cluster vs the rest of its OWN
-     batch, holding batch constant) — the primary evidence for what the population is;
-   - **matches the same population across batches** by shared identity genes (a candidate match,
-     not proof);
-   - **compares matched regions directly** and reports genes higher on each side;
-   - flags a **recurring** sample-associated program (higher in the same batch across ≥2 distinct
-     populations);
-   - cross-tabs supplied `condition_keys` against the batch key for **confounding**.
+## When multiple samples are present
 
-   Composition, Cramér's V, neighborhood mixing, and per-batch QC are kept only as **advisory
-   context**. The verdict is two independent axes — `gene_evidence` (`none`/`localized`/
-   `recurring_sample_associated`) × `design_interpretation` (`unknown`/`confounded_with_biology`/
-   `orthogonal_but_not_known_technical`/`documented_technical_batch`) — and a **non-binding**
-   recommendation. Only a recurring program **and** a documented technical batch yields
-   `integration_supported`. Set `technical_batch_documented=true` only with a real
-   `technical_batch_basis` — never infer it from separation. If there is no meaningful batch
-   variable, pass `batch_key=null` to record `not_applicable`.
+Ask the user how to proceed:
 
-2. **`decide_batch_handling`** consumes the current `evidence_id` after you inspect the evidence and
-   records the decision. This consequential decision step is deliberately state-bound.
-   Non-integration decisions are always allowed. `integrate` requires an
-   explicit `integration_basis` and never proceeds silently against the evidence: if the
-   recommendation does not support it you must pass an `override_warning`.
+1. investigate whether integration is useful;
+2. integrate;
+3. continue with one combined uncorrected analysis;
+4. analyze samples separately; or
+5. provide more information about the experiment.
 
-A matched identity plus a direct gene list does **not** prove a technical batch effect; cell-level
-q-values rank separation and are not sample-level replication. diffxpy runs in an isolated runtime,
-so `prefer_diffxpy` degrades visibly to the in-environment Wilcoxon test rather than running in the
-wrong environment. After an `integrate` decision, integration issues a new representation and
-clustering that require fresh cluster QC and a fresh batch evaluation before finalization.
+If they choose investigation, build the uncorrected representation and clustering, show a readable
+sample-colored embedding, and call `investigate_batch`. Investigation is not authorization to
+integrate. After presenting the evidence, put the same practical choices back to the user.
 
-Read [references/decision-guide.md](references/decision-guide.md) for confounding and integration
-cautions.
+## Scientific method
+
+`investigate_batch` uses a gene-first matched-population method:
+
+1. Find sample-enriched cluster regions using enrichment over each sample's dataset-wide frequency,
+   not an arbitrary raw-purity cutoff.
+2. For each region, calculate the cluster versus every other cell in the **same sample**. These
+   within-sample DEGs are the primary evidence because sample is held constant and the genes
+   describe population identity.
+3. Nominate similar regions from different samples by mean-expression correlation, then confirm
+   the match using overlap between their within-sample identity DEG signatures.
+4. For a small number of confirmed pairs, calculate direct pair DEGs to describe how the two
+   samples' versions differ.
+5. Record design confounding when condition metadata is available. Recurrence, composition,
+   Cramér's V, and neighborhood mixing are supporting context only.
+
+The capability writes five durable evidence tables:
+
+- `batch_diagnostic_sample_enriched_regions.csv`
+- `batch_diagnostic_within_sample_degs.csv`
+- `batch_diagnostic_population_pairs.csv`
+- `batch_diagnostic_direct_pair_degs.csv`
+- `batch_diagnostic_design_check.csv`
+
+It also writes `README.md`, `batch-investigation.md`, `batch-evidence.json`, a composition figure,
+and SDK-native detailed tables. Read the README and name the actual matched regions and shared genes
+when explaining the result.
+
+Similar within-sample DEG signatures establish that sample-separated regions look like the same
+biological population. That is strong evidence of sample-associated organization in the
+uncorrected representation. It does not by itself establish that the cause is technical or that
+correction is mandatory: comparable replicates, unrelated donors, biological conditions, tissues,
+and protocols have different implications.
+
+## Decision and state
+
+`decide_batch_handling` records `keep_uncorrected`, `integrate`, `separate`,
+`request_guidance`, or `not_applicable` against the current evidence identities.
+
+After an investigation, every substantive decision requires a real user answer after the evidence.
+Pass only the question you asked; the decision tool resolves the user's answering turn and records
+its id, sequence, and exact text automatically. Do not search session files for turn ids. This
+prevents the agent from converting its own interpretation into authorization without prescribing
+tool order or dialogue rendering.
+
+Once the user has answered, that answer holds. Re-running the investigation after integrating or
+re-clustering re-measures the same structure; it does not re-ask the question, and the recorded
+answer carries forward. Never ask the user to repeat a batch decision they have already given, and
+never treat a later unrelated instruction as the answer. A different batch variable or a different
+set of samples *is* a new question, and must actually be put to them.
+
+`request_guidance` is pending and does not satisfy finalization. Integration also requires an
+explicit `integration_basis`: use `documented_technical_batch` only when the evidence contains
+real documentation, otherwise use `user_authorized_integration` when the user chooses integration.
+Evidence stays bound to current cells, counts, representation, and clustering, so changed science
+re-measures; the user's recorded choice is what persists across that.
+
+## How to explain the result
+
+Lead with the matched populations and the DEGs, in plain language:
+
+- name the two clusters and samples;
+- say that each cluster was compared with all other cells in its own sample;
+- name several shared identity genes and give the shared top-25 count;
+- explain that this supports the same population being organized by sample; and
+- state that the genes alone cannot say whether the cause is technical or biological.
+
+Do not lead with Cramér's V, neighbor mixing, or a list of sample-dominated clusters. Those are
+supporting context only. Never call donors technical replicates, call a result a classic/clear
+technical batch effect, or promise that integration will remove technical variation unless the
+experimental information explicitly establishes that. Healthy tissue does not make different
+donors technical replicates. If sample is confounded with donor or condition, say so simply.
+
+Read [references/decision-guide.md](references/decision-guide.md) for interpretation cautions.

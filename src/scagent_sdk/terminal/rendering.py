@@ -13,7 +13,7 @@ from rich.markdown import Heading, Markdown
 from rich.status import Status
 from rich.text import Text
 
-from scagent_sdk.runtime.observer import ToolActivity
+from scagent_sdk.runtime.observer import ToolActivity, ToolOutput
 from scagent_sdk.runtime.protocol import RuntimeMessage, RuntimeRequest, RuntimeResponse
 
 
@@ -146,6 +146,7 @@ class RichRuntimeObserver:
         self.show_thinking = show_thinking
         self.reasoning_log = reasoning_log
         self._status: Status | None = None
+        self._status_display: ElapsedStatus | None = None
         self._status_label: str | None = None
         self._rendered_text: list[str] = []
         self._emitted_thoughts: list[str] = []
@@ -193,12 +194,14 @@ class RichRuntimeObserver:
         if self._status is not None:
             self._status.stop()
             self._status = None
+        self._status_display = None
         self._status_label = None
 
     def _start_status(self, label: str = _THINKING) -> None:
         self._stop_status()
         self._status_label = label
-        self._status = self.console.status(ElapsedStatus(label), spinner="dots")
+        self._status_display = ElapsedStatus(label)
+        self._status = self.console.status(self._status_display, spinner="dots")
         self._status.start()
 
     def _render_markdown(self, text: str, *, dim: bool = False) -> None:
@@ -274,12 +277,73 @@ class RichRuntimeObserver:
         self.console.print(f"[cyan]▶[/cyan] {activity.label}...")
         self._start_status(activity.label)
 
+    def on_tool_progress(self, activity: ToolActivity, progress: dict[str, object]) -> None:
+        """Update the live spinner without resetting its elapsed timer."""
+
+        message = progress.get("message")
+        if not isinstance(message, str) or not message.strip():
+            return
+        label = f"{activity.label} — {message.strip()}"
+        self._status_label = label
+        if self._status_display is not None:
+            self._status_display.label = label
+        else:
+            self._start_status(label)
+
     def on_tool_finished(self, activity: ToolActivity, summary: str | None) -> None:
         self._stop_status()
         self.console.print(f"[green]✓[/green] {activity.label} done")
         if summary:
             self.console.print(f"  ⤷ {summary}", style="dim", markup=False)
         # After a tool returns, the model is interpreting its result, not cold-starting.
+        self._start_status(_ANALYZING)
+
+    def on_tool_outputs(
+        self,
+        activity: ToolActivity,
+        outputs: tuple[ToolOutput, ...],
+        *,
+        index_path: str,
+    ) -> None:
+        """Show findable outputs after their durable commit, without flooding the terminal."""
+
+        self._stop_status()
+        images = tuple(output for output in outputs if output.media_type.startswith("image/"))
+        important = tuple(
+            output
+            for output in outputs
+            if output.media_type.startswith("image/")
+            or output.media_type
+            in {
+                "text/markdown",
+                "text/x-python",
+                "text/csv",
+                "application/x-hdf5",
+            }
+        )
+        shown = important if len(important) <= 8 else important[:6]
+        if shown:
+            self.console.print("  Outputs:", style="dim")
+            for output in shown:
+                description = f" — {output.description}" if output.description else ""
+                self.console.print(
+                    f"    • {output.name}{description}\n      {output.path}",
+                    style="dim",
+                    markup=False,
+                )
+        omitted = len(important) - len(shown)
+        if omitted:
+            self.console.print(
+                f"    • {omitted} more output(s), including {len(images)} total figure(s)",
+                style="dim",
+                markup=False,
+            )
+        if important:
+            self.console.print(
+                f"    Complete named output index: {index_path}",
+                style="dim",
+                markup=False,
+            )
         self._start_status(_ANALYZING)
 
     def on_tool_failed(self, activity: ToolActivity, error: str) -> None:
@@ -296,6 +360,11 @@ class RichRuntimeObserver:
             self._emit_thought(thought)
         if final and final not in self._rendered_text:
             self._render_markdown(final)
+
+    def on_runtime_consistency_warning(self, warnings: tuple[str, ...]) -> None:
+        self._stop_status()
+        for warning in warnings:
+            self.console.print(f"⚠ {warning}", style="bold red", markup=False)
 
     def on_runtime_failed(self, error: str) -> None:
         self._stop_status()

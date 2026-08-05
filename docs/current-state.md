@@ -1,8 +1,630 @@
 # Current project state
 
-Status date: 2026-07-29  
+Status date: 2026-08-04
 Authority: this is the concise source of truth for what exists now, what was actually verified,
 and what should happen next. Historical detail remains in `docs/handoff.md`.
+
+## On-request package installs land in a per-user overlay, never the locked base (2026-08-04)
+
+Users occasionally need a package the base environment does not ship. Legacy `scagent` handled this
+with an `install_package` tool that `pip install`ed into `sys.executable` — the shared agent
+interpreter — which in its own deployed module (a read-only `chmod 555` pixi env) would have failed
+or silently mutated every user's environment. That approach is doubly wrong here: locks are
+authoritative and their hashes are fingerprinted into every result, and deployment is again a shared
+read-only base.
+
+P0 of ADR 0010 is implemented **and live-validated** on branch `feat/on-request-package-installs`
+(design discussion and full rationale in `docs/decisions/0010-on-request-package-installs.md`). A new
+`manage-environment` skill adds a package into a **persistent per-user, per-`(runtime, base)`
+overlay** under `/usersoftware/peerd/$USER`, layered on the immutable runtime via `PYTHONPATH` — the
+shared prefix is never written. The tools (`propose_package_install` → `install_proposed_package`,
+plus list/remove) run on a no-GPU `overlay-admin` view of `rapids-main`, so `sys.executable` is the
+runtime interpreter and the resolver runs against the real base. The gate is **uv-first with a pip
+fallback** (`resolve_package`/`materialize`): uv is pixi's own PyPI resolver, so it reads the conda
+env correctly and is ~5–15× faster; both paths admit only **additive** packages (a resolved closure
+that changes no base version), so nothing on the path can shadow the RAPIDS stack, and
+conflict/conda-only/unavailable are refused with a reason. The install is gated a second time by
+explicit user approval, verified against the event log via the same `user_turns` consultation
+pattern the batch decision uses (approval must be the first user turn after the proposal). The broker
+exports `SCAGENT_OVERLAY_DIR`, injects a non-empty overlay onto `PYTHONPATH` (never during the health
+probe), and records the active overlay set in every runtime result's provenance; a new
+`environment_overlay` session fact (in `FACT_ROOT_SCOPES`) records what was added and why. Removal
+rebuilds the overlay from the remaining pins (a `--target` layout has no uninstaller and RECORD
+deletion leaves an importable `__pycache__` namespace remnant). A package installed once persists
+across exit, resume, and new sessions, while every result stays reproducible and explainable.
+
+**Live-validated** on the real rapids conda env (Python 3.14.6): uv classifies `gseapy` as additive
+in ~1s excluding base numpy/pandas/scipy, flags an older `requests`/`click` pin as a conflict,
+reports a nonexistent package as unavailable, installs into the overlay and imports via `PYTHONPATH`,
+and removes cleanly while a second overlay package survives — the pip fallback path passes the same
+end-to-end flow. Two bugs were caught by that testing and fixed: a stray `--ignore-installed` that
+made the pip dry-run re-resolve the whole base closure (slow + wrong), and RECORD-based removal
+leaving a namespace remnant (now rebuild-based). Deterministic checks green: 27 new unit tests, full
+suite green, ruff + mypy clean, `capability validate` passes (25 skills, 58 tools).
+
+Governance is **decided: open** — any PyPI package, gated only by the additive check and explicit
+user approval; no allowlist. The intended posture is that the base environment carries the common
+single-cell stack so on-request installs stay the exception, with the overlay as the escape hatch.
+
+Acting on that posture, the `rapids` base was audited and grown (2026-08-04): **`mygene==3.2.2`**
+(activates `inspect-dataset`'s previously-inert online gene-id conversion), **`harmonypy==0.0.10`**
+(Harmony integration via `scanpy.external.pp.harmony_integrate`), and **`gseapy==1.3.1`** (GSEA)
+added to `pixi.toml`/`pixi.lock`; the re-lock added only those three + their small deps with zero
+churn to the rest of the env, and the rapids `check` task passes (scanpy 1.12.1, scvi 1.4.3, torch
+2.12.1+cu130, all new packages import). `scrublet` was intentionally not added (scanpy has it
+built in). Note: `harmonypy` was first pinned to its latest `2.0.0`, which resolves additive but is
+a C++ rewrite that fails to build on py3.14 — the pure-Python `0.0.10` scanpy uses installs cleanly;
+**additive resolution ≠ a successful build.** Still open technically: P1 constrained-retry +
+`doctor` drift/graduation, P2 isolated sidecar runtimes for incompatible packages.
+
+## The batch decision survives the integration it authorizes (2026-08-03)
+
+An integrated run stalled at `finalize_analysis`: the `batch_decision` floor reported "No explicit
+batch-handling decision is recorded against current batch evidence for the active cells, counts,
+representation, and clustering," and the model — following the floor's own remediation string —
+rationalized its way into re-running `investigate_batch` on the *corrected* data at the very last
+step. That is the implicit-DAG smell: a settled question re-asked at finalize, where re-measuring
+residual batch structure on the integrated representation makes no scientific sense.
+
+Root cause: `batch_decision` and `integration_authorized` both bound the *decision* to all four
+analysis identities (cells, counts, representation, clustering) via `_batch_identities_current` —
+the same binding used for batch *evidence*. But integration deliberately produces a new
+representation and a new clustering, so honoring an `integrate` decision instantly invalidated the
+decision that authorized it. The failure only surfaced at finalize, not when it was caused.
+
+Fix (`floors/evaluator.py`): the decision now uses `_batch_decision_current`, bound only to
+`cell_set` + `count_representation` — the substrate the user actually chose how to handle.
+Representation/clustering changes (integration, reclustering) no longer stale the decision;
+removing cells (cluster cleanup) still does, correctly. Batch *evidence* keeps its full four-way
+binding and re-measures on any change. This makes the floor match the contract already written in
+`batch-investigation/SKILL.md` ("the user's recorded choice is what persists across that"); no
+skill or prose change was needed. Two floor tests were rewritten to assert the decision and the
+integration authorization survive the integration/reclustering they authorize while still staling
+on cell removal. Full suite green; ruff + mypy clean on the touched files.
+
+## Gene filtering carries per-cell evidence forward; doublets ordered before clustering (2026-08-04)
+
+A live run (`run_20260804T153724Z_bde07f`, Reyfman, 43,632 cells) exposed a defect the 0.5.0 gene
+filter created: after `filter_single_cell_genes` removed ~18k genes, the `current_cell_qc_review`
+floor went stale and the model — told by our own SKILL.md **not** to recompute QC after ribosomal
+removal (it would read a false ~0% ribosomal) — had no legal way to refresh it and just "moved on."
+The floor and the guidance pointed in opposite directions. Root cause: gene filtering nulled
+`cell_qc` and minted a new `count_representation_id`, but the `current_cell_qc_review` floor keys
+freshness on that id (`evaluator.py:103,108`). Cell QC is a decision about **cells**; gene filtering
+removes genes, not cells, so invalidating it was wrong — and diverged from legacy and standard
+scanpy, which never re-review cell QC after gene filtering.
+
+Fix: `filter_single_cell_genes` now **carries the cell-QC review and complete doublet evidence
+forward**, re-stamped to the new count representation and marked `carried_through: ["gene_filter"]`,
+instead of nulling them. The floor stays strict (a genuine re-materialization still would not
+carry): the carry only fires when the evidence is about the same `cell_set_id` and was current for
+the input artifact. Everything gene-dependent — representation, clustering, cluster QC, annotation,
+batch — is still correctly invalidated. The same reasoning covers doublets (Scrublet scores are
+per-cell), which the `current_doublet_evidence` floor also keys on count representation
+(`evaluator.py:81`).
+
+The same run showed doublets running **late** — `evaluate_doublet_evidence` at step 39, after a full
+clustering + cluster-QC pass, forcing a re-cluster. Legacy runs Scrublet early (Step 2 of
+`run_qc_pipeline`, before clustering), because cluster QC consumes the `predicted_doublet` calls
+(`cluster-qc/scripts/evaluate.py:477`). Guidance now mirrors legacy: `base.md`, the orchestration
+SKILL/reference, and `doublet-evidence/SKILL.md` place doublet evidence after cell QC and **before
+the first clustering**, and state that gene filtering carries QC/doublets forward while only *cell*
+removal invalidates them.
+
+Verified: 12 new deterministic carry-forward tests (re-stamp at both evidence and review levels,
+same-cell guard, stale-for-input guard, no-mutation, doublets) on top of the existing gene-filter
+suite, plus two live checks in the real `rapids` runtime — the gene filter itself, and a
+carry-forward integration check confirming `filter_single_cell_genes` reads `state_facts` and emits
+a re-stamped `cell_qc` + `doublets` facts_patch that the floor accepts. Full suite, Ruff, strict
+mypy on the script, and `capability validate` pass. Not done: no full model-behavior session has yet
+confirmed the model now runs doublets before clustering and does not re-review QC after gene
+filtering — the guidance change is the lever, not proof.
+
+## Gene filtering matches legacy science: dataset-size threshold plus ribosomal removal (2026-08-03)
+
+`filter_single_cell_genes` removed only genes detected in fewer than a flat `min_cells=3` and did
+nothing about ribosomal genes — well below what legacy `scagent` actually does. Legacy's gene
+filter is not in its low-level `filter_genes` (default `min_cells=None`); it lives in
+`normalize_and_hvg` (`agent/tools.py:9965`) as a guaranteed pre-HVG filter with two parts: a
+**dataset-size-aware** low-detection threshold — keep genes detected in at least 2% of cells,
+`ceil`-rounded and **capped at 100 absolute** so a large dataset does not delete rare-cell-type
+markers — and **ribosomal-gene removal by default** (RPS/RPL and the mitochondrial-ribosomal
+MRPS/MRPL) so they cannot dominate variance and drive the embedding. Mitochondrial genes are kept;
+MT content stays a cell-level concern.
+
+`single-cell-qc` 0.5.0 brings `filter_single_cell_genes` to that behavior, keeping it an explicit,
+`confirm_filtering`-gated mutation rather than legacy's automatic bundling into normalization (QC
+calculation stays flag-only, nothing removed):
+
+- The low-detection threshold is now `min(ceil(min_cell_fraction × n_cells), max_cells)` with
+  defaults `0.02` and `100` — the flat 3 is gone. `min_cells` is an exact absolute override;
+  `min_cell_fraction=0` disables the filter for strict source replication. `low_detection_threshold`
+  is a pure helper, unit-tested across the fraction, cap, override, and disabled branches.
+- `remove_ribosomal` (default true) drops RPS/RPL/MRPS/MRPL, matched case-insensitively on the
+  resolved gene symbols so Ensembl-indexed matrices still match. `remove_mitochondrial` (default
+  false) exists for completeness; the default keeps MT genes.
+- **The ribosomal figures do not break.** `pct_counts_mt`/`pct_counts_ribo` are computed on the full
+  matrix before any removal and preserved in `obs` (a var-subset keeps all obs), so the QC,
+  embedding, and cluster-QC ribosomal panels — which already prefer the recorded obs column over
+  recomputing from genes, since the 2026-07-28 figure pass — keep reading the correct value. The
+  one hazard is re-running `calculate_single_cell_qc` on the ribosomal-filtered artifact, which
+  would recompute `pct_counts_ribo` to ~0; the SKILL.md now says not to, and names the preserved obs
+  column as authoritative.
+
+Verified: 22 new deterministic tests (`tests/unit/single_cell_qc_gene_filter_test.py`) covering the
+threshold scaling/cap/override/disable branches and the ribo/mito symbol classification, plus a live
+end-to-end run in the real `rapids` runtime on a synthetic 200-cell matrix — threshold resolved to 4
+(2% of 200), 2 low-detection and 4 ribosomal genes removed including MRPS/MRPL, MT and normal genes
+kept, and the preserved median `pct_counts_ribo` reading 20.7% *after* the ribosomal genes were
+gone. Full suite, Ruff, and `capability validate` pass. Not done: no full model-behavior session has
+exercised whether the model runs this at the right point (post-QC, pre-representation), and HVG-time
+ribosomal *exclusion* (legacy's alternative when `remove_ribosomal=false`) is not ported — this
+removes from the matrix rather than excluding at HVG.
+
+## The durable record is queryable, so answers stop coming from memory (2026-08-03)
+
+When a user asked what a step used or whether something was done, the model had no first-class way to
+consult the authoritative record mid-conversation. The full durable view is injected only at the
+first turn or a non-exact resume; on ordinary turns the model leaned on conversation memory plus
+tool results it had already seen. Its only reach into the authoritative files was to shell into them
+ad hoc through `analysis-workspace` — an unstructured escape hatch that is also lineage-blind, so a
+raw `grep` of `state.json` can return a parameter from a superseded sibling branch and present it as
+current, which is exactly the divergence the executor-owned lineage forest exists to prevent.
+
+`query-analysis-state` 0.1.0 makes the record a structured, always-available query surface instead
+of a thing to grep. Three read-only control-plane tools, no floors, no mutation:
+
+- `summarize_analysis_state` — dataset identity and working shape, the active version and how many
+  alternatives exist, and every recorded fact area flattened to its scalar leaves (bounded, with an
+  explicit truncation marker so a cut-short view is never mistaken for the whole state).
+- `find_analysis_steps` — committed steps by tool name or free text (matched against arguments too),
+  newest first by the `events.jsonl` commit order, each carrying its exact recorded `arguments` and
+  annotated with lineage placement: a transforming step reports `on_active_line` precisely, a
+  read-only step reports `null` rather than a fabricated currency claim.
+- `list_recorded_decisions` — each recorded decision with its rationale and, when it cites a turn,
+  the authorizing user prompt resolved from `context.user_turns`.
+
+Lineage awareness is the reason this beats grep, and it is the design's whole point: the tools
+resolve the active line of descent (`active_execution_id` → parent chain, cycle-guarded) and label
+every step and version against it. The logic is pure stdlib over plain dicts — it reads the same
+`state.json`/`events.jsonl`/lineage sources the runtime does — so it runs in the control plane with
+no compute runtime and is unit-tested without a live session. `base.md` now lists the skill and
+makes "read the durable record with `query-analysis-state`, do not reconstruct from memory" an
+explicit norm in the durable-state grounding section.
+
+Verified: 10 new deterministic tests in `tests/unit/query_analysis_state_test.py` covering bounded
+flattening with the truncation marker, cycle-guarded ancestry, event-ordered history, the
+active-line/sibling-branch/read-only labelling that distinguishes it from grep, tool/query/limit
+filtering including matches inside recorded arguments, the summary shape, decision rationale and
+authorizing-turn resolution, and the three entrypoints end to end against a fabricated session on
+disk. Ruff, strict mypy on the script, and `scagent-sdk capability validate` (now 24 skills, 23
+executable, 54 tools) pass. Not done: no model-behavior session has yet exercised whether the model
+reaches for these tools instead of memory, and the tools deliberately do not re-derive floor status
+(the runtime already states outstanding floors) — adding that would duplicate the fragile
+floor-schema logic these skills are meant to avoid.
+
+## Gates stopped being able to destroy finished work (2026-07-31)
+
+Session `run_20260731T160516Z_074aa5` (Reyfman, 43,559 cells, three user turns: *analyze this*, *yes
+integrate*, *can you finalize*) ran for two and a half hours across 44 committed capabilities and 25
+failures, and never finalized. Reading the event log, almost none of the failures were scientific.
+Four mechanisms accounted for them, and each is now fixed at the mechanism rather than by asking the
+model to be more careful.
+
+**A presentational limit could discard completed science.** `model_media` over 2 MiB raised
+`CapabilityExecutionError` *after* the capability had computed and written everything. That killed
+`plot_qc_embedding` three times in a row and `evaluate_cluster_qc` three times — and the model could
+not fix it, because the figure's size is not something a tool argument controls. With cluster QC
+unobtainable, `review_cluster_qc` was unreachable and finalization stayed blocked on the
+`current_cluster_qc` floor forever. **This single limit is why the session could not finish.**
+Transport ceilings now degrade: the executor downscales an oversized image (Pillow, longest edge
+2000 → 1400 → 1000, committed artifact untouched at full resolution) and, if it still will not fit or
+the total budget is spent, leaves it unattached and names it in the figure directive with an
+instruction to open it via `inspect-media` and a warning not to re-run. Verified on a regenerated
+figure of the same class: 4.19 MB / 3134 px → 1.15 MB / 1400 px, panels and tick labels legible.
+
+**A recorded human answer could be invalidated by recomputation.** The user said "yes integrate" at
+turn 46. The model then trained scVI, re-clustered, and re-ran `investigate_batch` because the batch
+floor legitimately requires evidence for the current clustering — which moved the consultation anchor
+past turn 46. `decide_batch_handling` then failed four times with *no user answer after the batch
+evidence*, and no action available to the model could satisfy it; only a future user turn could.
+Worse, when one eventually arrived, `max(candidates)` harvested "can you finalize" as the recorded
+authorization to integrate. The anchor now belongs to the *question* (`consultation_question_id` over
+the batch variable and its sample labels, deliberately excluding representation, clustering, and
+counts), a recorded answer carries forward while the question is unchanged, and the *first* turn
+after the question is taken as the answer with `turns_after_anchor` recording that an exchange
+followed. A different batch variable or sample set is still a new question that must be asked.
+
+**Bookkeeping gates failed on transcription.** `review_single_cell_qc` demanded that six to seven
+90-character artifact paths be echoed back exactly; it failed twice in a row, twice, and the review
+that finally landed was written by copying paths out of the error text. Both QC review gates now
+match on file name, path suffix, or full path, ignore extra names, and record the canonical paths in
+the fact rather than the shorthand. The requirement is still that the figures were looked at.
+
+**Floors were discovered only on denial.** `finalize_analysis` reported four unmet predicates at
+once, one of them (`current_cell_qc_review`) stale since a filtering step near the beginning. Floors
+are state predicates and there is more than one legitimate order in which to satisfy them, so the
+unmet set is now stated in the system prompt at bind time — explicitly as predicates to satisfy by
+any route, not a checklist — and each committed step reports, via PostToolUse `additionalContext`,
+only what it *newly* made outstanding or satisfied. Silence when nothing changed is deliberate.
+
+Also: the untracked-matrix error now names `adopt_untracked=true` instead of saying "adopt the matrix
+through a transforming tool", and `methods_reviewed` documents that `markers` is required instead of
+only rejecting its absence.
+
+Verified: 4 new media/transport tests including the oversized-figure regression, 5 new batch
+consultation tests including the exact deadlock and the harvested-wrong-turn case, 3 new
+floor-visibility tests, 1 new assembly test proving the prompt block and the per-step delta; the
+synthetic batch acceptance gained `B_answer_survives_reinvestigation` and
+`B_a_different_question_still_needs_asking` and passes in the real compute environment, as does the
+cluster-cleanup synthetic. Full suite, Ruff, strict mypy, and capability validation pass. `mypy`'s
+`python_version` was corrected from 3.10 to 3.12 (the control plane's actual version) because the
+installed numpy stubs use PEP 695 syntax, which made `mypy src/scagent_sdk` fail on any cold cache
+for reasons unrelated to this package.
+
+Not fixed: the model still wrote custom `run_analysis_code` that guessed column names in its own DEG
+tables (`KeyError: 'group1'`, `'p_val_adj'`) — a discoverability problem for tool-produced table
+schemas, and the largest remaining source of failures in that log. The ancestor-path guard still
+fails rather than resolving (correctly, for transforming tools), and no model-behavior eval yet
+covers any of this.
+
+## scVI trains to a cell-count epoch cap and reports its own convergence (2026-07-31)
+
+`train_scvi_latent` had a fixed `max_epochs` default of 200 and, although it passed
+`early_stopping=True`, it reported nothing about how training ended: no epochs actually trained, no
+loss curve, and a history CSV that saved only the first of scVI's history frames. A 200-epoch cap is
+wrong in both directions — too few for a small dataset, far more than a large one needs — and without
+the ELBO curve neither the model nor the user could tell a converged run from a truncated one.
+
+`scvi-integration` 0.5.0 makes the schedule cell-aware and the outcome inspectable:
+
+- `max_epochs` has no default. Unset, the cap comes from scVI's own `get_max_epochs_heuristic`,
+  which scales epochs *inversely* with cell count (`min(400, round(20000 / n_cells × 400))`), with
+  the same formula reimplemented locally as a fallback if that helper moves. `epoch_cap_source`
+  records which applied, so `400` is never mistaken for a default.
+- `early_stopping` is an explicit input, defaulting to true. Training runs on `devices=1` because
+  scvi-tools cannot early-stop under multi-GPU DDP; a multi-device run would silently train the full
+  cap. That is the legacy multi-GPU caveat removed at the source rather than explained afterward.
+- The result reports `epochs_trained`, `early_stopped`, `hit_cap`, final and best train/validation
+  ELBO, `best_val_epoch`, a descriptive tail improvement, and an `overfitting_warning` when the
+  validation ELBO rose more than 2% above its best value. A train/validation convergence figure is
+  saved and attached as `model_media`, so the curve is reviewed from pixels, not from recall. The
+  history CSV now merges every frame scVI logged, one row per epoch.
+- One sentence (`epoch_narrative`) states the cell count, the resolved cap, that the heuristic chose
+  it, and how training ended, in the result summary and the artifact README. Running the full cap
+  *with* early stopping enabled is reported as a possible undertrained model; with early stopping
+  off it is reported as expected.
+- `epochs_trained` joins `max_epochs`, `early_stopping`, and the seed in the representation identity,
+  since two runs that stopped at different epochs are different latent spaces.
+
+Verified live in the real `rapids` runtime on 2,000 cells × 11,501 genes with a two-level
+`sample_name` covariate: the heuristic set a 400-epoch cap, early stopping fired at 196 epochs (best
+validation epoch 150), and the run produced a 197-row history CSV plus a convergence figure showing
+both curves flattening with no overfitting flag. 13 new deterministic tests in
+`tests/unit/scvi_training_schedule_test.py` cover the cap formula, the heuristic/fallback/explicit
+resolution, early-stopped vs cap-bound runs, the overfitting threshold from both sides, empty
+history, and the narrative wording; they import the skill script without scvi, torch, or pandas.
+Full suite, Ruff, and capability validation pass.
+
+Not established: whether these latent spaces are scientifically better than the fixed-200 ones on
+any dataset, and no model-behavior eval yet checks that the epoch count is explained to the user in
+these terms. Integration evaluation (`evaluate-integration`, like-for-like latent comparison and
+biological conservation) remains unimplemented, so adoption evidence is still the weak link.
+
+## Shell bundles are named for what the command did (2026-07-31)
+
+The `shell/` projection named each bundle by re-slugifying the command text, which produced names
+that reproduced the shell instead of describing the work:
+`001-cd-scripts-grep-n-context-artifact-relat-fcd39b46` leads with a `cd` that accomplished nothing
+and truncates the one word that mattered. A reader had to reconstruct the command to learn what the
+run was for, which is precisely what the name should have saved them.
+
+The label now describes the function performed. `output_view.py` lexes the command with `shlex`
+(`punctuation_chars=True`, so one pass both tokenizes and cuts the command into its steps), drops
+shell preamble (`cd`, `source`, `set`, …) and redirection plumbing, and describes the first working
+step as a verb plus what it acted on, appending the final step when it differs. Absolute paths still
+reduce to the basename the command acted on, option values are not mistaken for operands
+(`head -n 5 notes.txt`), a pattern from `-e`/`-f` is recognized as the pattern, and stream-editor
+program text is never used as a name. A command outside the verb table keeps its own name as the
+verb rather than being given an invented description; unbalanced quotes fall back to the old
+command-text slug. Names are cut at a word boundary within a 56-character budget, so a truncated
+name still ends on a whole word.
+
+The two bundles above became `001-search-evaluate-py-for-context-artifact-relative-path-fcd39b46`
+and `002-copy-evaluate-py-then-edit-b1c71d3d`; other examples are `read-end-of-events-jsonl`
+(`tail -5 …/events.jsonl`), `search-events-jsonl-for-finalize-then-count-lines` (a `grep | wc`
+pipeline), `find-files-named-h5ad`, `run-pytest-output-view-test-py`, and `run-inline-python` for a
+`python3 -c` heredoc whose source cannot be named.
+
+Verified by refreshing the real session `run_20260731T033831Z_d1649c`: both bundles were renamed,
+stale bundle directories pruned, every projected link still resolves, and the `outputs.md` shell
+table and `outputs.json` `bundle_path` entries agree with the new names. Covered by 21 parametrized
+labeler cases plus the existing bundle-shape tests in `tests/unit/output_view_test.py`; full suite,
+Ruff, strict mypy, and capability validation pass.
+
+## Cluster-QC figures identify themselves without interpreting themselves (2026-07-31)
+
+The covariance heatmaps had accumulated too much text, and the worst of it was the verdict: the
+title ended `→ covariance: moderate`. That is the conclusion the figure is *evidence for*, so
+printing it on the image lets a review agree with the label without ever reading the pattern —
+which is exactly what the visual-review floor exists to prevent. Removed, along with the two-line
+"how to read a correlation block" caption, the colorbar label, and the gene-count x-label.
+
+The heatmaps now match the legacy figures: a two-line title carrying only what a reader opening the
+file cold cannot reconstruct — `{cluster_key} / cluster {id}` then `{n} genes x {m} cells |
+mean_abs_corr=0.121` — gene names when there are 60 or fewer, hidden spines, an unlabelled
+colorbar, and a square sized from the gene count. The degenerate case is still named honestly
+(`mean_abs_corr=undefined (genes do not vary)`) because that is a fact about the data rather than an
+interpretation of it. The reading guidance moved into the folder README's `how_to_read` entry, where
+it is stated once instead of burned into every image, and `cluster-qc/SKILL.md` now tells the model
+to state the structure it sees rather than repeat `mean_abs_corr`.
+
+The metric boxplot caption lost its redundant clause: `Metric-flagged clusters (red boxes and red
+labels above): 1` is now `Metric-flagged clusters: 1`, and the no-flag case reads
+`Metric-flagged clusters: none`.
+
+Verified by rendering the heatmap at 150 genes with three injected co-expression modules, at 24
+genes to confirm gene labels still appear, and the boxplot in both the flagged and unflagged cases,
+then inspecting each. Full suite, Ruff, mypy, and capability validation pass.
+
+## Heavy-tailed QC metrics are plotted as log values, not on log-scaled axes (2026-07-31)
+
+Every figure that previously drew raw counts on a `set_xscale("log")`/`set_yscale("log")` axis now
+plots the log10 of the metric on a linear axis. The distinction is not cosmetic: on a log-scaled
+axis the numbers printed are not the numbers drawn, so a distribution's spread and symmetry cannot
+be read off it, histogram bins have to be manufactured uniform-in-log to avoid a distorted low end,
+and equal distances carry no fixed meaning. With the logarithm plotted, bins are uniform by
+construction, a box's height is a spread in fold-change, equal distances are equal fold-changes, and
+the axis reads in the same space library-size and gene-count cutoffs are chosen in.
+
+Converted across all three skills that draw these metrics, so one convention holds everywhere:
+`single-cell-qc` 0.3.0 (knee, library-size and gene histograms, violins, joint scatters),
+`visualize-single-cell` 0.4.0 (the same set plus the per-group QC boxplots), and `cluster-qc` 0.7.0
+(per-cluster metric boxplots). No `set_xscale("log")`/`set_yscale("log")` remains under
+`.claude/skills`.
+
+Two things keep the change from costing the reader anything. Each log10 axis carries a **raw
+magnitude mirror** on the opposite spine — marks at 1/2/5 per decade, widening to a finer mantissa
+set when the metric spans well under a decade, so a narrow range still gets a usable reference
+rather than one mark. And zero-count cells, which have no logarithm, are dropped *and counted* in
+the panel title rather than folded in by a log1p shift that would present them as ordinary small
+values. `log1p_*` violin panels moved to log10 as well, so every logged panel reads in one unit: a
+decade is a decade, where natural-log 8.5 has to be converted before it means anything.
+
+The helper trio (`log10_positive`, `raw_reference_ticks`, `label_log10_axis`) is duplicated in each
+skill rather than shared, because a skill's own `scripts/` directory is the only thing on its import
+path and `scagent_sdk` is not importable from the compute environment. The copies cross-reference
+each other and must not drift.
+
+One latent defect surfaced and was fixed: `single-cell-qc` built its scatter panels from columns
+filtered for finiteness *independently*, so a dataset with any zero-count cell produced `total` and
+`pct_counts_mt` arrays of different lengths that no longer described the same cells. A new `paired`
+helper masks the columns together. This was present before the change and only went unnoticed
+because the tested datasets had no such cell.
+
+Verified by rendering every affected figure through the real compute runtime on a synthetic dataset
+carrying two populations of different depth plus 30 zero-count cells, and inspecting each: the
+library-size histogram is now a symmetric bell in log space, the knee reads in decades with raw
+counts mirrored, the per-cluster boxplot separates the two populations with raw counts mirrored on
+the right, and the narrow-range genes panel still gets three raw marks. Full suite, Ruff, mypy, and
+capability validation pass. Not verified: no model-behavior session has read the new figures.
+
+## A committed session is legible without the conversation that produced it (2026-07-30)
+
+Four presentation defects were fixed together because they share one cause: the review surface was
+naming and describing artifacts from what the runtime could infer, rather than from what the
+producing skill knew.
+
+**Projections are named for content, not for the tool.** `_projected_name` now renders
+`<artifact>--<execution-short-id>`; the tool name is gone from the filename (it is still in state
+and `outputs.md`). `ProducedArtifact` gained an optional `title`, and the projection prefers it over
+the artifact `name`. That separation is the point: `name` is the stable identifier floors, report
+selection, and figure requirements match on and must not absorb a subject, while `title` says which
+embedding, clustering, or sample this particular file shows. So
+`embedding--plot-embedding--a8c2f0d0.png` is now `umap-by-leiden-int-sample--a8c2f0d0.png` with the
+artifact still named `embedding`. `visualize-single-cell` 0.4.0 titles its embedding figures and
+grids from the basis plus the coloured columns, truncating long panel sets with a count.
+`finalize-analysis` figure selection was changed to match artifact names only — it had been matching
+projected paths, which coupled report contents to a filename convention.
+
+**Skills can ship a plain-language README.** A new `documentation` field on the result envelope
+(`src/scagent_sdk/capabilities/documentation.py`) declares title, overview, what was done, what was
+found on this dataset, a per-file guide with column glossaries, settings, and caveats. The executor
+renders it to `README.md` inside the folder it describes and registers it as an ordinary artifact,
+so it is committed, hashed, retained, and projected like the figures it explains. Structure is the
+runtime's; content is the skill's, and findings must be dataset-specific. Rolled out to `cluster-qc`
+0.7.0 only for now — the mechanism is general, the remaining skills are not yet converted, and
+`batch-investigation` still hand-writes its own README rather than declaring one.
+
+**Cluster-QC figures identify themselves.** The metric boxplot now names its metric-flagged clusters
+in bold text beneath the axes and reddens their tick labels, instead of relying on box colour alone.
+Each covariance heatmap is captioned with its clustering, cluster, gene and cell counts, mean |r|,
+the share of strongly correlated pairs, the resulting verdict, gene names when few enough to read, a
+labelled colorbar, and a sentence naming the pattern to look for.
+
+Two real defects surfaced while verifying this, both fixed:
+
+- The covariance gene filter kept genes on `variance > 0`. A gene with variance 1e-30 passes that
+  and then makes `np.corrcoef` divide by ~0, so its correlations return NaN; zeroing those NaNs
+  drove mean |r| to exactly 0 and the cluster was called `unstructured` on undefined evidence. The
+  filter now uses the legacy floor (`isfinite` and `> 1e-12`), and the heatmap detects a still-
+  degenerate matrix and says the correlation is undefined rather than claiming independence.
+- `scripts/validate_cluster_cleanup_synthetic.py` built its junk cluster with `rng.poisson(20)` and
+  no `size=`, so one scalar draw broadcast across all 150 cells and every gene was constant within
+  the cluster. The acceptance passed its `junk_cluster_confirmed` check while testing nothing about
+  covariance. With `size=n_junk` the junk cluster now carries genuinely independent noise
+  (mean |r| = 0.064, 28 genes) and is still correctly confirmed and removed.
+
+Verified with the full test suite, repository-wide Ruff and mypy, capability validation, the
+synthetic convergent-junk acceptance through the real compute runtime (all 13 checks pass), visual
+inspection of the regenerated boxplot and both covariance heatmaps, a README rendered from that
+run's real evidence JSON, and an end-to-end executor run confirming the README is committed as an
+artifact and projected into `reports/`. Not verified: no model-behavior session has exercised the
+new figures or README, and `evaluate_cluster_qc` through the brokered live path is currently blocked
+by a **separate pre-existing defect** — when the input already carries a `rank_genes_groups` for the
+same cluster key, `evaluate.py:476` reuses it and `sc.get.rank_genes_groups_df` raises
+`AttributeError: 'dict' object has no attribute 'dtype'`. That reuse branch trusts a stored shape
+scanpy's reader cannot parse. It is untouched by this work and is the next thing to fix here.
+
+## Batch investigation is gene-first without becoming a workflow DAG (2026-07-30)
+
+`batch-investigation` 0.8.0 keeps the matched-population, gene-first science and concrete
+deliverables while making the interaction guidance-led. When multiple samples are found, the model
+offers investigate / integrate / keep combined uncorrected / analyze separately / describe the
+experiment. Investigation is an uncorrected first pass followed by the diagnostic; afterward the
+user chooses the action. Floors protect only the outcome: the choice is evidence-bound, stale after
+identity changes, and every substantive post-investigation decision cites a real user turn after the
+evidence. The decision tool finds and records the newest post-evidence user answer itself, so the
+model never searches event logs for an opaque turn id or paraphrases the answer.
+
+The capability writes the five-file evidence packet:
+
+- `batch_diagnostic_sample_enriched_regions.csv`
+- `batch_diagnostic_within_sample_degs.csv`
+- `batch_diagnostic_population_pairs.csv`
+- `batch_diagnostic_direct_pair_degs.csv`
+- `batch_diagnostic_design_check.csv`
+
+It also writes a plain-language `README.md`, the SDK report/JSON, detailed native tables, and the
+composition figure. The scientific hierarchy is gene-first: within-sample one-vs-rest DEGs are
+primary; mean-expression nomination plus identity-gene overlap confirms a small number of
+cross-sample pairs; direct pair DEGs, recurrence, composition, mixing, and design checks are
+supporting context. Similar identity signatures establish a shared population split by sample, not
+technical causality. Experimental design and the user determine whether correction is appropriate.
+The structured result and report now name each matched cluster/sample pair, the two within-sample
+comparisons, shared top-25 genes, and direct differences. Runtime guidance explicitly forbids
+calling donors technical replicates or claiming a proven technical batch without documentation.
+Saved decision rationales are generated neutrally from the exact recorded user choice.
+
+Pair work is compact: default three confirmed pairs, at most ten nominations attempted, with a 0.4
+profile-correlation nomination floor. The prior union-find population expansion and up-to-60 direct
+comparison default are no longer on the main path. The two-axis interpretation remains advisory
+metadata; it neither authorizes nor blocks a choice. Recurrence is explicitly secondary.
+
+Verified with 66 focused unit/contract tests, the full 715-test suite, repository-wide Ruff and
+mypy, capability validation, the synthetic compute-runtime acceptance, and a real direct run on
+the 43,559-cell Reyfman artifact. The real run
+found 30 enriched regions and three confirmed matches and wrote the compact packet: 30 region
+rows, 200 within-sample DEG rows, three pair rows, 150 direct-DEG rows, one explicit unknown-design
+row, plus README/JSON/report. The matched pairs were coherent donor-specific macrophage regions
+sharing 15–20 of their top-25 identity genes. No full model-behavior session has yet exercised the
+new guidance and post-evidence conversation.
+
+`scvi-integration` publishes an append-only progress stream. The terminal shows live
+epoch/maximum, training ELBO when available, and the later latent-computation and save phases on the
+same elapsed status line. A two-epoch run through the real isolated scVI environment delivered every
+progress event from loading through model save.
+
+## The batch decision now requires the user when the evidence cannot settle it (2026-07-30)
+
+> Historical 0.6.0 account. The 0.7.0 section above supersedes its
+> recommendation-dependent consultation and recurrence-priority conclusions.
+
+Session `run_20260729T205323Z_2a1c40` (Reyfman lung, 8 donors, `iris-qwen36`) recorded
+`keep_uncorrected` on evidence that said the opposite of settled:
+`gene_evidence=recurring_sample_associated`, `design_interpretation=unknown`,
+`recommendation=cannot_determine_technical_vs_biological`, Cramér's V 0.906, same-donor neighbor
+fraction 0.887 against 0.130 expected from composition. The donor highlight grid is textbook
+unintegrated structure — AT2 (24,301 cells) smeared across ~8 disconnected islands, alveolar
+macrophages across 4. **The engine was right and the decision layer was not.**
+
+Nothing was broken; nothing required asking. `orchestrate-single-cell/SKILL.md` said "record an
+explicit decision", `request_guidance` was one of five peer enum values, and `validate_decision`
+allowed every non-`integrate` decision unconditionally. The gating was asymmetric in exactly the
+wrong direction: `integrate` needed a basis plus an override warning, while `keep_uncorrected` — the
+option that abandons the question — needed nothing. Legacy `scagent` closed this with a mandatory
+runtime selector (`agent/agent.py:1497`) fired twice, the second time re-opening the same
+`multi_sample_strategy` decision after `diagnose_batch_effect`; its own code comment records what
+happened when that checkpoint failed to fire: "the model hand-rolled the decision."
+
+Verified first: legacy HEAD's engine reaches the **identical** verdict on this dataset
+(`run_2026_07_19_212128/reports/conversation.md`), so this is not a science regression. The
+"orig always said clear batch effect" memory is the *pre-two-axis* generation, whose
+`batch_diagnosis.json` carried a single `verdict: batch_effect_supported`.
+
+The obligation is expressed as a state predicate rather than a widget, so it holds however the
+question reaches the user:
+
+- **`CapabilityContext.user_turns`** — a read-only index of `{turn_id, sequence, user_prompt}` built
+  by `SessionStore.user_turns()`, which streams `events.jsonl` and parses only turn-start lines
+  (the scientific payloads dominate its bytes; a full parse per execution is not affordable). The
+  runtime states who spoke and when; **no consultation policy lives in the runtime package.**
+- **`validate_consultation`** (`batch-investigation` 0.6.0) — when the recommendation is
+  `cannot_determine_technical_vs_biological` or `integration_optional_for_confirmed_replicates`,
+  `keep_uncorrected`/`integrate`/`separate` require `user_consultation` (`turn_id`,
+  `question_asked`, `user_answer`). It is checked, not trusted: the turn must exist in the event log
+  **and postdate the evidence**, so the opening "analyze this dataset" prompt cannot be cited as
+  authorization — and neither can the turn the evidence itself was produced in, which is precisely
+  what the bad session would have tried.
+- **`request_guidance` is pending, not terminal** — the `batch_decision` floor now fails on it with
+  a distinct reason. Previously it satisfied the floor, so "I need to ask the user" was the cheapest
+  route to finalization. The loop closes itself: ask → user answers → record with attestation →
+  floor passes; no answer means finalization stays blocked and the floor re-prompts.
+- **Design collection moved before the investigation.** `design_interpretation=unknown` in that
+  session existed only because nobody told the agent what the 8 donors were, and an `unknown` design
+  caps the verdict at "cannot determine" regardless of gene evidence. Asking for `condition_keys` and
+  a real `technical_batch_basis` is now part of the method in `orchestrate-single-cell` and
+  `batch-investigation`. This one is guidance, deliberately: pre-investigation there is no evidence
+  to write a predicate against, and hard-blocking every multi-sample run on a user turn would break
+  non-interactive and eval runs.
+
+Evidence schema 1 → 2 (carries the anchor) and decision policy 1 → 2, both fail-closed: existing
+sessions must re-run `investigate_batch` before a decision binds. The anchor is deliberately
+**excluded from every `evidence_id`** — it records when evidence was made, not what it found, so
+identical science in a different turn keeps its identity and does not stale a prior decision.
+
+Verified live, two ways. **In the `rapids` runtime against the real entrypoints:** evidence carries
+schema 2 and the anchor (0 with no turns, 17 with), the `not_applicable` `evidence_id` is unchanged
+by turn history, an unconsulted `keep_uncorrected` is refused, citing the anchor turn itself is
+refused, `request_guidance` records and reports finalization as blocked, and a consultation on a
+later turn is accepted and persisted in full. **Brokered end to end** via
+`scripts/validate_p0_live.py` on `combined_truly_raw_annotated.h5ad` (36,419 cells, 7 samples):
+`anchor_sequence=22` proves the turn index survives the broker → worker JSON boundary and is read
+*inside* the isolated compute environment; `request_guidance` records and leaves
+`batch_decision` failing with the pending reason; the consulted decision is accepted; the floor
+passes after the real answer and still stales after a forged reclustering. Honest gap in that run:
+this dataset's recommendation was `do_not_integrate_based_on_current_evidence`, so the brokered path
+did **not** exercise the refusal branch — that is covered by the in-runtime check and the
+deterministic tests, not brokered.
+
+Deterministic coverage: 20 new tests across `batch_capability_test.py`, `floor_evaluator_test.py`,
+`session_test.py`, `capability_executor_test.py`, plus two new contract tests, both negative-checked
+by breaking them deliberately:
+`tests/contracts/capability_context_boundary_test.py` pins every `CapabilityContext` field to both
+halves of the broker/worker boundary (add a field to one side and compute capabilities silently get
+the dataclass default), and `tests/contracts/evidence_schema_agreement_test.py` pins the
+evidence-schema and policy constants that are necessarily duplicated between skill scripts and
+`floors/evaluator.py` (disagreement makes a floor reject every piece of evidence its skill can
+produce, with a staleness message no rerun can fix).
+
+Fixed in passing, pre-existing and unrelated: `scripts/live_fixture_pipeline.py` hardcoded
+`cluster_key: "leiden"`, which the non-overwrite guard correctly refuses on already-annotated
+validation inputs — the P0 live baseline could not run at all. Now `leiden_res_0_8`, with
+`validate_p0_live.py` passing that key to `investigate_batch` explicitly so it cannot silently
+investigate the input's legacy clustering instead of the one the fixture just built.
+
+**Known limit, not closed:** a faithful `turn_id` paired with a misreported `user_answer` passes.
+Recording the user's own words is the mitigation. A runtime selector would remove the gap entirely
+by capturing the choice directly, and is the natural next step — it would write the same
+`user_consultation`, so nothing downstream changes. It was deliberately not built first: without the
+attestation the model would skip a selector exactly as it skipped `request_guidance`, and a selector
+means new interactive-loop rendering, a `user.decision` event kind, and resume semantics for a
+session interrupted mid-question. Build it if measurement shows the local Qwen profile stalls often.
+
+**Still open from the same review (P1, unfixed):** the `gene_evidence` recurrence axis is
+**unstable in both directions**, because its magnitude tracks how many region pairs the clustering
+happened to surface rather than anything about the biology. Reyfman (30 regions, 91 matches, 3
+populations) produced **19,883** recurring `(gene, donor)` entries over 7,221 unique genes of ~20k
+from 159,097 direct rows — saturated. The 7-sample validation dataset (9 regions, 6 matches) produced
+**0**, landing on `localized`. Two porting gaps: (1) legacy caps the recurrence accumulator at
+`top_n=25` genes per side per pair, while `summarize_recurrence` consumes every significant row
+uncapped (`investigate.py:786-790` records that the detection-fraction gate was dropped
+deliberately); (2) legacy keys recurrence on the distinct **cluster** and unions a second
+within-cluster cross-batch **region scan** added expressly to stop the verdict flapping between
+models, while the SDK keys on the union-find **component** with only the pair geometry — the exact
+dependence legacy's region scan exists to remove. So the Reyfman verdict was right by accident, and a
+sparser dataset can miss a real recurring program entirely. Fixing this changes how often
+`cannot_determine` — and therefore the new consultation gate — fires at all.
 
 ## `materialize_count_matrix` cost halved (2026-07-29)
 
@@ -419,11 +1041,11 @@ Ruff checks and strict mypy are clean.
   ran was committed under `artifacts/capabilities/<uuid>/` but had no browsable surface at all: the
   `shell/` directory existed only because session creation made it. Because a command is
   uninterpretable without its output, shell runs project as one **bundle directory per execution**
-  rather than as loose files — `shell/002-tail-5-events-jsonl-f513a638/{command.sh, stdout.txt,
+  rather than as loose files — `shell/002-read-end-of-events-jsonl-f513a638/{command.sh, stdout.txt,
   stderr.txt, run.json}`. The name carries an ordinal so a name-sorted listing preserves run order,
-  and a label read from the committed `shell-run.json` (the only place the command text is
-  recorded), with absolute paths reduced to basenames so the label says what was acted on. Files a
-  shell record produces that are not part of the run itself still classify into their own category.
+  and a label derived from the command text in the committed `shell-run.json` (the only place that
+  text is recorded). Files a shell record produces that are not part of the run itself still
+  classify into their own category.
   `outputs.md` gains a **Shell commands** section listing command, duration, and per-member links;
   `outputs.json` shell entries carry `bundle_path`, `command`, `cwd`, `exit_code`, and
   `duration_seconds`. The index schema is version 2; existing sessions reuse their current links on
@@ -481,9 +1103,9 @@ skills/executable/tools; and all six Iris environment profiles are healthy.
 
 **Shell-projection acceptance:** replayed against a copy of the real session
 `run_20260729T205323Z_2a1c40`, whose 8 committed `run_shell_command` executions previously had no
-browsable surface. All 8 now project as named bundles (`001-cat-state-json-python3-c-import-sys-json-b3516d16`
-through `008-grep-i-resolution-res-leiden-res-cluster-7a3d322e`) carrying 32 links; every link
-resolves to a file, repeated refreshes reproduce a byte-identical index, and no `--view-N`
+browsable surface. All 8 now project as named bundles (`001-…-b3516d16` through `008-…-7a3d322e`,
+under the command-text labels that predate the function-based naming above) carrying 32 links; every
+link resolves to a file, repeated refreshes reproduce a byte-identical index, and no `--view-N`
 collision names appear. `tests/unit/output_view_test.py` covers this at 28 tests (bundle shape and
 member order, ordinal-follows-commit-order with reverse-sorting ids, absolute-path and
 trailing-separator label compression, URLs and relative paths left intact, unreadable-report and

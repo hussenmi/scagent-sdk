@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,6 +29,15 @@ _CONTEXT_ERROR_MARKERS = (
     "maximum context window",
     "prompt is too long",
     "too many input tokens",
+)
+_COMPLETION_CLAIMS = (
+    re.compile(r"\b(?:session|analysis)\s+(?:is\s+|was\s+)?complet(?:e|ed)\b", re.I),
+    re.compile(r"^\s*final artifacts\s*:", re.I | re.M),
+)
+_FINAL_VIEW_PATHS = (
+    "reports/final-analysis-report.md",
+    "code/analysis-recipe.py",
+    "data/final-annotated.h5ad",
 )
 
 
@@ -148,7 +159,7 @@ class AgentRuntimeService:
             ),
         )
 
-    def _reconstructed_request(
+    def _rollover_request(
         self,
         session: AnalysisSession,
         *,
@@ -161,8 +172,17 @@ class AgentRuntimeService:
             session.store.state,
             events=session.store.events(),
             session_dir=session.directory,
+            include_recent_turns=False,
         )
-        prompt = self._effective_prompt(user_prompt, context, ResumeMode.RECONSTRUCTED)
+        prompt = (
+            "This is an automatic mid-turn context rollover, not a new user turn. Work may have "
+            "advanced after the initiating message. Continue from the current durable checkpoint, "
+            "do not repeat completed actions, and do not reinterpret the quoted initiating message "
+            "as an answer to an older question.\n\n"
+            f"{context}\n\n"
+            "Initiating user message (intent only; not a new reply):\n"
+            f"{user_prompt.strip()}"
+        )
         return self._request(
             session=session,
             profile=profile,
@@ -203,6 +223,29 @@ class AgentRuntimeService:
         if response is not None:
             payload["response"] = response.to_dict()
         session.store.record("runtime.turn_interrupted", payload=payload, actor="user")
+
+    @staticmethod
+    def _completion_warnings(
+        session: AnalysisSession, response: RuntimeResponse
+    ) -> tuple[str, ...]:
+        """Reject narration that claims a durable finalization which never happened."""
+
+        if not any(pattern.search(response.final_text) for pattern in _COMPLETION_CLAIMS):
+            return ()
+        finalization = session.store.state.facts.get("finalization")
+        if isinstance(finalization, Mapping) and finalization.get("status") == "complete":
+            return ()
+        missing = [
+            relative
+            for relative in _FINAL_VIEW_PATHS
+            if not (session.directory / relative).is_file()
+        ]
+        detail = f" Missing advertised files: {', '.join(missing)}." if missing else ""
+        return (
+            "Completion claim rejected: durable state does not record a successful "
+            f"`finalize_analysis` result, so this session is not finalized.{detail} "
+            f"Current outputs are indexed at {session.directory / 'outputs.md'}.",
+        )
 
     async def run_turn(
         self,
@@ -280,7 +323,7 @@ class AgentRuntimeService:
                     reason="preflight usage reached the model's context reserve",
                     details=exc.to_dict(),
                 )
-                request = self._reconstructed_request(
+                request = self._rollover_request(
                     session,
                     user_prompt=user_prompt,
                     profile=profile,
@@ -308,7 +351,7 @@ class AgentRuntimeService:
                 self._notify_rollover(
                     reason="provider rejected the exact transcript as over its context window",
                 )
-                request = self._reconstructed_request(
+                request = self._rollover_request(
                     session,
                     user_prompt=user_prompt,
                     profile=profile,
@@ -366,6 +409,24 @@ class AgentRuntimeService:
                 f"model runtime returned an error result ({response.subtype}): "
                 f"{response.final_text}"
             )
+
+        warnings = self._completion_warnings(session, response)
+        if warnings:
+            original_final_text = response.final_text
+            correction = "\n\n".join(f"> **Completion correction:** {item}" for item in warnings)
+            response = replace(
+                response,
+                final_text=f"{response.final_text.rstrip()}\n\n{correction}",
+            )
+            session.store.record(
+                "runtime.response_consistency_warning",
+                payload={
+                    "turn_id": turn_id,
+                    "warnings": list(warnings),
+                    "original_final_text": original_final_text[:4000],
+                },
+            )
+            self.observer.on_runtime_consistency_warning(warnings)
 
         session.bind_runtime(
             runtime=self.backend.runtime_name,

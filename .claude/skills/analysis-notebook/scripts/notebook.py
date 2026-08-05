@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -66,10 +67,21 @@ _DEFAULT_PHASE = "Other steps"
 # A committed artifact path carries the execution id, which is how an input is traced back to the
 # step that produced it.
 _ARTIFACT_PATH = re.compile(
-    r"(?:[^\s\"']*/)?artifacts/capabilities/([0-9a-fA-F][0-9a-fA-F-]{7,})/([^\s\"']+)"
+    r"(?:[^\s\"']*/)?artifacts/capabilities/"
+    r"(?:[a-z0-9-]+--)?([0-9a-fA-F][0-9a-fA-F-]{7,})/([^\s\"']+)"
 )
 _DECISION_KEYS = ("decision", "disposition", "verdict")
 _RATIONALE_KEYS = ("rationale", "justification", "override_justification")
+# Artifact names whose content is literally the code a step executed, matched by declared name
+# rather than by media type: `analysis-recipe.py` is also text/x-python but is a replay list, not
+# the code any step ran. Where one of these exists the step gets the real code instead of a stub.
+_EXECUTED_CODE_ARTIFACTS = {
+    "analysis-code": "python",
+    "shell-command": "shell",
+}
+# The same content also arrives as an argument; render it as code, never as a prose blockquote.
+_CODE_ARGUMENT_KEYS = {"code": "python", "command": "shell"}
+_CODE_CELL_MAX_CHARS = 40000
 
 
 def _phase(skill_id: Any) -> str:
@@ -159,6 +171,76 @@ def _rationales_of(arguments: dict[str, Any]) -> list[tuple[str, str]]:
         if isinstance(value, str) and value.strip():
             found.append((key, value.strip()))
     return found
+
+
+def _executed_code(
+    item: dict[str, Any], session_dir: Path
+) -> tuple[str, str, bool] | None:
+    """Recover the code a step actually executed, as ``(kind, text, truncated)``.
+
+    Prefers the committed artifact, which is the authoritative record of what ran, and falls back
+    to the recorded argument. A step with neither -- an ordinary capability call -- returns None
+    and keeps its illustrative call signature.
+    """
+
+    root = session_dir / str(
+        item.get(
+            "artifact_path",
+            f"artifacts/capabilities/{item.get('execution_id', '')}",
+        )
+    )
+    for raw in item.get("files") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        kind = _EXECUTED_CODE_ARTIFACTS.get(str(raw.get("name")))
+        relative = raw.get("relative_path")
+        if kind is None or not isinstance(relative, str):
+            continue
+        source = (root / relative).resolve()
+        try:
+            source.relative_to(session_dir.resolve())
+            text = source.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        if text.strip():
+            return (kind, *_bound_code(text))
+    arguments = item.get("arguments")
+    if isinstance(arguments, Mapping):
+        for key, kind in _CODE_ARGUMENT_KEYS.items():
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return (kind, *_bound_code(value))
+    return None
+
+
+def _bound_code(text: str) -> tuple[str, bool]:
+    body = text.replace("\r\n", "\n").rstrip()
+    if len(body) <= _CODE_CELL_MAX_CHARS:
+        return body, False
+    return body[:_CODE_CELL_MAX_CHARS].rstrip(), True
+
+
+def _code_cell_for(kind: str, text: str, truncated: bool, *, environment: str | None) -> list[str]:
+    """Build a cell holding real executed code rather than a call record.
+
+    Shell commands get ``%%bash`` so the cell stays genuinely executable in Jupyter. Python is
+    emitted verbatim; it ran in a compute runtime, so a header names that environment instead of
+    implying the notebook's own kernel will reproduce it.
+    """
+
+    where = f" in {environment}" if environment else ""
+    lines = (
+        ["%%bash", f"# Exactly as it ran{where}."]
+        if kind == "shell"
+        else [f"# Custom Python, exactly as it ran{where}."]
+    )
+    lines.extend(text.splitlines())
+    if truncated:
+        lines.append(
+            f"# [truncated at {_CODE_CELL_MAX_CHARS:,} characters; "
+            "full text in the committed artifact]"
+        )
+    return lines
 
 
 def _quote(text: str) -> list[str]:
@@ -270,8 +352,14 @@ def _render_step(
     steps: dict[str, tuple[int, str]],
     embedded: list[tuple[str, dict[str, Any], str]],
     linked: list[str],
+    executed: tuple[str, str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+    if executed is not None:
+        # The code becomes this step's cell, so it must not also appear as a quoted blob.
+        arguments = {
+            key: value for key, value in arguments.items() if key not in _CODE_ARGUMENT_KEYS
+        }
     inline, prose, structured = _split_arguments(dict(arguments), steps)
     lines = [_step_heading(number, item), ""]
 
@@ -311,6 +399,21 @@ def _render_step(
         lines.extend(["", "</details>", ""])
 
     cells = [_markdown_cell(lines, attachments or None)]
+    if executed is not None:
+        kind, text, truncated = executed
+        environment = item.get("environment")
+        name = environment.get("name") if isinstance(environment, Mapping) else None
+        cells.append(
+            _code_cell(
+                _code_cell_for(
+                    kind,
+                    text,
+                    truncated,
+                    environment=str(name) if isinstance(name, str) and name != "current" else None,
+                )
+            )
+        )
+        return cells
     call_lines = [f"call({str(item.get('tool_name', 'capability'))!r}"]
     for key, value, note in inline:
         comment = f"  # {note}" if note else ""
@@ -356,10 +459,13 @@ def _intro_cells(
         "committed, in the order they ran, with each step's arguments, result, decision "
         "rationale, and figures. " + stage,
         "",
-        "**The code cells are a record, not a runnable pipeline.** Each capability executes "
-        "inside the scagent-sdk runtime, which enforces scientific floors, stages outputs, and "
-        "commits immutable artifacts with provenance. Reproducing the analysis means replaying "
-        "those calls through that runtime rather than running these cells.",
+        "**Read the code cells as two different things.** A `call(...)` cell records which "
+        "capability ran with which parameters — it is a faithful record, not runnable science, "
+        "because capabilities execute inside the scagent-sdk runtime that enforces scientific "
+        "floors, stages outputs, and commits immutable artifacts. Reproducing those steps means "
+        "replaying them through that runtime. Where a step ran custom Python or a shell command, "
+        "the cell instead holds **that code verbatim**, recovered from the committed artifact, "
+        "and is labelled with the runtime it ran in.",
         "",
     ]
     # Only advertise deliverables that finalization actually produced.
@@ -494,7 +600,13 @@ def build_analysis_notebook(
 
         figures = _figure_files(item)
         embed_plan, link_plan = _plan_figures(figures, remaining)
-        root = session_dir / "artifacts" / "capabilities" / str(item.get("execution_id", ""))
+        artifact_path = str(
+            item.get(
+                "artifact_path",
+                f"artifacts/capabilities/{item.get('execution_id', '')}",
+            )
+        )
+        root = session_dir / artifact_path
         embedded: list[tuple[str, dict[str, Any], str]] = []
         for raw in embed_plan:
             relative = str(raw["relative_path"])
@@ -505,10 +617,7 @@ def build_analysis_notebook(
                 continue
             embedded.append((name, attachment, str(raw.get("name", Path(relative).stem))))
             remaining -= int(raw.get("size_bytes") or 0)
-        links = [
-            f"../artifacts/capabilities/{item.get('execution_id', '')}/{raw['relative_path']}"
-            for raw in link_plan
-        ]
+        links = [f"../{artifact_path}/{raw['relative_path']}" for raw in link_plan]
         cells.extend(
             _render_step(
                 number=number,
@@ -516,6 +625,7 @@ def build_analysis_notebook(
                 steps=steps,
                 embedded=embedded,
                 linked=links,
+                executed=_executed_code(item, session_dir),
             )
         )
 

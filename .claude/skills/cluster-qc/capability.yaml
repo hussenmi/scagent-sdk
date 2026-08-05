@@ -1,7 +1,7 @@
 schema_version: 1
 skill:
   id: cluster-qc
-  version: "0.6.0"
+  version: "0.7.1"
   description: Artifact-scoped three-axis cluster quality evidence, complete figures, visual review, and optional bounded cleanup.
 tools:
   - name: evaluate_cluster_qc
