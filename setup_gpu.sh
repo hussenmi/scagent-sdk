@@ -72,6 +72,14 @@ SCAGENT_SDK_PIXI="${_SCAGENT_SDK_PIXI}" \
 
 source "${_SCAGENT_SDK_ROOT}/.venv/bin/activate"
 
+# Host-specific broker profile: the DGX Spark (aarch64) uses spark.toml, Iris
+# (x86_64) uses iris.toml. An explicit SCAGENT_SDK_ENVIRONMENTS_FILE still wins.
+if [[ "$(uname -m)" == "aarch64" ]]; then
+  _SCAGENT_SDK_ENV_PROFILE="spark"
+else
+  _SCAGENT_SDK_ENV_PROFILE="iris"
+fi
+
 export SCAGENT_SDK_PROJECT_ROOT="${_SCAGENT_SDK_ROOT}"
 export SCAGENT_SDK_UV="${_SCAGENT_SDK_UV}"
 export SCAGENT_SDK_PIXI="${_SCAGENT_SDK_PIXI}"
@@ -79,7 +87,7 @@ export SCAGENT_SDK_MODEL_PROFILE="${SCAGENT_SDK_MODEL_PROFILE:-iris-qwen36}"
 export SCAGENT_SDK_MODEL_PROFILES_DIR="${SCAGENT_SDK_MODEL_PROFILES_DIR:-${_SCAGENT_SDK_ROOT}/configs/models}"
 export SCAGENT_SDK_SKILLS_DIR="${SCAGENT_SDK_SKILLS_DIR:-${_SCAGENT_SDK_ROOT}/.claude/skills}"
 export SCAGENT_SDK_SESSIONS_DIR="${SCAGENT_SDK_SESSIONS_DIR:-${_SCAGENT_SDK_ROOT}/sessions}"
-export SCAGENT_SDK_ENVIRONMENTS_FILE="${SCAGENT_SDK_ENVIRONMENTS_FILE:-${_SCAGENT_SDK_ROOT}/configs/environments/iris.toml}"
+export SCAGENT_SDK_ENVIRONMENTS_FILE="${SCAGENT_SDK_ENVIRONMENTS_FILE:-${_SCAGENT_SDK_ROOT}/configs/environments/${_SCAGENT_SDK_ENV_PROFILE}.toml}"
 export SCAGENT_SDK_ENV_FILE="${SCAGENT_SDK_ENV_FILE:-${_SCAGENT_SDK_ROOT}/.env}"
 
 echo "scagent-sdk environment ready"
@@ -91,4 +99,4 @@ echo "  locks:    uv.lock + pixi.lock"
 echo "Run: scagent start"
 
 unset _SCAGENT_SDK_ROOT _SCAGENT_SDK_UV _SCAGENT_SDK_UV_CANDIDATE
-unset _SCAGENT_SDK_PIXI _SCAGENT_SDK_PIXI_CANDIDATE
+unset _SCAGENT_SDK_PIXI _SCAGENT_SDK_PIXI_CANDIDATE _SCAGENT_SDK_ENV_PROFILE

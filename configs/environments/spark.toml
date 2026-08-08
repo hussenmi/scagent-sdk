@@ -1,0 +1,113 @@
+schema_version = 2
+host = "spark"
+
+# DGX Spark (GB10 / aarch64 / sm_121). Parity with iris.toml but for the ARM
+# compute stack built by the Spark-local pixi.toml override: RAPIDS from conda,
+# torch from the CUDA-13 wheel index, scimilarity via the tiledb stub. The
+# activation env mirrors sc-agent's proven GB10 recipe — notably LD_PRELOAD of
+# the env's own cuBLAS/cuBLASLt (NOT the x86 libstdc++/libnvJitLink used on Iris)
+# and system CUDA at /usr/local/cuda for ptxas/nvcc.
+#
+# All three compute runtimes (rapids, cellbender, diffxpy) are ported. diffxpy
+# runs on ARM by depending on plain `tensorflow` (which has aarch64 wheels)
+# instead of `tensorflow-cpu` (which has none); on ARM that wheel is CPU-only,
+# which is what diffxpy wants anyway.
+
+[runtimes.rapids-main]
+python = "/home/hussen/projects/scagent-sdk/.pixi/envs/rapids/bin/python"
+prefix = "/home/hussen/projects/scagent-sdk/.pixi/envs/rapids"
+probe_timeout_seconds = 180
+gpu_probe = "cupy"
+probe_modules = ["torch", "numpy", "rapids_singlecell", "cupy", "scvi"]
+provenance_files = [
+  "/home/hussen/projects/scagent-sdk/pixi.toml",
+  "/home/hussen/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.rapids-main.environment]
+SCAGENT_GPU = "1"
+MPLBACKEND = "Agg"
+CUDA_HOME = "/usr/local/cuda"
+LD_PRELOAD = "{prefix}/lib/libcublas.so.13:{prefix}/lib/libcublasLt.so.13"
+TORCH_CUDA_ARCH_LIST = "12.1a"
+TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"
+
+[capabilities.gpu-singlecell]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 4096
+required_modules = ["anndata", "scanpy", "rapids_singlecell", "cupy", "sklearn"]
+
+[capabilities.gpu-singlecell.environment]
+SCIMILARITY_MODEL_PATH = "/home/hussen/models/sci/human_v2"
+
+[capabilities.scvi]
+runtime = "rapids-main"
+timeout_seconds = 14400
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 8192
+required_modules = ["anndata", "scanpy", "scvi", "cupy"]
+
+[capabilities.celltypist]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = false
+required_modules = ["anndata", "scanpy", "celltypist"]
+
+[capabilities.scimilarity]
+runtime = "rapids-main"
+timeout_seconds = 7200
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 4096
+required_modules = ["anndata", "scanpy", "scimilarity", "cupy"]
+
+[capabilities.scimilarity.environment]
+SCIMILARITY_MODEL_PATH = "/home/hussen/models/sci/human_v2"
+
+[runtimes.cellbender]
+python = "/home/hussen/projects/scagent-sdk/.pixi/envs/cellbender/bin/python"
+prefix = "/home/hussen/projects/scagent-sdk/.pixi/envs/cellbender"
+probe_timeout_seconds = 300
+gpu_probe = "torch"
+probe_modules = ["torch", "cellbender"]
+provenance_files = [
+  "/home/hussen/projects/scagent-sdk/pixi.toml",
+  "/home/hussen/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.cellbender.environment]
+MPLBACKEND = "Agg"
+
+[capabilities.cellbender]
+runtime = "cellbender"
+timeout_seconds = 21600
+gpu_required = true
+gpu_count = 1
+min_gpu_memory_mb = 8192
+required_modules = ["cellbender", "torch", "h5py", "numpy", "scipy", "matplotlib"]
+
+[runtimes.diffxpy]
+python = "/home/hussen/projects/scagent-sdk/.pixi/envs/diffxpy/bin/python"
+prefix = "/home/hussen/projects/scagent-sdk/.pixi/envs/diffxpy"
+probe_timeout_seconds = 180
+gpu_probe = "torch"
+probe_modules = ["numpy", "diffxpy"]
+provenance_files = [
+  "/home/hussen/projects/scagent-sdk/pixi.toml",
+  "/home/hussen/projects/scagent-sdk/pixi.lock",
+]
+
+[runtimes.diffxpy.environment]
+MPLBACKEND = "Agg"
+TF_CPP_MIN_LOG_LEVEL = "3"
+CUDA_VISIBLE_DEVICES = ""
+
+[capabilities.diffxpy]
+runtime = "diffxpy"
+timeout_seconds = 7200
+gpu_required = false
+required_modules = ["diffxpy", "numpy"]
