@@ -1,0 +1,40 @@
+# Host-agnostic gateway config for the `local-default` model profile — the
+# default profile on every host. The Claude Agent SDK speaks Anthropic Messages
+# to this gateway; LiteLLM translates to the upstream OpenAI-compatible endpoint
+# (vLLM / NIM). The upstream model and URL are deliberately NOT hardcoded here:
+# each host sets them in its untracked .env, so the same config drives Iris's
+# dense Qwen and the Spark's Qwen MoE without edits. See .env.example.
+#
+#   SCAGENT_SDK_UPSTREAM_MODEL     openai/<served-model-name>   (per host)
+#   SCAGENT_SDK_FAST_MODEL         small/fast alias (often the same model)
+#   SCAGENT_SDK_UPSTREAM_BASE_URL  http://<host>:<port>/v1
+#   SCAGENT_SDK_UPSTREAM_API_KEY   local-noauth for an unauthenticated vLLM
+#
+# Reasoning: vLLM often defaults thinking OFF; enable_thinking turns it on per
+# request, and merge_reasoning_content_in_choices folds reasoning into
+# <think>...</think>, which the terminal extracts and dims. Harmless for backends
+# that ignore chat_template_kwargs.
+model_list:
+  - model_name: scagent-primary
+    litellm_params:
+      model: os.environ/SCAGENT_SDK_UPSTREAM_MODEL
+      api_base: os.environ/SCAGENT_SDK_UPSTREAM_BASE_URL
+      api_key: os.environ/SCAGENT_SDK_UPSTREAM_API_KEY
+      merge_reasoning_content_in_choices: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+  - model_name: scagent-fast
+    litellm_params:
+      model: os.environ/SCAGENT_SDK_FAST_MODEL
+      api_base: os.environ/SCAGENT_SDK_UPSTREAM_BASE_URL
+      api_key: os.environ/SCAGENT_SDK_UPSTREAM_API_KEY
+      merge_reasoning_content_in_choices: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+
+litellm_settings:
+  drop_params: true
+  use_chat_completions_url_for_anthropic_messages: true
