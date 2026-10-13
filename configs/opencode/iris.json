@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "enabled_providers": ["localhost", "iscp001", "iscn012"],
   "provider": {
     "localhost": {
       "npm": "@ai-sdk/openai-compatible",
@@ -64,25 +63,6 @@
           }
         }
       }
-    }
-  },
-  "mcp": {
-    "scagent": {
-      "type": "local",
-      "command": [
-        "/data1/peerd/ibrahih3/scagent-sdk/.venv/bin/python",
-        "/data1/peerd/ibrahih3/scagent-oc-spike/mcp_server/server.py"
-      ],
-      "environment": {
-        "SCAGENT_SDK_SKILLS_DIR": "/data1/peerd/ibrahih3/scagent-sdk/.claude/skills",
-        "SCAGENT_SDK_SESSIONS_DIR": "/data1/peerd/ibrahih3/scagent-oc-spike/scagent_sessions",
-        "SCAGENT_SDK_ENVIRONMENTS_FILE": "/data1/peerd/ibrahih3/scagent-sdk/configs/environments/iris.toml",
-        "SCAGENT_SESSION_FILE": "/data1/peerd/ibrahih3/scagent-oc-spike/session-map/current.txt",
-        "SCAGENT_SESSION_MAP": "/data1/peerd/ibrahih3/scagent-oc-spike/session-map/scagent-map.json",
-        "SCAGENT_INSTRUCTIONS_FILE": "/data1/peerd/ibrahih3/scagent-oc-spike/session-map/skill-instructions.txt",
-        "SCAGENT_CHECKPOINT_FILE": "/data1/peerd/ibrahih3/scagent-oc-spike/session-map/durable-checkpoint.txt"
-      },
-      "enabled": true
     }
   },
   "tools": {
