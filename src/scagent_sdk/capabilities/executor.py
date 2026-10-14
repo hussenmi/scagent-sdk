@@ -1304,17 +1304,28 @@ class CapabilityExecutor:
                 unsequenced.append((execution_id, path))
             else:
                 pending.append((sequence, execution_id, path))
-        for _, execution_id, _path in sorted(
+        for _, execution_id, path in sorted(
             pending, key=lambda item: (item[0], item[1], item[2].name)
         ):
-            if self.commit(execution_id):
-                recovered.append(execution_id)
+            # A result refused at commit (its head moved while it ran) stays staged. Retrying it
+            # on every open would fail the open itself and wedge the session, so set it aside.
+            try:
+                if self.commit(execution_id):
+                    recovered.append(execution_id)
+            except CapabilityExecutionError as exc:
+                self._quarantine(path, execution_id=execution_id, reason=str(exc))
         for execution_id, path in sorted(unsequenced, key=lambda item: (item[0], item[1].name)):
             self._quarantine(path, execution_id=execution_id)
         return recovered
 
-    def _quarantine(self, path: Path, *, execution_id: str | None = None) -> None:
-        """Move an unorderable staged result aside and record why."""
+    def _quarantine(
+        self,
+        path: Path,
+        *,
+        execution_id: str | None = None,
+        reason: str = "no capability.result_staged event; commit order is undefined",
+    ) -> None:
+        """Move an unrecoverable staged result aside and record why."""
 
         target = self.quarantine_root / path.name
         try:
@@ -1328,7 +1339,7 @@ class CapabilityExecutor:
                 "capability.result_quarantined",
                 payload={
                     "execution_id": execution_id or path.name,
-                    "reason": "no capability.result_staged event; commit order is undefined",
+                    "reason": reason,
                     "path": str(target.relative_to(self.session.directory)),
                 },
             )

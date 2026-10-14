@@ -604,6 +604,31 @@ def test_commit_is_refused_when_the_head_moved_underneath_it(tmp_path: Path) -> 
     assert slow not in harness.session.store.state.artifacts
 
 
+def test_recovery_quarantines_a_result_whose_head_moved_instead_of_failing(tmp_path: Path) -> None:
+    """A refused stale result stays staged; reopening the session must not wedge on it."""
+
+    harness = _Harness(tmp_path, "stale-recovery")
+    base = harness.run("make_matrix")
+    slow = harness.run("make_matrix", commit=False, path=harness.matrix_path(base))
+    fast = harness.run("make_matrix", path=harness.matrix_path(base))
+
+    assert harness.executor.recover_pending() == []
+    assert active_head(harness.lineage) == fast
+    assert slow not in harness.session.store.state.artifacts
+    assert (harness.executor.quarantine_root / slow / "result.json").is_file()
+    assert not (harness.executor.pending_root / slow).exists()
+    quarantined = [
+        event
+        for event in harness.session.store.events()
+        if event.kind == "capability.result_quarantined"
+    ]
+    assert quarantined[-1].payload["execution_id"] == slow
+    assert "active head is now" in quarantined[-1].payload["reason"]
+
+    # The session keeps working after recovery.
+    assert harness.run("make_matrix") in harness.session.store.state.artifacts
+
+
 def test_stale_head_check_uses_state_reloaded_inside_the_store_lock(tmp_path: Path) -> None:
     """A second process has a stale in-memory checkpoint even though disk already advanced."""
 

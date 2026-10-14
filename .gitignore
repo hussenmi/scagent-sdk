@@ -14,6 +14,8 @@ dist/
 build/
 *.egg-info/
 sessions/
+tmp/
+scagent/
 .env
 .agentic_peer_project.json
 
