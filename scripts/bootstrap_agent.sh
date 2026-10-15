@@ -2,12 +2,15 @@
 
 set -euo pipefail
 
-PYTHON_VERSION=3.14
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$ROOT/.venv"
+PYTHON_VERSION="$(<"$ROOT/.python-version")"
 
-# setup uv path (UV_EXEC) from .env
-source "$ROOT/.env"
+# optional uv path (UV_EXEC) from .env; otherwise the uv found by setup_gpu.sh
+if [[ -f "$ROOT/.env" ]]; then
+    source "$ROOT/.env"
+fi
+UV_EXEC="${UV_EXEC:-${SCAGENT_SDK_UV:-uv}}"
 
 # pass --update-lock-file to re-solve uv.lock instead of requiring it up-to-date
 LOCKED_ARGS=(--locked)

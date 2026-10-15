@@ -17,8 +17,15 @@ for arg in "$@"; do
     fi
 done
 
-# setup pixi paths (PIXI_MANIFEST, PIXI_EXEC, PIXI_SCAGENT) from .env
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+# setup pixi paths (PIXI_MANIFEST, PIXI_EXEC, PIXI_SCAGENT) from .env;
+# PIXI_EXEC falls back to the pixi found by setup_gpu.sh
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$ROOT/.env" ]]; then
+    source "$ROOT/.env"
+fi
+PIXI_EXEC="${PIXI_EXEC:-${SCAGENT_SDK_PIXI:-pixi}}"
+PIXI_MANIFEST="${PIXI_MANIFEST:-$ROOT/pixi.toml}"
+PIXI_SCAGENT="${PIXI_SCAGENT:?set PIXI_SCAGENT in .env to the pixi storage root (see .env.example)}"
 
 mkdir -p $PIXI_SCAGENT/envs $PIXI_SCAGENT/cache
 
