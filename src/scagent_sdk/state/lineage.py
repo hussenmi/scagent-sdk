@@ -65,6 +65,13 @@ FACT_ROOT_SCOPES: dict[str, Scope] = {
     "reference_runs": "session",
 }
 
+# Replay-only (Figure 4 ablation): annotation evidence stops belonging to the data version it
+# describes, so a data change neither clears nor replaces it.
+from scagent_sdk.replay_switches import off as _replay_off  # noqa: E402
+
+if _replay_off("evidence_clearing"):
+    FACT_ROOT_SCOPES["annotation"] = "session"
+
 # Historical events predate declared matrix roles. Keep the role vocabulary versioned here so a
 # migration does not guess by extension: CellBender's continuing matrix is ``.h5``, and some tools
 # may emit more than one AnnData artifact in one execution.

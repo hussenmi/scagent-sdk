@@ -35,6 +35,7 @@ from scagent_sdk.errors import CapabilityExecutionError, CapabilityInterrupted
 from scagent_sdk.execution.broker import EnvironmentBroker
 from scagent_sdk.floors import FloorEvaluator
 from scagent_sdk.session import AnalysisSession
+from scagent_sdk.replay_switches import off as replay_off
 from scagent_sdk.state.lineage import (
     LineageNode,
     active_head,
@@ -510,7 +511,12 @@ class CapabilityExecutor:
             else None
         )
         relation = classify_input(lineage, resolved_node) if requested else None
-        if continues_lineage and branch_from is None and relation in {"ancestor", "sibling"}:
+        if (
+            continues_lineage
+            and branch_from is None
+            and relation in {"ancestor", "sibling"}
+            and not replay_off("ancestor_check")
+        ):
             current = head_path(lineage) or "(none)"
             raise CapabilityExecutionError(
                 f"{tool.name} was given {requested}, which is a tracked {relation} of the active "
@@ -936,6 +942,8 @@ class CapabilityExecutor:
         dispatch = dispatch if isinstance(dispatch, Mapping) else {}
         facts_patch = data.get("facts_patch")
         facts_patch = facts_patch if isinstance(facts_patch, Mapping) else {}
+        if replay_off("evidence_clearing"):
+            facts_patch = {k: v for k, v in facts_patch.items() if not (k == "annotation" and v is None)}
         node_facts, session_facts = partition_facts_patch(facts_patch)
 
         if dispatch.get("operation") == "checkout":

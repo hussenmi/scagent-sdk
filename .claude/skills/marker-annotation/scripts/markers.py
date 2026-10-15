@@ -380,6 +380,12 @@ def run(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     }
 
 
+def _replay_off(name: str) -> bool:
+    import os
+
+    return name in {s.strip() for s in os.environ.get("SCAGENT_REPLAY_OFF", "").split(",")}
+
+
 def review_annotation_evidence(arguments: dict[str, Any], context: Any) -> dict[str, Any]:
     facts = context.state_facts
     analysis = facts.get("analysis")
@@ -394,7 +400,7 @@ def review_annotation_evidence(arguments: dict[str, Any], context: Any) -> dict[
         for name, value in evidence.items()
         if isinstance(value, dict)
         and value.get("status") == "complete"
-        and value.get("clustering_id") == clustering_id
+        and (value.get("clustering_id") == clustering_id or _replay_off("evidence_filter"))
     }
     requested_methods = {str(value) for value in arguments.get("methods_reviewed", [])}
     methods = requested_methods or set(current)
